@@ -1,0 +1,163 @@
+[tools]
+rust = "latest"
+bun = "latest"
+"cargo:cargo-watch" = "latest"
+# prek: a fast, Rust reimplementation of pre-commit; runs the hooks in
+# .pre-commit-config.yaml (see `mise run pre-commit`).
+prek = "latest"
+
+# ---------------------------------------------------------------------------
+# Full stack (self-contained): Postgres + simplecas in Docker, served on :9000.
+# Good for a smoke test of the whole thing; no host toolchain needed.
+# ---------------------------------------------------------------------------
+
+[tasks.up]
+description = "Bring up the full stack in Docker (Postgres + simplecas on :9000)"
+run = "docker compose -f docker/docker-compose.yml up --build"
+
+[tasks."up:d"]
+description = "Bring up the full stack detached"
+run = "docker compose -f docker/docker-compose.yml up --build -d"
+
+[tasks.down]
+description = "Tear down the Docker stack (keeps volumes)"
+run = "docker compose -f docker/docker-compose.yml down"
+
+[tasks."down:clean"]
+description = "Tear down the Docker stack and delete its volumes (wipes data)"
+run = "docker compose -f docker/docker-compose.yml down -v"
+
+[tasks.logs]
+description = "Follow logs from the Docker stack"
+run = "docker compose -f docker/docker-compose.yml logs -f"
+
+# ---------------------------------------------------------------------------
+# Local watch dev: backend on the host (:9100) + Vite dev server, hot-reloading.
+# Vite proxies /api -> localhost:9100 (web/vite.config.ts); the backend talks to
+# a throwaway dev Postgres on :55432 and stores blobs in a local RustFS
+# (S3-compatible) store on :9200 — exercising the S3 backend, not local fs.
+# `mise run dev`.
+# ---------------------------------------------------------------------------
+
+[tasks.dev]
+description = "Watch dev: dev Postgres + RustFS + auto-reloading backend + Vite (open the URL Vite prints)"
+depends = ["dev:server", "dev:web"]
+
+[tasks."dev:server"]
+description = "Run the backend on :9100 (blobs -> RustFS S3 on :9200), rebuilding on source changes"
+depends = ["db", "rustfs"]
+run = "cargo watch -w src -w migrations -w Cargo.toml -x run"
+
+[tasks."dev:server".env]
+SIMPLECAS__SERVER__BIND = "0.0.0.0:9100"
+# Point the blob store at the local RustFS instead of the fs default in
+# simplecas.toml. ROOT="/" neutralises the toml's fs `root = "./data"` so blobs
+# land at bucket-root keys (blobs/… , staging/…).
+SIMPLECAS__STORAGE__BACKEND = "s3"
+SIMPLECAS__STORAGE__BUCKET = "simplecas"
+SIMPLECAS__STORAGE__REGION = "us-east-1"
+SIMPLECAS__STORAGE__ENDPOINT = "http://localhost:9200"
+SIMPLECAS__STORAGE__ACCESS_KEY_ID = "rustfsadmin"
+SIMPLECAS__STORAGE__SECRET_ACCESS_KEY = "rustfsadmin"
+SIMPLECAS__STORAGE__ROOT = "/"
+
+[tasks."dev:web"]
+description = "Run the Vite dev server for the PWA (hot module reload)"
+depends = ["web:install"]
+dir = "web"
+run = "bun run dev"
+
+# ---------------------------------------------------------------------------
+# Dev dependencies live in docker-compose.dev.yml, in their own compose project
+# (simplecas-dev) on non-default ports so they never collide with the full
+# `docker compose up` stack. `dev:down` tears the whole dev stack down + wipes
+# its volumes.
+# ---------------------------------------------------------------------------
+
+[tasks.db]
+description = "Start the dev Postgres container (:55432) and wait until it's ready"
+run = "docker compose -f docker/docker-compose.dev.yml up -d --wait postgres"
+
+[tasks."db:stop"]
+description = "Stop and remove the dev Postgres container (keeps its volume)"
+run = "docker compose -f docker/docker-compose.dev.yml rm -sf postgres"
+
+# ---------------------------------------------------------------------------
+# Dev RustFS — a local S3-compatible object store (MinIO alternative, written in
+# Rust) on :9200 (S3 API) / :9201 (web console). The one-shot `createbucket`
+# service waits for RustFS, then creates the 'simplecas' bucket the S3 backend
+# never creates itself.
+# ---------------------------------------------------------------------------
+
+[tasks.rustfs]
+description = "Start the dev RustFS S3 store (:9200 API, :9201 console) and ensure the 'simplecas' bucket exists"
+run = """
+set -e
+docker compose -f docker/docker-compose.dev.yml up -d rustfs
+docker compose -f docker/docker-compose.dev.yml run --rm createbucket
+"""
+
+[tasks."rustfs:stop"]
+description = "Stop and remove the dev RustFS container (keeps its volume)"
+run = "docker compose -f docker/docker-compose.dev.yml rm -sf rustfs"
+
+[tasks."dev:down"]
+description = "Tear down the whole dev stack (Postgres + RustFS) and wipe its volumes"
+run = "docker compose -f docker/docker-compose.dev.yml down -v"
+
+# ---------------------------------------------------------------------------
+# Build & quality
+# ---------------------------------------------------------------------------
+
+[tasks."web:install"]
+description = "Install PWA dependencies (skipped when package.json/lockfile are unchanged)"
+dir = "web"
+sources = ["web/package.json", "web/bun.lock"]
+outputs = ["web/node_modules"]
+run = "bun install"
+
+[tasks."web:build"]
+description = "Build the PWA into web/dist (embedded into the release binary)"
+depends = ["web:install"]
+dir = "web"
+run = "bun run build"
+
+[tasks."web:lint"]
+description = "Lint the PWA"
+depends = ["web:install"]
+dir = "web"
+run = "bun run lint"
+
+[tasks.build]
+description = "Production build: PWA then release binary with the UI embedded"
+depends = ["web:build"]
+run = "cargo build --release"
+
+[tasks.check]
+description = "Fast type/borrow check of the Rust crate"
+run = "cargo check"
+
+[tasks.fmt]
+description = "Format Rust sources"
+run = "cargo fmt"
+
+[tasks."fmt:check"]
+description = "Check Rust formatting without modifying files"
+run = "cargo fmt --check"
+
+[tasks.clippy]
+description = "Lint Rust sources with Clippy"
+run = "cargo clippy --all-targets"
+
+[tasks.test]
+description = "Run the Rust test suite"
+run = "cargo test"
+
+# ---------------------------------------------------------------------------
+# Pre-commit: runs the hooks in .pre-commit-config.yaml (fmt check, clippy, PWA
+# lint, plus whitespace/YAML/TOML hygiene). Same entrypoint CI runs.
+# ---------------------------------------------------------------------------
+
+[tasks."pre-commit"]
+description = "Run all pre-commit hooks against the whole tree"
+run = "prek run --show-diff-on-failure --color=always --all-files"

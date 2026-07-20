@@ -1,0 +1,35 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+
+  - repo: local
+    hooks:
+      # Mutating: reformats in place so CI can auto-commit the result.
+      - id: rust-fmt
+        name: rust format
+        entry: mise run fmt
+        language: system
+        pass_filenames: false
+        types: [rust]
+
+      - id: rust-clippy
+        name: rust clippy
+        entry: mise run clippy
+        language: system
+        pass_filenames: false
+        types: [rust]
+
+      - id: frontend-lint
+        name: frontend lint
+        entry: mise run web:lint
+        language: system
+        pass_filenames: false
+        files: ^web/

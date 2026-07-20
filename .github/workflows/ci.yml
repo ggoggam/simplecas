@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      # Mint a short-lived token from the GitHub App (vars.APP_ID +
+      # secrets.PRIVATE_KEY), scoped to contents:write, so the auto-format
+      # commit below can be pushed back to the branch. The App installation
+      # must grant Repository contents: Read and write.
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          client-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.PRIVATE_KEY }}
+          permission-contents: write
+
+      # Check out with the App token (persisted in git config) and, on PRs, the
+      # head branch — so git-auto-commit-action can push the reformatting back.
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      # Installs the toolchain declared in mise.toml (Rust, bun, prek, ...).
+      - uses: jdx/mise-action@v3
+
+      # mise's Rust resolves to a rustup toolchain that ships without the
+      # rustfmt/clippy components, so add them for the fmt + clippy hooks.
+      - run: rustup component add rustfmt clippy
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      # Mutating hooks (cargo fmt, whitespace/EOF fixers) rewrite files in place
+      # and exit non-zero when they change anything — that's the reformat signal.
+      - name: Pre-commit
+        run: mise run pre-commit
+
+      # If the hooks reformatted anything, commit it back to the branch. Runs
+      # even when the step above "failed" (files were reformatted), but not when
+      # the job was cancelled. No-op on a clean tree. Skipped in the merge queue,
+      # whose readonly ref can't be pushed to.
+      - name: Auto-commit formatting fixes
+        if: ${{ !cancelled() && github.event_name != 'merge_group' }}
+        uses: stefanzweifel/git-auto-commit-action@v7
+        with:
+          commit_message: "style: auto-format via pre-commit hooks"
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: jdx/mise-action@v3
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-test-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-test-${{ runner.os }}-
+
+      - name: Test
+        run: mise run test

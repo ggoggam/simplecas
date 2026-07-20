@@ -1,0 +1,38 @@
+# Local stack: Postgres + simplecas with a local-fs storage backend.
+# `docker compose up --build` then open http://localhost:9000/ui/
+name: simplecas
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: simplecas
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  simplecas:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SIMPLECAS__DATABASE__URL: postgres://postgres:postgres@postgres:5432/simplecas
+      SIMPLECAS__STORAGE__BACKEND: fs
+      SIMPLECAS__STORAGE__ROOT: /data
+    volumes:
+      - blobdata:/data
+    ports:
+      - "9000:9000"
+
+volumes:
+  pgdata:
+  blobdata:

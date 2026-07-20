@@ -1,0 +1,38 @@
+# simplecas configuration. Every field can be overridden with env vars, e.g.
+#   SIMPLECAS__DATABASE__URL=postgres://…
+#   SIMPLECAS__STORAGE__BACKEND=s3
+[server]
+bind = "0.0.0.0:9000"
+region = "us-east-1"
+
+[database]
+url = "postgres://postgres:postgres@localhost:55432/simplecas"
+max_connections = 16
+
+# Storage backend. Swap `backend` to s3 / gcs / azblob and fill the matching
+# fields; the logical blob layout is identical across all of them.
+[storage]
+backend = "fs"
+root = "./data"
+
+# [storage]
+# backend = "s3"
+# bucket = "my-cas-bucket"
+# region = "us-east-1"
+# endpoint = "https://s3.amazonaws.com"   # or a MinIO/R2 endpoint
+# access_key_id = "…"
+# secret_access_key = "…"
+
+# S3 gateway auth. Disabled = anonymous access (fine behind private ingress or
+# for the bundled PWA). Enable to require SigV4-signed requests.
+[auth]
+enabled = false
+access_key_id = "simplecas"
+secret_access_key = "simplecas-secret"
+
+[gc]
+interval_secs = 60
+grace_secs = 300
+# How long a multipart upload may sit inactive (no initiation or new part)
+# before it's abandoned and its staged parts reclaimed. Default: 86400 (24h).
+multipart_expiry_secs = 86400

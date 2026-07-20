@@ -1,0 +1,56 @@
+# Dev dependencies for `mise run dev`: a throwaway Postgres (:55432) and a
+# RustFS S3 store (:9200 API, :9201 console). They run on non-default ports and
+# in their own compose project (simplecas-dev) so they never collide with the
+# full `docker compose up` stack. The backend and Vite run on the host with hot
+# reload; only these dependencies live in Docker.
+name: simplecas-dev
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: simplecas
+    volumes:
+      - devpgdata:/var/lib/postgresql/data
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    command: ["/data"]
+    environment:
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+      RUSTFS_CONSOLE_ENABLE: "true"
+    volumes:
+      - devblobdata:/data
+    ports:
+      - "9200:9000"
+      - "9201:9001"
+
+  # One-shot: wait for RustFS to answer, then create the 'simplecas' bucket (the
+  # S3 backend never creates it). Runs on the compose network, so it reaches
+  # RustFS at rustfs:9000. Invoked explicitly via `docker compose run --rm
+  # createbucket`, so it never starts with a plain `up`.
+  createbucket:
+    image: minio/mc:latest
+    depends_on:
+      - rustfs
+    entrypoint:
+      - sh
+      - -c
+      - >
+        until mc alias set r http://rustfs:9000 rustfsadmin rustfsadmin >/dev/null 2>&1
+        && mc mb --ignore-existing r/simplecas; do
+          echo "waiting for rustfs..."; sleep 1;
+        done
+
+volumes:
+  devpgdata:
+  devblobdata:

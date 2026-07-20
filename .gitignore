@@ -1,0 +1,10 @@
+# Rust
+/target
+
+# Local storage backend + config with secrets
+/data
+/simplecas.local.toml
+
+# Frontend
+/web/node_modules
+/web/dist
