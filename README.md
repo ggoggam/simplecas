@@ -89,6 +89,7 @@ The server exposes three surfaces on one port (`:9000` in Docker, backend on
 | `/`       | S3-compatible gateway (path-style addressing)      |
 | `/api/`   | JSON admin API (used by the PWA)                   |
 | `/ui/`    | Progressive Web App                                |
+| `/auth/`  | OIDC sign-in endpoints (only mounted when enabled) |
 
 ## Configuration
 
@@ -105,6 +106,60 @@ endpoint = "https://s3.amazonaws.com"   # or MinIO / R2
 access_key_id = "…"
 secret_access_key = "…"
 ```
+
+## Authentication
+
+There are two independent auth mechanisms for the two kinds of client:
+
+- **S3 gateway (`/`)** — AWS **SigV4**, for machine clients. Toggled by
+  `[auth] enabled` (see above). Unaffected by OIDC.
+- **Web surface (`/ui` + `/api`)** — optional **OIDC** single sign-on, for
+  humans. When enabled, both are gated behind a login; the S3 gateway is not.
+
+### OIDC single sign-on
+
+simplecas has no user database and its instances are stateless, so OIDC here is
+deliberately lean: **any identity that authenticates at a configured provider is
+admitted** (optionally narrowed by an email allowlist), and the session is a
+stateless **HMAC-signed cookie** — no session table, no server-side revocation.
+Every instance behind a load balancer only needs the same `session_secret`.
+
+```toml
+[oidc]
+enabled = true
+public_url = "https://cas.example.com"      # used to derive redirect URIs
+session_secret = "…32+ random bytes…"        # shared across instances
+session_ttl_secs = 86400
+allowed_domains = ["lunit.io"]               # optional; empty = allow anyone
+allowed_emails = []                          # optional exact allowlist
+
+[[oidc.providers]]                           # one block per provider
+id = "google"
+name = "Google"
+issuer = "https://accounts.google.com"
+client_id = "…"
+client_secret = "…"                          # omit for public (PKCE) clients
+scopes = ["openid", "email", "profile"]
+```
+
+Register this **redirect URI** with each provider:
+`<public_url>/auth/oidc/<id>/callback` (e.g.
+`https://cas.example.com/auth/oidc/google/callback`).
+
+The flow is standard OIDC authorization-code with **PKCE** and **nonce**;
+per-login state rides in a short-lived signed cookie so the callback needs no
+shared store. Provider discovery (and the signing JWKS) is fetched at startup
+and **re-discovered hourly**, so IdP key rotation doesn't break logins without a
+restart. When an allowlist is configured the email must be present **and
+verified** — an unverified email is rejected.
+
+Endpoints: `GET /auth/login` (provider buttons), `/auth/oidc/{id}/start`,
+`/auth/oidc/{id}/callback`, `/auth/logout`, and `/auth/me` (current identity as
+JSON). Unauthenticated `/api` calls get `401`; unauthenticated page loads
+redirect to `/auth/login`.
+
+> **Note:** OIDC gates the bundled PWA and admin API only. If you expose the S3
+> gateway publicly, protect it with `[auth]` SigV4 or your own ingress.
 
 ## S3 gateway
 
@@ -188,6 +243,7 @@ src/
   storage.rs   OpenDAL operator construction + blob path layout
   s3/          S3 gateway: mod.rs (handlers), xml.rs (wire types), sigv4.rs (auth)
   api.rs       JSON admin API for the PWA
+  auth.rs      OIDC sign-in: discovery, signed-cookie sessions, guard middleware
   ui.rs        serves the embedded PWA
 migrations/    sqlx migrations (run automatically on boot)
 web/           Vite + React + Tailwind PWA (shadcn/ui, ggoggam/shadcn-treeview)

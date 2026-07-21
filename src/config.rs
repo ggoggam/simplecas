@@ -14,6 +14,8 @@ pub struct Config {
     #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
+    pub oidc: OidcConfig,
+    #[serde(default)]
     pub gc: GcConfig,
 }
 
@@ -103,6 +105,60 @@ pub struct AuthConfig {
     pub secret_access_key: String,
 }
 
+/// OIDC single sign-on for the human-facing surface (the PWA at `/ui` and the
+/// JSON admin API at `/api`). The S3 gateway keeps its own SigV4 auth — OIDC is
+/// a browser flow and does not apply to machine clients.
+///
+/// Sessions are stateless: on a successful login the server sets an
+/// HMAC-signed cookie carrying the identity + expiry, so no session table and
+/// no shared state is needed across instances (they only need the same
+/// `session_secret`). The provider fields mirror a standard OIDC relying-party
+/// registration; discovery is performed at startup and refreshed periodically.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OidcConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Public base URL of this instance (e.g. `https://cas.example.com`), used
+    /// to derive each provider's redirect URI. Required when `enabled`.
+    #[serde(default)]
+    pub public_url: String,
+    /// Secret used to HMAC-sign session and flow-state cookies. Must be shared
+    /// by every instance behind the load balancer. Required when `enabled`.
+    #[serde(default)]
+    pub session_secret: String,
+    /// How long a login session stays valid before re-authentication.
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl_secs: u64,
+    /// Optional allowlist: if either list is non-empty, a login is accepted
+    /// only when the (verified) email matches an entry here. Empty = allow any
+    /// identity that authenticates at a configured provider.
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    #[serde(default)]
+    pub allowed_emails: Vec<String>,
+    #[serde(default)]
+    pub providers: Vec<ProviderConfig>,
+}
+
+/// One external identity provider. Fields mirror hitch's `ProviderConfig`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderConfig {
+    /// Stable slug used in the redirect URI and login URLs (e.g. `google`).
+    pub id: String,
+    /// Human-facing label on the login button; defaults to `id`.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Issuer URL for OIDC discovery (`<issuer>/.well-known/openid-configuration`).
+    pub issuer: String,
+    pub client_id: String,
+    /// Omitted for public clients (PKCE-only).
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Requested scopes; defaults to `["openid", "email", "profile"]`.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GcConfig {
     #[serde(default = "default_gc_interval")]
@@ -135,6 +191,9 @@ fn default_region() -> String {
 }
 fn default_pool_size() -> u32 {
     16
+}
+fn default_session_ttl() -> u64 {
+    86_400
 }
 fn default_gc_interval() -> u64 {
     60
