@@ -25,6 +25,8 @@ pub struct AppState {
     pub pool: PgPool,
     pub op: Operator,
     pub config: crate::config::Config,
+    /// Present only when OIDC is enabled; guards the `/ui` and `/api` surfaces.
+    pub oidc: Option<std::sync::Arc<crate::auth::OidcRegistry>>,
 }
 
 pub struct StagedBlob {

@@ -30,6 +30,33 @@ enabled = false
 access_key_id = "simplecas"
 secret_access_key = "simplecas-secret"
 
+# OIDC single sign-on for the human surface (the /ui PWA and /api admin API).
+# Disabled by default; the S3 gateway at / keeps its own SigV4 auth regardless.
+# Sessions are stateless signed cookies, so no session table and no shared
+# state — every instance behind the load balancer just needs the same
+# session_secret. Uncomment and fill in to require sign-in:
+#
+# [oidc]
+# enabled = true
+# public_url = "https://cas.example.com"      # used to derive redirect URIs
+# session_secret = "change-me-to-32+-random-bytes"
+# session_ttl_secs = 86400
+# # Optional allowlist. Empty = admit anyone who authenticates. When set, the
+# # (verified) email must match a domain or address here.
+# allowed_domains = ["lunit.io"]
+# allowed_emails = []
+#
+# [[oidc.providers]]
+# id = "google"                                # slug used in the redirect URI
+# name = "Google"                              # label on the login button
+# issuer = "https://accounts.google.com"
+# client_id = "…"
+# client_secret = "…"                          # omit for public (PKCE) clients
+# scopes = ["openid", "email", "profile"]
+#
+# Redirect URI to register with the provider:
+#   <public_url>/auth/oidc/<id>/callback   e.g. https://cas.example.com/auth/oidc/google/callback
+
 [gc]
 interval_secs = 60
 grace_secs = 300
