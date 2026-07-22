@@ -77,14 +77,39 @@ export const api = {
     return (await req("/api/stats")).json();
   },
 
-  // The signed-in identity, or null when sign-in isn't enabled / not logged in
-  // (the /auth endpoints exist only when OIDC is configured).
+  // The signed-in identity, or null when sign-in genuinely isn't in effect:
+  //   * 401 — OIDC is enabled but there's no valid session (not signed in).
+  //   * 404 — the /auth endpoints aren't mounted (OIDC disabled).
+  // Any *other* outcome (network failure, 5xx, or a non-JSON body — e.g. a proxy
+  // or stale service worker returning HTML) is a genuine load failure and is
+  // thrown, so the route loader can surface it and retry instead of silently
+  // hiding the signed-in UI (which is what made the logout button vanish).
   async me(): Promise<Identity | null> {
+    let res: Response;
     try {
-      const res = await fetch("/auth/me");
-      return res.ok ? await res.json() : null;
+      res = await fetch("/auth/me", { headers: { accept: "application/json" } });
+    } catch (e) {
+      throw new Error(`identity request failed: ${(e as Error).message}`);
+    }
+    if (res.status === 401 || res.status === 404) return null;
+    if (!res.ok) throw new Error(`identity request failed: ${res.status}`);
+    if (!res.headers.get("content-type")?.includes("application/json")) {
+      throw new Error("identity request returned a non-JSON response");
+    }
+    return res.json();
+  },
+
+  // Probe multi-tenancy. `/api/tenants` succeeds only when OIDC is enabled and
+  // the caller has a verified email; otherwise it rejects (401/403) and we fall
+  // back to the untenanted admin view. Never throws — the result always tells
+  // the UI which mode to render.
+  async tenancy(): Promise<
+    { mode: "teams"; teams: Tenant[] } | { mode: "untenanted"; teams: [] }
+  > {
+    try {
+      return { mode: "teams", teams: await this.listTenants() };
     } catch {
-      return null;
+      return { mode: "untenanted", teams: [] };
     }
   },
 
