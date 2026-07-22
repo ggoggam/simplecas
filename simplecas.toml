@@ -43,7 +43,7 @@ secret_access_key = "simplecas-secret"
 # session_ttl_secs = 86400
 # # Optional allowlist. Empty = admit anyone who authenticates. When set, the
 # # (verified) email must match a domain or address here.
-# allowed_domains = ["lunit.io"]
+# allowed_domains = ["example.com"]
 # allowed_emails = []
 #
 # [[oidc.providers]]

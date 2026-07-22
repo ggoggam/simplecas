@@ -327,18 +327,33 @@ struct NamespaceJson {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Deserialize)]
+struct NamespaceListQuery {
+    /// Restrict to one team's namespaces (name). Requires membership. When
+    /// omitted, all of the caller's teams' namespaces are returned.
+    #[serde(default)]
+    tenant: Option<String>,
+}
+
 async fn list_namespaces(
     State(state): State<Arc<AppState>>,
     caller: Caller,
+    Query(q): Query<NamespaceListQuery>,
 ) -> ApiResult<Json<Vec<NamespaceJson>>> {
     let namespaces = match sess(&caller) {
-        Some(s) => {
-            let ids = match s.tenant_email() {
-                Some(email) => db::tenant_ids_for_email(&state.pool, &email).await?,
-                None => Vec::new(),
-            };
-            db::list_namespaces_for_tenants(&state.pool, &ids).await?
-        }
+        Some(s) => match q.tenant.as_deref() {
+            Some(tenant) => {
+                let tenant_id = authorize_tenant(&state, sess(&caller), tenant, false).await?;
+                db::list_namespaces_for_tenants(&state.pool, &[tenant_id]).await?
+            }
+            None => {
+                let ids = match s.tenant_email() {
+                    Some(email) => db::tenant_ids_for_email(&state.pool, &email).await?,
+                    None => Vec::new(),
+                };
+                db::list_namespaces_for_tenants(&state.pool, &ids).await?
+            }
+        },
         None => db::list_namespaces(&state.pool).await?,
     };
     Ok(Json(

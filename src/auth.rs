@@ -700,15 +700,15 @@ mod tests {
 
     #[test]
     fn allowlist_requires_verified_matching_email() {
-        let c = cfg(&["lunit.io"], &["ceo@other.example"]);
-        assert!(admitted(&c, Some("dev@lunit.io"), Some(true)));
-        assert!(admitted(&c, Some("DEV@LUNIT.IO"), Some(true)));
+        let c = cfg(&["example.com"], &["ceo@other.example"]);
+        assert!(admitted(&c, Some("dev@example.com"), Some(true)));
+        assert!(admitted(&c, Some("DEV@EXAMPLE.COM"), Some(true)));
         assert!(admitted(&c, Some("ceo@other.example"), Some(true)));
         // wrong domain
         assert!(!admitted(&c, Some("dev@evil.example"), Some(true)));
         // right domain but unverified
-        assert!(!admitted(&c, Some("dev@lunit.io"), Some(false)));
-        assert!(!admitted(&c, Some("dev@lunit.io"), None));
+        assert!(!admitted(&c, Some("dev@example.com"), Some(false)));
+        assert!(!admitted(&c, Some("dev@example.com"), None));
         // no email at all
         assert!(!admitted(&c, None, Some(true)));
     }
