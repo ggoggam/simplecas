@@ -130,14 +130,26 @@ pub async fn copy_object(
 /// Returns the (hash, size) on success, or `None` if the blob isn't present —
 /// letting the caller fall back to a real upload. This is what turns a
 /// client-side hash match into a zero-byte upload.
+///
+/// `tenant_scope` bounds visibility: when `Some(tenant_id)`, the link succeeds
+/// only if the blob is already referenced within that tenant, so the endpoint
+/// can't confirm the existence of another tenant's content. `None` (the S3
+/// admin plane / unowned namespaces) links against any stored blob.
 pub async fn link_blob(
     state: &AppState,
     namespace_id: i64,
     key: &str,
     hash: &str,
     content_type: &str,
+    tenant_scope: Option<i64>,
 ) -> Result<Option<i64>> {
     let mut tx = state.pool.begin().await?;
+    if let Some(tenant_id) = tenant_scope {
+        if !db::blob_referenced_in_tenant(&mut tx, hash, tenant_id).await? {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+    }
     let Some(size) = db::claim_existing_blob(&mut tx, hash).await? else {
         tx.rollback().await?;
         return Ok(None);

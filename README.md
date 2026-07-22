@@ -118,11 +118,12 @@ There are two independent auth mechanisms for the two kinds of client:
 
 ### OIDC single sign-on
 
-simplecas has no user database and its instances are stateless, so OIDC here is
-deliberately lean: **any identity that authenticates at a configured provider is
-admitted** (optionally narrowed by an email allowlist), and the session is a
-stateless **HMAC-signed cookie** — no session table, no server-side revocation.
-Every instance behind a load balancer only needs the same `session_secret`.
+*Authentication* is deliberately lean and stateless: **any identity that
+authenticates at a configured provider is admitted** (optionally narrowed by an
+email allowlist), and the session is a stateless **HMAC-signed cookie** — no
+session table, no server-side revocation. Every instance behind a load balancer
+only needs the same `session_secret`. *Authorization* (who may see which
+namespaces) is layered on top via **teams** — see below.
 
 ```toml
 [oidc]
@@ -130,7 +131,7 @@ enabled = true
 public_url = "https://cas.example.com"      # used to derive redirect URIs
 session_secret = "…32+ random bytes…"        # shared across instances
 session_ttl_secs = 86400
-allowed_domains = ["lunit.io"]               # optional; empty = allow anyone
+allowed_domains = ["example.com"]            # optional; empty = allow anyone
 allowed_emails = []                          # optional exact allowlist
 
 [[oidc.providers]]                           # one block per provider
@@ -160,6 +161,39 @@ redirect to `/auth/login`.
 
 > **Note:** OIDC gates the bundled PWA and admin API only. If you expose the S3
 > gateway publicly, protect it with `[auth]` SigV4 or your own ingress.
+
+### Teams (multi-tenancy)
+
+When OIDC is enabled the human plane (`/ui` + `/api`) is **multi-tenant**: each
+namespace is owned by a **team**, and a signed-in user sees and touches only the
+namespaces of teams they belong to. Isolation is enforced per request; a
+namespace a caller can't access is reported as *not found*, so existence never
+leaks across teams.
+
+- **Membership** is keyed by **verified email** — you invite by email, and the
+  invitee gains access on their next sign-in. Two roles: `owner` (manage
+  membership, delete the team) and `member` (read/write the team's namespaces).
+  A team always keeps at least one owner. Tenancy requires a verified email; an
+  identity whose provider doesn't assert `email_verified` gets no team access.
+- **Self-serve**: any signed-in user can create a team and becomes its owner.
+- **Dedup stays global** across all content, but the client-side dedup "link"
+  fast path is scoped to your own team, so it can't be used to probe whether
+  another team holds a given blob. A genuine re-upload of identical bytes is
+  still physically de-duplicated (nothing new is stored).
+
+No config is required — tenancy is automatic whenever OIDC is on. There is no
+users/teams state when OIDC is off; then `/api` is the unauthenticated
+full-access plane it has always been.
+
+API (JSON, cookie-authenticated): `GET/POST /api/tenants`,
+`DELETE /api/tenants/{team}`, `GET/POST /api/tenants/{team}/members`,
+`DELETE /api/tenants/{team}/members/{email}`. Creating a namespace
+(`POST /api/namespaces`) takes a `tenant` field naming the owning team.
+
+> **The S3 gateway is a single trusted admin plane** and is *not* tenant-scoped:
+> its one credential has full access, and namespaces it creates are unowned
+> (`tenant_id NULL`) and hidden from the team-scoped UI. Machine-client tenancy
+> (per-team S3 keys) is intentionally out of scope.
 
 ## S3 gateway
 

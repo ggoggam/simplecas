@@ -21,6 +21,9 @@ pub struct Namespace {
     pub id: i64,
     pub name: String,
     pub created_at: DateTime<Utc>,
+    /// Owning tenant, or `None` for unowned (S3-admin-plane / pre-tenancy)
+    /// namespaces.
+    pub tenant_id: Option<i64>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -53,25 +56,62 @@ pub struct Stats {
 
 pub async fn list_namespaces(pool: &PgPool) -> Result<Vec<Namespace>> {
     Ok(
-        sqlx::query_as("SELECT id, name, created_at FROM namespaces ORDER BY name")
+        sqlx::query_as("SELECT id, name, created_at, tenant_id FROM namespaces ORDER BY name")
             .fetch_all(pool)
             .await?,
     )
 }
 
+/// Namespaces owned by any of `tenant_ids`, in name order. Used by the
+/// tenant-scoped `/api` + `/ui` plane so a caller sees only their tenants'
+/// namespaces (unowned NULL-tenant namespaces are excluded).
+pub async fn list_namespaces_for_tenants(
+    pool: &PgPool,
+    tenant_ids: &[i64],
+) -> Result<Vec<Namespace>> {
+    Ok(sqlx::query_as(
+        "SELECT id, name, created_at, tenant_id FROM namespaces
+         WHERE tenant_id = ANY($1) ORDER BY name",
+    )
+    .bind(tenant_ids)
+    .fetch_all(pool)
+    .await?)
+}
+
 pub async fn get_namespace(pool: &PgPool, name: &str) -> Result<Namespace> {
-    sqlx::query_as("SELECT id, name, created_at FROM namespaces WHERE name = $1")
+    sqlx::query_as("SELECT id, name, created_at, tenant_id FROM namespaces WHERE name = $1")
         .bind(name)
         .fetch_optional(pool)
         .await?
         .ok_or(Error::NoSuchNamespace)
 }
 
-pub async fn create_namespace(pool: &PgPool, name: &str) -> Result<()> {
-    let inserted = sqlx::query("INSERT INTO namespaces (name) VALUES ($1) ON CONFLICT DO NOTHING")
-        .bind(name)
-        .execute(pool)
-        .await?;
+/// Fetch a namespace only if `email` is a member of its owning tenant. Any
+/// other case — missing namespace, unowned namespace, or caller not a member —
+/// resolves to `NoSuchNamespace`, so the tenant plane never reveals the
+/// existence of namespaces the caller can't access.
+pub async fn get_namespace_for_member(pool: &PgPool, name: &str, email: &str) -> Result<Namespace> {
+    sqlx::query_as(
+        "SELECT n.id, n.name, n.created_at, n.tenant_id
+         FROM namespaces n
+         JOIN tenant_members m ON m.tenant_id = n.tenant_id AND m.email = $2
+         WHERE n.name = $1",
+    )
+    .bind(name)
+    .bind(email)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(Error::NoSuchNamespace)
+}
+
+pub async fn create_namespace(pool: &PgPool, name: &str, tenant_id: Option<i64>) -> Result<()> {
+    let inserted = sqlx::query(
+        "INSERT INTO namespaces (name, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(name)
+    .bind(tenant_id)
+    .execute(pool)
+    .await?;
     if inserted.rows_affected() == 0 {
         return Err(Error::NamespaceAlreadyExists);
     }
@@ -81,12 +121,13 @@ pub async fn create_namespace(pool: &PgPool, name: &str) -> Result<()> {
 /// S3 semantics: deleting a non-empty namespace is a 409.
 pub async fn delete_namespace(pool: &PgPool, name: &str) -> Result<()> {
     let mut tx = pool.begin().await?;
-    let namespace: Namespace =
-        sqlx::query_as("SELECT id, name, created_at FROM namespaces WHERE name = $1 FOR UPDATE")
-            .bind(name)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(Error::NoSuchNamespace)?;
+    let namespace: Namespace = sqlx::query_as(
+        "SELECT id, name, created_at, tenant_id FROM namespaces WHERE name = $1 FOR UPDATE",
+    )
+    .bind(name)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(Error::NoSuchNamespace)?;
     let (occupied,): (bool,) =
         sqlx::query_as("SELECT EXISTS(SELECT 1 FROM objects WHERE namespace_id = $1)")
             .bind(namespace.id)
@@ -103,7 +144,191 @@ pub async fn delete_namespace(pool: &PgPool, name: &str) -> Result<()> {
     Ok(())
 }
 
+// ---- tenants ----
+
+/// A tenant the caller belongs to, carrying the caller's role in it.
+#[derive(Debug, sqlx::FromRow)]
+pub struct TenantMembership {
+    pub name: String,
+    pub role: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct Member {
+    pub email: String,
+    pub role: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Tenants `email` is a member of, with the caller's role, in name order.
+pub async fn list_tenants_for_email(pool: &PgPool, email: &str) -> Result<Vec<TenantMembership>> {
+    Ok(sqlx::query_as(
+        "SELECT t.name, m.role, t.created_at
+         FROM tenants t
+         JOIN tenant_members m ON m.tenant_id = t.id
+         WHERE m.email = $1
+         ORDER BY t.name",
+    )
+    .bind(email)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Tenant ids `email` belongs to (for scoping listings and stats).
+pub async fn tenant_ids_for_email(pool: &PgPool, email: &str) -> Result<Vec<i64>> {
+    let rows: Vec<(i64,)> = sqlx::query_as("SELECT tenant_id FROM tenant_members WHERE email = $1")
+        .bind(email)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Resolve a tenant name to its id, or `NoSuchTenant`.
+pub async fn tenant_id_by_name(pool: &PgPool, name: &str) -> Result<i64> {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM tenants WHERE name = $1")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?;
+    row.map(|(id,)| id).ok_or(Error::NoSuchTenant)
+}
+
+/// The caller's role in `tenant_id`, or `None` if they're not a member.
+pub async fn tenant_role(pool: &PgPool, tenant_id: i64, email: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT role FROM tenant_members WHERE tenant_id = $1 AND email = $2")
+            .bind(tenant_id)
+            .bind(email)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(r,)| r))
+}
+
+/// Create a tenant with `owner_email` as its sole owner (both in one tx).
+pub async fn create_tenant(pool: &PgPool, name: &str, owner_email: &str) -> Result<i64> {
+    let mut tx = pool.begin().await?;
+    let row: Option<(i64,)> = sqlx::query_as(
+        "INSERT INTO tenants (name) VALUES ($1) ON CONFLICT DO NOTHING RETURNING id",
+    )
+    .bind(name)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((id,)) = row else {
+        return Err(Error::TenantAlreadyExists);
+    };
+    sqlx::query("INSERT INTO tenant_members (tenant_id, email, role) VALUES ($1, $2, 'owner')")
+        .bind(id)
+        .bind(owner_email)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+pub async fn list_members(pool: &PgPool, tenant_id: i64) -> Result<Vec<Member>> {
+    Ok(sqlx::query_as(
+        "SELECT email, role, created_at FROM tenant_members
+         WHERE tenant_id = $1 ORDER BY email",
+    )
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Invite (or re-role) a member. Upserts so re-inviting updates the role.
+pub async fn add_member(pool: &PgPool, tenant_id: i64, email: &str, role: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO tenant_members (tenant_id, email, role) VALUES ($1, $2, $3)
+         ON CONFLICT (tenant_id, email) DO UPDATE SET role = $3",
+    )
+    .bind(tenant_id)
+    .bind(email)
+    .bind(role)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Remove a member, refusing to strip a tenant of its last owner.
+pub async fn remove_member(pool: &PgPool, tenant_id: i64, email: &str) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let victim: Option<(String,)> = sqlx::query_as(
+        "SELECT role FROM tenant_members WHERE tenant_id = $1 AND email = $2 FOR UPDATE",
+    )
+    .bind(tenant_id)
+    .bind(email)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((role,)) = victim else {
+        return Ok(()); // idempotent: not a member
+    };
+    if role == "owner" {
+        let (owners,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM tenant_members WHERE tenant_id = $1 AND role = 'owner'",
+        )
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if owners <= 1 {
+            return Err(Error::InvalidArgument(
+                "cannot remove the last owner of a tenant".into(),
+            ));
+        }
+    }
+    sqlx::query("DELETE FROM tenant_members WHERE tenant_id = $1 AND email = $2")
+        .bind(tenant_id)
+        .bind(email)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Delete an empty tenant (members cascade). A tenant that still owns
+/// namespaces is a 409, mirroring non-empty namespace deletion.
+pub async fn delete_tenant(pool: &PgPool, tenant_id: i64) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let (occupied,): (bool,) =
+        sqlx::query_as("SELECT EXISTS(SELECT 1 FROM namespaces WHERE tenant_id = $1)")
+            .bind(tenant_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if occupied {
+        return Err(Error::TenantNotEmpty);
+    }
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 // ---- blobs / objects ----
+
+/// Whether any object inside `tenant_id`'s namespaces references `hash`. Gates
+/// the dedup "link" fast path so it can't be used as a cross-tenant existence
+/// oracle: a caller only gets a zero-byte link for content their own tenant
+/// already holds. (Physical dedup stays global — a real upload of the same
+/// bytes still hits `claim_blob` and stores nothing new.)
+pub async fn blob_referenced_in_tenant(
+    tx: &mut Transaction<'_, Postgres>,
+    hash: &str,
+    tenant_id: i64,
+) -> Result<bool> {
+    let (referenced,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS(
+             SELECT 1 FROM objects o
+             JOIN namespaces n ON n.id = o.namespace_id
+             WHERE o.blob_hash = $1 AND n.tenant_id = $2
+         )",
+    )
+    .bind(hash)
+    .bind(tenant_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(referenced)
+}
 
 /// Claim a reference to `hash` inside `tx`, creating the blob row if new.
 /// Returns true when this call created the row (caller must upload the bytes
@@ -539,6 +764,46 @@ pub async fn stats(pool: &PgPool) -> Result<Stats> {
     let (blob_count, physical_bytes): (i64, i64) = sqlx::query_as(
         "SELECT COUNT(*), COALESCE(SUM(size), 0)::BIGINT FROM blobs WHERE refcount > 0",
     )
+    .fetch_one(pool)
+    .await?;
+    Ok(Stats {
+        namespace_count,
+        object_count,
+        blob_count,
+        logical_bytes,
+        physical_bytes,
+    })
+}
+
+/// Stats restricted to the namespaces owned by `tenant_ids`. Under global
+/// dedup a blob shared by two tenants counts toward each tenant's physical
+/// footprint, so per-tenant `physical_bytes` summed across tenants can exceed
+/// the global figure — it's "the footprint attributable to your data".
+pub async fn stats_for_tenants(pool: &PgPool, tenant_ids: &[i64]) -> Result<Stats> {
+    let (namespace_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM namespaces WHERE tenant_id = ANY($1)")
+            .bind(tenant_ids)
+            .fetch_one(pool)
+            .await?;
+    let (object_count, logical_bytes): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(o.size), 0)::BIGINT
+         FROM objects o
+         JOIN namespaces n ON n.id = o.namespace_id
+         WHERE n.tenant_id = ANY($1)",
+    )
+    .bind(tenant_ids)
+    .fetch_one(pool)
+    .await?;
+    let (blob_count, physical_bytes): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(size), 0)::BIGINT FROM (
+             SELECT DISTINCT b.hash, b.size
+             FROM blobs b
+             JOIN objects o ON o.blob_hash = b.hash
+             JOIN namespaces n ON n.id = o.namespace_id
+             WHERE n.tenant_id = ANY($1)
+         ) distinct_blobs",
+    )
+    .bind(tenant_ids)
     .fetch_one(pool)
     .await?;
     Ok(Stats {
