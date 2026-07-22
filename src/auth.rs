@@ -3,10 +3,14 @@
 //! does not apply to machine clients.
 //!
 //! Design, contrasted with a full account system (e.g. hitch's):
-//!   * **No user model, no DB.** simplecas has no users table and every
-//!     instance is stateless. So there is nothing to provision or link — any
-//!     identity that authenticates at a configured provider is admitted
-//!     (optionally narrowed by an email allowlist).
+//!   * **Stateless authentication.** There is no users table: any identity that
+//!     authenticates at a configured provider is admitted (optionally narrowed
+//!     by an email allowlist), and the resulting session is self-contained.
+//!     *Authorization* is a separate layer — see the `tenants` /
+//!     `tenant_members` tables and [`crate::api`], which scope each namespace to
+//!     the team that owns it, keyed on the caller's verified email. Tenancy
+//!     applies only when OIDC is enabled; the S3 gateway stays a single trusted
+//!     admin plane.
 //!   * **Stateless sessions.** A successful login sets an HMAC-signed cookie
 //!     carrying the identity + expiry. No session table, no server-side
 //!     revocation; instances only need the same `session_secret`. Logout
@@ -260,11 +264,27 @@ pub struct Session {
     pub sub: String,
     #[serde(default)]
     pub email: Option<String>,
+    /// Whether the provider asserted the email is verified. Tenancy is keyed on
+    /// email, so tenant access requires this to be true.
+    #[serde(default)]
+    pub email_verified: bool,
     #[serde(default)]
     pub name: Option<String>,
     pub provider: String,
     /// Unix expiry.
     pub exp: i64,
+}
+
+impl Session {
+    /// The caller's tenant identity: their verified, lowercased email. `None`
+    /// when the email is absent or unverified, in which case the caller has no
+    /// tenant access.
+    pub fn tenant_email(&self) -> Option<String> {
+        if !self.email_verified {
+            return None;
+        }
+        self.email.as_deref().map(|e| e.trim().to_ascii_lowercase())
+    }
 }
 
 /// Per-login state that must survive the round trip to the provider.
@@ -341,11 +361,13 @@ fn admitted(cfg: &OidcConfig, email: Option<&str>, verified: Option<bool>) -> bo
 /// page, preserving the intended destination.
 pub async fn guard(
     State(state): State<Arc<AppState>>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
     let cfg = &state.config.oidc;
-    if current_session(request.headers(), cfg).is_some() {
+    if let Some(session) = current_session(request.headers(), cfg) {
+        // Hand the identity to downstream handlers for tenant authorization.
+        request.extensions_mut().insert(Arc::new(session));
         return next.run(request).await;
     }
     if request.uri().path().starts_with("/api") {
@@ -639,6 +661,7 @@ async fn complete_login(
     Ok(Session {
         sub: claims.subject().as_str().to_string(),
         email,
+        email_verified: verified == Some(true),
         name,
         provider: provider_id.to_string(),
         exp: now() + cfg.session_ttl_secs as i64,
@@ -677,15 +700,15 @@ mod tests {
 
     #[test]
     fn allowlist_requires_verified_matching_email() {
-        let c = cfg(&["lunit.io"], &["ceo@other.example"]);
-        assert!(admitted(&c, Some("dev@lunit.io"), Some(true)));
-        assert!(admitted(&c, Some("DEV@LUNIT.IO"), Some(true)));
+        let c = cfg(&["example.com"], &["ceo@other.example"]);
+        assert!(admitted(&c, Some("dev@example.com"), Some(true)));
+        assert!(admitted(&c, Some("DEV@EXAMPLE.COM"), Some(true)));
         assert!(admitted(&c, Some("ceo@other.example"), Some(true)));
         // wrong domain
         assert!(!admitted(&c, Some("dev@evil.example"), Some(true)));
         // right domain but unverified
-        assert!(!admitted(&c, Some("dev@lunit.io"), Some(false)));
-        assert!(!admitted(&c, Some("dev@lunit.io"), None));
+        assert!(!admitted(&c, Some("dev@example.com"), Some(false)));
+        assert!(!admitted(&c, Some("dev@example.com"), None));
         // no email at all
         assert!(!admitted(&c, None, Some(true)));
     }
@@ -703,6 +726,28 @@ mod tests {
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"goodbye")
         );
         assert!(unsign(secret, &forged).is_none());
+    }
+
+    #[test]
+    fn tenant_email_requires_verification() {
+        let mk = |email: Option<&str>, verified: bool| Session {
+            sub: "s".into(),
+            email: email.map(String::from),
+            email_verified: verified,
+            name: None,
+            provider: "p".into(),
+            exp: 0,
+        };
+        // verified email is normalized (trimmed + lowercased)
+        assert_eq!(
+            mk(Some(" Dev@Example.COM "), true)
+                .tenant_email()
+                .as_deref(),
+            Some("dev@example.com")
+        );
+        // unverified or absent email yields no tenant identity
+        assert_eq!(mk(Some("dev@example.com"), false).tenant_email(), None);
+        assert_eq!(mk(None, true).tenant_email(), None);
     }
 
     #[test]

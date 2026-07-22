@@ -205,7 +205,7 @@ async fn create_namespace(state: &AppState, namespace: &str) -> Result<Response>
     if !valid_namespace_name(namespace) {
         return Err(Error::InvalidNamespaceName);
     }
-    db::create_namespace(&state.pool, namespace).await?;
+    db::create_namespace(&state.pool, namespace, None).await?;
     Ok((
         [(header::LOCATION, format!("/{namespace}"))],
         StatusCode::OK,

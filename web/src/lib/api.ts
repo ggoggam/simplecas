@@ -22,6 +22,27 @@ export interface Namespace {
   created_at: string;
 }
 
+export interface Identity {
+  sub: string;
+  email: string | null;
+  name: string | null;
+  provider: string;
+}
+
+export type Role = "owner" | "member";
+
+export interface Tenant {
+  name: string;
+  role: Role;
+  created_at: string;
+}
+
+export interface Member {
+  email: string;
+  role: Role;
+  created_at: string;
+}
+
 export interface ObjectEntry {
   key: string;
   size: number;
@@ -56,15 +77,75 @@ export const api = {
     return (await req("/api/stats")).json();
   },
 
-  async listNamespaces(): Promise<Namespace[]> {
-    return (await req("/api/namespaces")).json();
+  // The signed-in identity, or null when sign-in isn't enabled / not logged in
+  // (the /auth endpoints exist only when OIDC is configured).
+  async me(): Promise<Identity | null> {
+    try {
+      const res = await fetch("/auth/me");
+      return res.ok ? await res.json() : null;
+    } catch {
+      return null;
+    }
   },
 
-  async createNamespace(name: string): Promise<void> {
-    await req("/api/namespaces", {
+  // Sign out by hitting the server logout endpoint, which clears the session
+  // cookie and redirects to the login page.
+  logout(): void {
+    window.location.href = "/auth/logout";
+  },
+
+  // Teams (multi-tenancy). These succeed only when OIDC is enabled and the
+  // caller has a verified email; otherwise they reject (e.g. 403) and the UI
+  // falls back to the untenanted admin view. See README "Teams".
+  async listTenants(): Promise<Tenant[]> {
+    return (await req("/api/tenants")).json();
+  },
+
+  async createTenant(name: string): Promise<void> {
+    await req("/api/tenants", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name }),
+    });
+  },
+
+  async deleteTenant(name: string): Promise<void> {
+    await req(`/api/tenants/${encodeURIComponent(name)}`, { method: "DELETE" });
+  },
+
+  async listMembers(tenant: string): Promise<Member[]> {
+    return (
+      await req(`/api/tenants/${encodeURIComponent(tenant)}/members`)
+    ).json();
+  },
+
+  async addMember(tenant: string, email: string, role: Role): Promise<void> {
+    await req(`/api/tenants/${encodeURIComponent(tenant)}/members`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email, role }),
+    });
+  },
+
+  async removeMember(tenant: string, email: string): Promise<void> {
+    await req(
+      `/api/tenants/${encodeURIComponent(tenant)}/members/${encodeURIComponent(email)}`,
+      { method: "DELETE" },
+    );
+  },
+
+  // `tenant` scopes the listing to one team; omit for the untenanted view.
+  async listNamespaces(tenant?: string): Promise<Namespace[]> {
+    const q = tenant ? `?tenant=${encodeURIComponent(tenant)}` : "";
+    return (await req(`/api/namespaces${q}`)).json();
+  },
+
+  // `tenant` names the owning team; required when signed in, ignored otherwise.
+  async createNamespace(name: string, tenant?: string): Promise<void> {
+    await req("/api/namespaces", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(tenant ? { name, tenant } : { name }),
     });
   },
 

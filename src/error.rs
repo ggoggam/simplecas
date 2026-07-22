@@ -17,6 +17,16 @@ pub enum Error {
     NamespaceNotEmpty,
     #[error("invalid namespace name")]
     InvalidNamespaceName,
+    #[error("tenant not found")]
+    NoSuchTenant,
+    #[error("tenant already exists")]
+    TenantAlreadyExists,
+    #[error("tenant still has namespaces")]
+    TenantNotEmpty,
+    #[error("invalid tenant name")]
+    InvalidTenantName,
+    #[error("{0}")]
+    Forbidden(String),
     #[error("{0}")]
     InvalidArgument(String),
     #[error("invalid part: {0}")]
@@ -48,6 +58,11 @@ impl Error {
             Error::NamespaceAlreadyExists => "BucketAlreadyOwnedByYou",
             Error::NamespaceNotEmpty => "BucketNotEmpty",
             Error::InvalidNamespaceName => "InvalidBucketName",
+            Error::NoSuchTenant => "NoSuchTenant",
+            Error::TenantAlreadyExists => "TenantAlreadyExists",
+            Error::TenantNotEmpty => "TenantNotEmpty",
+            Error::InvalidTenantName => "InvalidTenantName",
+            Error::Forbidden(_) => "AccessDenied",
             Error::InvalidArgument(_) => "InvalidArgument",
             Error::InvalidPart(_) => "InvalidPart",
             Error::InvalidRange => "InvalidRange",
@@ -63,13 +78,20 @@ impl Error {
             Error::NoSuchNamespace | Error::NoSuchKey | Error::NoSuchUpload => {
                 StatusCode::NOT_FOUND
             }
-            Error::NamespaceAlreadyExists | Error::NamespaceNotEmpty => StatusCode::CONFLICT,
+            Error::NoSuchTenant => StatusCode::NOT_FOUND,
+            Error::NamespaceAlreadyExists
+            | Error::NamespaceNotEmpty
+            | Error::TenantAlreadyExists
+            | Error::TenantNotEmpty => StatusCode::CONFLICT,
             Error::InvalidNamespaceName
+            | Error::InvalidTenantName
             | Error::InvalidArgument(_)
             | Error::InvalidPart(_)
             | Error::MalformedXML(_) => StatusCode::BAD_REQUEST,
             Error::InvalidRange => StatusCode::RANGE_NOT_SATISFIABLE,
-            Error::AccessDenied | Error::SignatureDoesNotMatch => StatusCode::FORBIDDEN,
+            Error::AccessDenied | Error::SignatureDoesNotMatch | Error::Forbidden(_) => {
+                StatusCode::FORBIDDEN
+            }
             Error::Db(_) | Error::Storage(_) | Error::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
