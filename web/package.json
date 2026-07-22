@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@dnd-kit/react": "0.5.1-beta-20260713030121",
+    "@tanstack/react-router": "^1.170.18",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "hash-wasm": "^4.12.0",

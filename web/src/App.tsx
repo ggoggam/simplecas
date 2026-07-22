@@ -1,17 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Toaster } from "@/components/ui/sonner";
+import { getRouteApi, useRouter } from "@tanstack/react-router";
 import { toast } from "sonner";
 import { TreeView } from "@/components/tree-view";
 import type { FlatTreeNode } from "@/lib/tree-types";
+import { useTheme } from "@/lib/theme";
 import {
   api,
   formatBytes,
-  type Identity,
   type Member,
-  type Namespace,
   type Role,
-  type Stats,
-  type Tenant,
 } from "@/lib/api";
 import { loadLevel, loadTree, type Node, type NodeData } from "@/lib/tree";
 import { Button } from "@/components/ui/button";
@@ -71,20 +68,6 @@ function normalizeDest(p: string): string {
   return t === "" || t.endsWith("/") ? t : `${t}/`;
 }
 
-function useDarkMode(): [boolean, () => void] {
-  const [dark, setDark] = useState(
-    () =>
-      localStorage.getItem("theme") === "dark" ||
-      (!localStorage.getItem("theme") &&
-        window.matchMedia("(prefers-color-scheme: dark)").matches),
-  );
-  useEffect(() => {
-    document.documentElement.classList.toggle("dark", dark);
-    localStorage.setItem("theme", dark ? "dark" : "light");
-  }, [dark]);
-  return [dark, () => setDark((d) => !d)];
-}
-
 /** Track a CSS media query, re-rendering on change. */
 function useMediaQuery(query: string): boolean {
   const [matches, setMatches] = useState(
@@ -123,38 +106,48 @@ function StatCard({
   );
 }
 
-export default function App() {
-  const [dark, toggleDark] = useDarkMode();
+const rootApi = getRouteApi("__root__");
+const browseRoute = getRouteApi("/");
+
+/** Trim + strip leading slashes, matching how a browse prefix is stored. */
+const normPrefix = (s: string): string => s.trim().replace(/^\/+/, "");
+
+export function BrowserPage() {
+  const { dark, toggle: toggleDark } = useTheme();
+  const router = useRouter();
+  // Identity + tenancy come from the root loader; stats + namespaces from this
+  // route's loader — always freshly resolved before render, so the chrome
+  // (logout button, team switcher, stats) reflects real state, and a load
+  // failure surfaces in the route's errorComponent instead of a half-empty UI.
+  const { me, teamsMode, teams } = rootApi.useLoaderData();
+  const { stats, namespaces } = browseRoute.useLoaderData();
+  // Browse state lives in the URL query so the view is deep-linkable and
+  // back/forward works: ?team=<t>&ns=<n>&prefix=<p>.
+  const search = browseRoute.useSearch();
+  const navigate = browseRoute.useNavigate();
+  const active = search.ns ?? null;
+  const activeTeam = search.team ?? null;
+  const browsePrefix = search.prefix ?? "";
+
   // Below `lg` we swap the resizable three-pane layout for a single column with
   // bottom sheets for namespaces and object details.
   const isDesktop = useMediaQuery("(min-width: 1024px)");
   const [nsSheetOpen, setNsSheetOpen] = useState(false);
-  const [stats, setStats] = useState<Stats | null>(null);
-  const [namespaces, setNamespaces] = useState<Namespace[]>([]);
-  const [active, setActive] = useState<string | null>(null);
   const [items, setItems] = useState<Node[]>([]);
   const [loading, setLoading] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [expandedIds, setExpandedIds] = useState<string[]>([]);
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [uploadLabel, setUploadLabel] = useState<string | null>(null);
-  // `filterInput` is the controlled search box; `browsePrefix` is the debounced
-  // prefix the tree is actually rooted at.
-  const [filterInput, setFilterInput] = useState("");
-  const [browsePrefix, setBrowsePrefix] = useState("");
+  // `filterInput` is the controlled search box; its debounced value is written
+  // to the `prefix` search param, which is where the tree is actually rooted.
+  const [filterInput, setFilterInput] = useState(browsePrefix);
   // Upload dialog state.
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploadDest, setUploadDest] = useState("");
   const [uploadFiles, setUploadFiles] = useState<File[]>([]);
   // The object currently shown in the preview lightbox, if any.
   const [previewNode, setPreviewNode] = useState<NodeData | null>(null);
-  // Teams (multi-tenancy). `teamsMode` is null until we've probed /api/tenants:
-  // true when OIDC tenancy is active, false for the untenanted admin view.
-  const [teamsMode, setTeamsMode] = useState<boolean | null>(null);
-  const [teams, setTeams] = useState<Tenant[]>([]);
-  const [activeTeam, setActiveTeam] = useState<string | null>(
-    () => localStorage.getItem("activeTeam"),
-  );
   // Team-members management dialog.
   const [teamDialogOpen, setTeamDialogOpen] = useState(false);
   const [members, setMembers] = useState<Member[]>([]);
@@ -166,8 +159,36 @@ export default function App() {
     () => teams.find((t) => t.name === activeTeam)?.role ?? null,
     [teams, activeTeam],
   );
-  // The signed-in identity (null when sign-in isn't enabled), for the header.
-  const [me, setMe] = useState<Identity | null>(null);
+
+  // --- URL-driven browse navigation ----------------------------------------
+
+  // Switching team clears the namespace + prefix (a new team has its own set);
+  // switching namespace clears the prefix. `undefined` values drop from the URL.
+  // `replace` is used by the canonicalization effects so auto-corrections don't
+  // add history entries; user-initiated switches push (default) so Back works.
+  const setActiveTeam = useCallback(
+    (team: string | null, opts?: { replace?: boolean }) =>
+      navigate({
+        search: (p) => ({
+          ...p,
+          team: team ?? undefined,
+          ns: undefined,
+          prefix: undefined,
+        }),
+        replace: opts?.replace,
+      }),
+    [navigate],
+  );
+  const setActive = useCallback(
+    (ns: string | null, opts?: { replace?: boolean }) =>
+      navigate({
+        search: (p) => ({ ...p, ns: ns ?? undefined, prefix: undefined }),
+        replace: opts?.replace,
+      }),
+    [navigate],
+  );
+  // Re-run the loaders (identity/tenancy + stats/namespaces) after a mutation.
+  const reload = useCallback(() => router.invalidate(), [router]);
 
   // Map every loaded node id -> its data so selection ids resolve to NodeData.
   const nodeById = useMemo(() => {
@@ -202,58 +223,13 @@ export default function App() {
   // the root is unchanged (i.e. not a namespace switch or filter change).
   const lastRootRef = useRef<string | null>(null);
 
-  const refreshStats = useCallback(async () => {
-    try {
-      setStats(await api.stats());
-    } catch (e) {
-      toast.error(`stats: ${(e as Error).message}`);
-    }
-  }, []);
-
-  const refreshTeams = useCallback(async () => {
-    try {
-      const ts = await api.listTenants();
-      setTeamsMode(true);
-      setTeams(ts);
-      // Keep the current team if it still exists, else fall back to the first.
-      setActiveTeam((cur) =>
-        cur && ts.some((t) => t.name === cur) ? cur : (ts[0]?.name ?? null),
-      );
-    } catch {
-      // Tenancy unavailable (OIDC off, or no verified email): untenanted view.
-      setTeamsMode(false);
-    }
-  }, []);
-
-  const refreshNamespaces = useCallback(async () => {
-    // In teams mode, list only the active team's namespaces; with no active
-    // team (e.g. none created yet) there is nothing to show.
-    if (teamsMode && !activeTeam) {
-      setNamespaces([]);
-      setActive(null);
-      return;
-    }
-    try {
-      const bs = await api.listNamespaces(
-        teamsMode ? (activeTeam ?? undefined) : undefined,
-      );
-      setNamespaces(bs);
-      // Reset the active namespace if it isn't in the (possibly new) team's set.
-      setActive((cur) =>
-        cur && bs.some((b) => b.name === cur) ? cur : (bs[0]?.name ?? null),
-      );
-    } catch (e) {
-      toast.error(`namespaces: ${(e as Error).message}`);
-    }
-  }, [teamsMode, activeTeam]);
-
   const refreshRoot = useCallback(async () => {
     if (!active) {
       setItems([]);
       lastRootRef.current = null;
       return;
     }
-    const rootKey = `${active} ${browsePrefix}`;
+    const rootKey = `${active} ${browsePrefix}`;
     // Same root (manual refresh, post-upload/delete) → keep opened folders open;
     // a new root starts collapsed.
     const expanded =
@@ -271,27 +247,40 @@ export default function App() {
     }
   }, [active, browsePrefix]);
 
-  // Probe tenancy, identity, and load stats on mount.
+  // Canonicalize the team param: in teams mode default to the remembered/first
+  // team; in the untenanted view drop any stray `?team=`.
   useEffect(() => {
-    refreshTeams();
-    refreshStats();
-    api.me().then(setMe);
-  }, [refreshTeams, refreshStats]);
+    if (!teamsMode) {
+      if (activeTeam !== null) setActiveTeam(null, { replace: true });
+      return;
+    }
+    if (activeTeam && teams.some((t) => t.name === activeTeam)) return;
+    const remembered = localStorage.getItem("activeTeam");
+    const next =
+      remembered && teams.some((t) => t.name === remembered)
+        ? remembered
+        : (teams[0]?.name ?? null);
+    if (next !== activeTeam) setActiveTeam(next, { replace: true });
+  }, [teamsMode, teams, activeTeam, setActiveTeam]);
 
-  // (Re)load namespaces once the team context has resolved and whenever it
-  // changes (team switch). Waits for the tenancy probe so we don't double-fetch.
+  // Canonicalize the namespace param against the loaded list (which the loader
+  // has already scoped to the active team). Wait until a team is chosen so we
+  // don't pick a namespace from the pre-canonical cross-team listing.
   useEffect(() => {
-    if (teamsMode === null) return;
-    refreshNamespaces();
-  }, [teamsMode, refreshNamespaces]);
+    if (teamsMode && !activeTeam) return;
+    if (active && namespaces.some((b) => b.name === active)) return;
+    const next = namespaces[0]?.name ?? null;
+    if (next !== active) setActive(next, { replace: true });
+  }, [teamsMode, activeTeam, namespaces, active, setActive]);
 
-  // Persist the chosen team across reloads.
+  // Persist the chosen team so a fresh visit (no ?team=) restores it.
   useEffect(() => {
     if (activeTeam) localStorage.setItem("activeTeam", activeTeam);
     else localStorage.removeItem("activeTeam");
   }, [activeTeam]);
+
   // refreshRoot's identity changes only when the browse root does (namespace or
-  // filter), so this resets selection/expansion on a root change but NOT on an
+  // prefix), so this resets selection/expansion on a root change but NOT on an
   // ordinary expand/collapse (which leaves refreshRoot untouched).
   useEffect(() => {
     setSelectedIds([]);
@@ -299,20 +288,28 @@ export default function App() {
     refreshRoot();
   }, [refreshRoot]);
 
-  // Reset the prefix filter when switching namespaces.
+  // Mirror the prefix into the search box when it changes from the URL
+  // (back/forward, or a namespace switch that cleared it).
   useEffect(() => {
-    setFilterInput("");
-    setBrowsePrefix("");
-  }, [active]);
-
-  // Debounce the search box into the actual browse root.
-  useEffect(() => {
-    const id = setTimeout(
-      () => setBrowsePrefix(filterInput.trim().replace(/^\/+/, "")),
-      300,
+    setFilterInput((cur) =>
+      normPrefix(cur) === browsePrefix ? cur : browsePrefix,
     );
+  }, [browsePrefix]);
+
+  // Debounce the search box into the `prefix` search param.
+  useEffect(() => {
+    const id = setTimeout(() => {
+      const p = normPrefix(filterInput);
+      // Replace, not push: typing shouldn't stack a history entry per keystroke,
+      // but the prefix stays in the URL so the view is still deep-linkable.
+      if (p !== browsePrefix)
+        navigate({
+          search: (s) => ({ ...s, prefix: p || undefined }),
+          replace: true,
+        });
+    }, 300);
     return () => clearTimeout(id);
-  }, [filterInput]);
+  }, [filterInput, browsePrefix, navigate]);
 
   // Lazy expansion: a folder node loads its children the first time it opens.
   const loadChildren = useCallback(
@@ -334,9 +331,10 @@ export default function App() {
     try {
       await api.createNamespace(trimmed, teamsMode ? (activeTeam ?? undefined) : undefined);
       toast.success(`namespace "${trimmed}" created`);
-      await refreshNamespaces();
+      // Reload first so the new namespace is in the list, then select it (which
+      // the canonicalization effect would otherwise override).
+      await reload();
       setActive(trimmed);
-      refreshStats();
     } catch (e) {
       toast.error((e as Error).message);
     }
@@ -351,7 +349,7 @@ export default function App() {
     try {
       await api.createTenant(trimmed);
       toast.success(`team "${trimmed}" created`);
-      await refreshTeams();
+      await reload();
       setActiveTeam(trimmed);
     } catch (e) {
       toast.error((e as Error).message);
@@ -415,8 +413,7 @@ export default function App() {
       toast.success(`team "${name}" deleted`);
       setTeamDialogOpen(false);
       setActiveTeam(null);
-      await refreshTeams();
-      refreshStats();
+      await reload();
     } catch (e) {
       toast.error((e as Error).message);
     }
@@ -427,9 +424,8 @@ export default function App() {
     try {
       await api.deleteNamespace(name);
       toast.success(`namespace "${name}" deleted`);
-      setActive((cur) => (cur === name ? null : cur));
-      await refreshNamespaces();
-      refreshStats();
+      if (active === name) setActive(null);
+      await reload();
     } catch (e) {
       toast.error((e as Error).message);
     }
@@ -475,7 +471,7 @@ export default function App() {
     setUploadProgress(null);
     setUploadLabel(null);
     refreshRoot();
-    refreshStats();
+    reload();
   };
 
   const openUpload = () => {
@@ -553,7 +549,7 @@ export default function App() {
 
     setSelectedIds([]);
     refreshRoot();
-    refreshStats();
+    reload();
   };
 
   const dedupPct = useMemo(() => {
@@ -780,7 +776,7 @@ export default function App() {
             size="sm"
             onClick={() => {
               refreshRoot();
-              refreshStats();
+              reload();
             }}
             disabled={!active}
           >
@@ -948,8 +944,6 @@ export default function App() {
 
   return (
     <div className="flex h-full flex-col">
-      <Toaster richColors position="top-right" theme={dark ? "dark" : "light"} />
-
       {/* Header */}
       <header className="flex items-center gap-3 border-b px-5 py-3">
         <Database className="size-6 text-primary" />
