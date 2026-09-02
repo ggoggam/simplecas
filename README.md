@@ -4,12 +4,12 @@ A distributed **content-addressable storage** server with an **S3-compatible
 gateway**, **global file-level deduplication**, pluggable storage backends, and
 a bundled **PWA** for managing objects.
 
-- **Rust** (axum + tokio) for the server.
+- **Go** for the server, on the standard library's `net/http` — no web framework.
 - **PostgreSQL** as the shared metadata store, so you can run many stateless
   server instances behind a load balancer.
-- **[OpenDAL](https://opendal.apache.org/)** for storage, so blobs can live on
-  the local filesystem, **S3** (incl. MinIO / R2), **GCS**, or **Azure Blob**
-  with a one-line config change.
+- **[Go CDK blob](https://gocloud.dev/howto/blob/)** for storage, so blobs can
+  live on the local filesystem, **S3** (incl. MinIO / R2), **GCS**, or **Azure
+  Blob** with a one-line config change.
 - **[BLAKE3](https://github.com/BLAKE3-team/BLAKE3)** for hashing — chosen for
   its throughput (multi-GB/s, SIMD + internal parallelism), far ahead of
   SHA-256 while remaining cryptographically strong.
@@ -55,18 +55,20 @@ No mise? `docker compose -f docker/docker-compose.yml up --build` works the same
 
 ## Development
 
-Install [mise](https://mise.jdx.dev) — it provisions the toolchain (Rust, Bun,
-cargo-watch) and drives every workflow. Docker is used for a throwaway Postgres.
+Install [mise](https://mise.jdx.dev) — it provisions the toolchain (Go, Bun,
+golangci-lint) and drives every workflow. Docker is used for a throwaway
+Postgres and a local S3-compatible blob store.
 
 ```bash
 mise install         # install pinned tools
 mise run dev         # dev Postgres + auto-reloading backend + Vite dev server
 ```
 
-`mise run dev` starts three things: a dev Postgres container on `:55432`, the
-backend on `:9100` (rebuilt on Rust changes via cargo-watch), and the Vite dev
-server with hot module reload. Open the URL Vite prints — it proxies `/api` to
-the backend. Migrations run automatically on backend startup.
+`mise run dev` starts four things: a dev Postgres container on `:55432`, a
+[RustFS](https://github.com/rustfs/rustfs) S3-compatible blob store on `:9200`,
+the backend on `:9100`, and the Vite dev server with hot module reload. Open the
+URL Vite prints — it proxies `/api` to the backend. Migrations run automatically
+on backend startup.
 
 | Task                | What it does                                             |
 |---------------------|---------------------------------------------------------|
@@ -75,8 +77,10 @@ the backend. Migrations run automatically on backend startup.
 | `mise run down`     | Tear down the Docker stack (`down:clean` wipes volumes) |
 | `mise run logs`     | Follow Docker stack logs                                 |
 | `mise run db`       | Start just the dev Postgres (`db:stop` to remove it)    |
-| `mise run build`    | Production build: PWA then release binary                |
-| `mise run test`     | Rust test suite (`check`, `fmt`, `clippy` also defined) |
+| `mise run build`    | Production build: PWA then the binary with the UI embedded |
+| `mise run test`     | Unit tests (database-backed tests skip without a DB)     |
+| `mise run test:integration` | Full suite against the dev Postgres              |
+| `mise run check`    | `lint` + `test` (`fmt`, `vet`, `lint` also defined)      |
 | `mise run web:build`| Build the PWA into `web/dist`                            |
 
 Run `mise tasks` to list them all.
@@ -213,6 +217,12 @@ Auth is AWS **SigV4** (header-signed), toggled by `[auth] enabled`. When
 disabled, anonymous access works (`aws s3 --no-sign-request`, or put the server
 behind your own ingress auth).
 
+Request bodies framed as **`aws-chunked`** are decoded before hashing. The AWS
+SDKs use that framing whenever they cannot hash a payload up front — an
+unseekable stream, or a request carrying a trailing checksum — so a server that
+ignored it would store the chunk headers as part of the object. Chunk signatures
+themselves are not verified; the credential on the request line already is.
+
 **Deliberately unsupported:** versioning, ACLs/bucket policies, presigned URLs,
 POST-policy uploads, virtual-host-style addressing. ETags are BLAKE3 digests,
 not MD5.
@@ -269,17 +279,37 @@ the ordinary staging sweeper.
 ## Source layout
 
 ```
-src/
-  main.rs      entrypoint: config, pool, operator, router, GC task
-  config.rs    layered TOML + env config; backend selection
-  db.rs        all SQL: namespaces, objects, blobs/refcounts, multipart, listing, GC
-  cas.rs       content-addressed write path (stage → claim → commit), GC loop
-  storage.rs   OpenDAL operator construction + blob path layout
-  s3/          S3 gateway: mod.rs (handlers), xml.rs (wire types), sigv4.rs (auth)
-  api.rs       JSON admin API for the PWA
-  auth.rs      OIDC sign-in: discovery, signed-cookie sessions, guard middleware
-  ui.rs        serves the embedded PWA
-migrations/    sqlx migrations (run automatically on boot)
-web/           Vite + React + Tailwind PWA (shadcn/ui, ggoggam/shadcn-treeview)
-mise.toml      toolchain pins + dev/build/test tasks (`mise tasks`)
+cmd/simplecas/       entrypoint: config, pool, bucket, routes, GC task, shutdown
+internal/
+  apperr/            error type carrying an S3 code + HTTP status; XML and JSON rendering
+  config/            layered TOML + SIMPLECAS__ env config; backend selection
+  storage/           blob backend construction + the blobs/ and staging/ layout
+  db/                all SQL: namespaces, tenants, blobs/refcounts, objects, multipart, GC
+  db/migrations/     embedded SQL migrations (run automatically on boot)
+  cas/               content-addressed write path (stage → claim → commit) and the GC loop
+  s3/                S3 gateway: handlers, XML wire types, SigV4 verification
+  api/               JSON admin API for the PWA
+  auth/              OIDC sign-in: discovery, signed-cookie sessions, guard middleware
+  ui/                serves the embedded PWA
+  server/            route precedence across the four surfaces + request logging
+  testdb/            per-test Postgres schemas (test-only)
+web/                 Vite + React + Tailwind PWA (shadcn/ui, ggoggam/shadcn-treeview)
+web/embed.go         go:embed of web/dist, so the PWA ships inside the binary
+mise.toml            toolchain pins + dev/build/test tasks (`mise tasks`)
 ```
+
+### A note on routing
+
+Requests are dispatched on their first path segment rather than by
+`http.ServeMux`, because `ServeMux` cleans request paths — collapsing `//` and
+resolving `.` and `..` segments with a redirect — and S3 object keys may
+legitimately contain those sequences. The reserved first segments are therefore
+`api` and `ui`, plus `auth` whenever sign-in is enabled; those namespace names
+are unavailable.
+
+### Tests
+
+`go test ./...` runs everything, skipping the database-backed tests unless
+`SIMPLECAS_TEST_DATABASE_URL` is set (`mise run test:integration` starts the dev
+Postgres and sets it). Each such test provisions its own Postgres schema and
+drops it afterwards, so packages can run concurrently without interfering.
