@@ -1,10 +1,14 @@
-# Rust
-/target
+# Go
+/simplecas
+/coverage.out
 
 # Local storage backend + config with secrets
 /data
 /simplecas.local.toml
 
-# Frontend
+# Frontend. web/dist is embedded by go:embed, which needs the directory to
+# exist at compile time — hence the tracked .gitkeep. A build that hasn't run
+# `bun run build` yet serves a "UI not built" placeholder at runtime.
 /web/node_modules
-/web/dist
+/web/dist/*
+!/web/dist/.gitkeep

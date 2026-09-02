@@ -3,7 +3,8 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "path";
 
-// Built assets are embedded into the Rust binary and served under /ui/.
+// Built assets are embedded into the server binary (see web/embed.go) and
+// served under /ui/.
 export default defineConfig({
   base: "/ui/",
   plugins: [react(), tailwindcss()],

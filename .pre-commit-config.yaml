@@ -13,19 +13,26 @@ repos:
   - repo: local
     hooks:
       # Mutating: reformats in place so CI can auto-commit the result.
-      - id: rust-fmt
-        name: rust format
+      - id: go-fmt
+        name: go format
         entry: mise run fmt
         language: system
         pass_filenames: false
-        types: [rust]
+        types: [go]
 
-      - id: rust-clippy
-        name: rust clippy
-        entry: mise run clippy
+      - id: go-vet
+        name: go vet
+        entry: mise run vet
         language: system
         pass_filenames: false
-        types: [rust]
+        types: [go]
+
+      - id: golangci-lint
+        name: golangci-lint
+        entry: mise run lint
+        language: system
+        pass_filenames: false
+        types: [go]
 
       - id: frontend-lint
         name: frontend lint

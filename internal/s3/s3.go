@@ -1,0 +1,971 @@
+// Package s3 is the S3-compatible gateway, using path-style addressing.
+//
+// Supported: ListBuckets, Create/Delete/HeadBucket, GetBucketLocation,
+// ListObjects V1 and V2 (prefix, delimiter, pagination), Put/Get/Head/Delete
+// Object, CopyObject, DeleteObjects (batch), range GETs, and multipart uploads
+// (initiate, upload part, list parts, list uploads, complete, abort).
+//
+// Divergence from AWS: ETags are blake3 digests of the content, not MD5.
+// Deliberately unsupported: versioning, ACLs and policies, presigned URLs,
+// virtual-host addressing, and UploadPartCopy.
+//
+// The gateway parses the request path itself rather than going through
+// http.ServeMux. ServeMux cleans paths — collapsing "//" and resolving "."
+// and ".." segments, with a redirect — and S3 keys may legitimately contain
+// those sequences. Routing here therefore works on the escaped path and
+// unescapes the namespace and key separately.
+package s3
+
+import (
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/ggoggam/simplecas/internal/apperr"
+	"github.com/ggoggam/simplecas/internal/cas"
+	"github.com/ggoggam/simplecas/internal/config"
+	"github.com/ggoggam/simplecas/internal/db"
+	"github.com/ggoggam/simplecas/internal/storage"
+)
+
+// maxXMLBody caps the request bodies the gateway parses as XML (the batch
+// delete and multipart completion manifests).
+const maxXMLBody = 8 << 20
+
+// maxKeysLimit and related caps mirror S3's documented maxima.
+const (
+	maxKeysLimit    = 1000
+	maxPartsLimit   = 1000
+	maxUploadsLimit = 1000
+	maxPartNumber   = 10000
+)
+
+// Gateway serves the S3 API over the content-addressed store.
+type Gateway struct {
+	db   *db.DB
+	blob *storage.Bucket
+	cas  *cas.Store
+	cfg  *config.Config
+	log  *slog.Logger
+}
+
+// New returns a Gateway over the given store.
+func New(database *db.DB, bucket *storage.Bucket, store *cas.Store, cfg *config.Config, log *slog.Logger) *Gateway {
+	return &Gateway{db: database, blob: bucket, cas: store, cfg: cfg, log: log}
+}
+
+// ServeHTTP verifies the request signature, then dispatches on the addressed
+// level: service, namespace, or object.
+func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if err := verify(r, g.cfg.Auth); err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	namespace, key, err := splitPath(r.URL.EscapedPath())
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	switch {
+	case namespace == "":
+		g.serviceDispatch(w, r)
+	case key == "":
+		g.namespaceDispatch(w, r, namespace)
+	default:
+		g.objectDispatch(w, r, namespace, key)
+	}
+}
+
+// splitPath separates "/namespace/key..." into its two parts, unescaping each.
+// An empty namespace means the request addressed the service root.
+func splitPath(escapedPath string) (namespace, key string, err error) {
+	trimmed := strings.TrimPrefix(escapedPath, "/")
+	rawNamespace, rawKey, _ := strings.Cut(trimmed, "/")
+
+	namespace, unescapeErr := url.PathUnescape(rawNamespace)
+	if unescapeErr != nil {
+		return "", "", apperr.InvalidArgument("malformed namespace in path")
+	}
+	key, unescapeErr = url.PathUnescape(rawKey)
+	if unescapeErr != nil {
+		return "", "", apperr.InvalidArgument("malformed key in path")
+	}
+	return namespace, key, nil
+}
+
+// writeError renders err as an S3 XML error, logging the internal ones.
+func (g *Gateway) writeError(w http.ResponseWriter, r *http.Request, err error) {
+	if e := apperr.From(err); e.IsInternal() {
+		g.log.Error("s3 gateway error", "method", r.Method, "path", r.URL.Path, "err", err)
+	}
+	apperr.WriteXML(w, err)
+}
+
+// writeXML sends a rendered wire type. A marshalling failure is a bug in a wire
+// type rather than a bad request, so it is logged and reported as a 500.
+func (g *Gateway) writeXML(w http.ResponseWriter, r *http.Request, status int, v any) {
+	body, err := render(v)
+	if err != nil {
+		g.writeError(w, r, apperr.Internalf("render response: %w", err))
+		return
+	}
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(status)
+	if _, err := w.Write(body); err != nil {
+		g.log.Warn("could not write response body", "path", r.URL.Path, "err", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+
+// iso8601 is the timestamp format S3 uses in listings, to milliseconds.
+func iso8601(t time.Time) string {
+	return t.UTC().Format("2006-01-02T15:04:05.000Z")
+}
+
+// httpDate is the RFC 1123 form used for Last-Modified.
+func httpDate(t time.Time) string {
+	return t.UTC().Format("Mon, 02 Jan 2006 15:04:05 GMT")
+}
+
+// quotedETag wraps a digest in the quotes S3 clients expect.
+func quotedETag(hash string) string { return `"` + hash + `"` }
+
+// validNamespaceName applies S3's bucket-naming rules.
+func validNamespaceName(name string) bool {
+	if len(name) < 3 || len(name) > 63 {
+		return false
+	}
+	for i := range len(name) {
+		c := name[i]
+		lower := c >= 'a' && c <= 'z'
+		digit := c >= '0' && c <= '9'
+		if !lower && !digit && c != '-' && c != '.' {
+			return false
+		}
+	}
+	return isAlphanumeric(name[0]) && isAlphanumeric(name[len(name)-1])
+}
+
+func isAlphanumeric(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
+// contentTypeOf reads the request's declared media type, defaulting to opaque
+// bytes.
+func contentTypeOf(r *http.Request) string {
+	if ct := r.Header.Get("Content-Type"); ct != "" {
+		return ct
+	}
+	return "application/octet-stream"
+}
+
+// readXMLBody reads a bounded request body for XML parsing.
+func readXMLBody(r *http.Request) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxXMLBody))
+	if err != nil {
+		return nil, apperr.MalformedXML("%v", err)
+	}
+	return body, nil
+}
+
+// clampInt parses a query parameter into [1, max], falling back to max when it
+// is absent or unparseable — which is how S3 treats a missing limit.
+func clampInt(raw string, max int) int {
+	if raw == "" {
+		return max
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return max
+	}
+	if n < 1 {
+		return 1
+	}
+	if n > max {
+		return max
+	}
+	return n
+}
+
+// parseDelimiter validates the delimiter query parameter.
+//
+// Only a single printable-ASCII byte is accepted. Delimiter grouping walks the
+// keyspace by incrementing the delimiter's byte to skip past a group, and
+// keeping it inside printable ASCII guarantees the incremented byte is still
+// valid UTF-8 — which the resume marker has to be, since it goes back into
+// Postgres as text.
+func parseDelimiter(raw string) (byte, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	if len(raw) != 1 || raw[0] < 0x20 || raw[0] > 0x7e {
+		return 0, apperr.InvalidArgument("only single printable ASCII delimiters are supported")
+	}
+	return raw[0], nil
+}
+
+// parseRange interprets a Range header against a known object size.
+//
+// present is false for a header this server does not honour (a multi-range
+// request, or an unrecognised unit), which RFC 7233 allows to be ignored by
+// serving the whole object. A header that is recognised but unsatisfiable is an
+// error.
+func parseRange(header string, size int64) (start, end int64, present bool, err error) {
+	spec, ok := strings.CutPrefix(strings.TrimSpace(header), "bytes=")
+	if !ok {
+		return 0, 0, false, nil
+	}
+	// S3 honours a single range per request.
+	if strings.Contains(spec, ",") {
+		return 0, 0, false, nil
+	}
+	first, last, ok := strings.Cut(spec, "-")
+	if !ok {
+		return 0, 0, false, nil
+	}
+	first, last = strings.TrimSpace(first), strings.TrimSpace(last)
+
+	switch {
+	case first == "":
+		// A suffix range: the final n bytes.
+		n, convErr := strconv.ParseInt(last, 10, 64)
+		if convErr != nil || n == 0 {
+			return 0, 0, false, apperr.ErrInvalidRange
+		}
+		start, end = max(size-n, 0), size-1
+	case last == "":
+		// An open-ended range: from first to the end.
+		start, err = parseOffset(first)
+		if err != nil {
+			return 0, 0, false, err
+		}
+		end = size - 1
+	default:
+		start, err = parseOffset(first)
+		if err != nil {
+			return 0, 0, false, err
+		}
+		end, err = parseOffset(last)
+		if err != nil {
+			return 0, 0, false, err
+		}
+		end = min(end, size-1)
+	}
+
+	if start < 0 || start >= size || start > end {
+		return 0, 0, false, apperr.ErrInvalidRange
+	}
+	return start, end, true, nil
+}
+
+func parseOffset(s string) (int64, error) {
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, apperr.ErrInvalidRange
+	}
+	return n, nil
+}
+
+// parseUploadID rejects a malformed upload id as an unknown upload, so a
+// client cannot distinguish a typo from someone else's upload.
+func parseUploadID(raw string) (uuid.UUID, error) {
+	id, err := uuid.Parse(raw)
+	if err != nil {
+		return uuid.Nil, apperr.ErrNoSuchUpload
+	}
+	return id, nil
+}
+
+// ---------------------------------------------------------------------------
+// Service level
+// ---------------------------------------------------------------------------
+
+func (g *Gateway) serviceDispatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	g.listNamespaces(w, r)
+}
+
+func (g *Gateway) listNamespaces(w http.ResponseWriter, r *http.Request) {
+	namespaces, err := g.db.ListNamespaces(r.Context())
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	entries := make([]bucketEntry, 0, len(namespaces))
+	for _, ns := range namespaces {
+		entries = append(entries, bucketEntry{
+			Name:         ns.Name,
+			CreationDate: iso8601(ns.CreatedAt),
+		})
+	}
+	g.writeXML(w, r, http.StatusOK, listAllMyBucketsResult{
+		Xmlns:   xmlns,
+		Owner:   owner{ID: "simplecas", DisplayName: "simplecas"},
+		Buckets: buckets{Bucket: entries},
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Namespace level
+// ---------------------------------------------------------------------------
+
+func (g *Gateway) namespaceDispatch(w http.ResponseWriter, r *http.Request, namespace string) {
+	query := r.URL.Query()
+
+	switch r.Method {
+	case http.MethodPut:
+		g.createNamespace(w, r, namespace)
+
+	case http.MethodDelete:
+		if err := g.db.DeleteNamespace(r.Context(), namespace); err != nil {
+			g.writeError(w, r, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+
+	case http.MethodHead:
+		if _, err := g.db.GetNamespace(r.Context(), namespace); err != nil {
+			g.writeError(w, r, err)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+
+	case http.MethodGet:
+		switch {
+		case query.Has("location"):
+			g.writeXML(w, r, http.StatusOK, locationConstraint{
+				Xmlns:  xmlns,
+				Region: g.cfg.Server.Region,
+			})
+		case query.Has("versioning"):
+			g.writeXML(w, r, http.StatusOK, versioningConfiguration{Xmlns: xmlns})
+		case query.Has("uploads"):
+			g.listMultipartUploads(w, r, namespace, query)
+		default:
+			g.listObjects(w, r, namespace, query)
+		}
+
+	case http.MethodPost:
+		if query.Has("delete") {
+			g.deleteObjects(w, r, namespace)
+			return
+		}
+		w.Header().Set("Allow", "GET, PUT, HEAD, DELETE, POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+
+	default:
+		w.Header().Set("Allow", "GET, PUT, HEAD, DELETE, POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (g *Gateway) createNamespace(w http.ResponseWriter, r *http.Request, namespace string) {
+	if !validNamespaceName(namespace) {
+		g.writeError(w, r, apperr.ErrInvalidNamespaceName)
+		return
+	}
+	// Namespaces created through the gateway are unowned: the S3 plane is a
+	// single trusted admin plane, with no tenant identity to attribute them to.
+	if err := g.db.CreateNamespace(r.Context(), namespace, nil); err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	w.Header().Set("Location", "/"+namespace)
+	w.WriteHeader(http.StatusOK)
+}
+
+func (g *Gateway) listObjects(w http.ResponseWriter, r *http.Request, namespace string, query url.Values) {
+	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	v2 := query.Get("list-type") == "2"
+	prefix := query.Get("prefix")
+	delimiter, err := parseDelimiter(query.Get("delimiter"))
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	maxKeys := clampInt(query.Get("max-keys"), maxKeysLimit)
+
+	marker, err := listStartMarker(query, v2)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	listing, err := g.db.ListObjects(r.Context(), ns.ID, prefix, delimiter, marker, maxKeys)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	result := listBucketResult{
+		Xmlns:       xmlns,
+		Name:        namespace,
+		Prefix:      prefix,
+		MaxKeys:     maxKeys,
+		KeyCount:    len(listing.Objects) + len(listing.CommonPrefixes),
+		IsTruncated: listing.IsTruncated,
+	}
+	if delimiter != 0 {
+		d := string(delimiter)
+		result.Delimiter = &d
+	}
+
+	if v2 {
+		if token := query.Get("continuation-token"); token != "" {
+			result.ContinuationToken = &token
+		}
+		if listing.IsTruncated {
+			next := encodeToken(listing.NextMarker)
+			result.NextContinuationToken = &next
+		}
+	} else {
+		result.Marker = &marker
+		if listing.IsTruncated {
+			// V1 falls back to the last returned key when the listing has no
+			// marker of its own.
+			next := listing.NextMarker
+			if next == "" && len(listing.Objects) > 0 {
+				next = listing.Objects[len(listing.Objects)-1].Key
+			}
+			result.NextMarker = &next
+		}
+	}
+
+	result.Contents = make([]contents, 0, len(listing.Objects))
+	for _, o := range listing.Objects {
+		result.Contents = append(result.Contents, contents{
+			Key:          o.Key,
+			LastModified: iso8601(o.UpdatedAt),
+			ETag:         quotedETag(o.BlobHash),
+			Size:         o.Size,
+			StorageClass: "STANDARD",
+		})
+	}
+	result.CommonPrefixes = make([]commonPrefix, 0, len(listing.CommonPrefixes))
+	for _, p := range listing.CommonPrefixes {
+		result.CommonPrefixes = append(result.CommonPrefixes, commonPrefix{Prefix: p})
+	}
+
+	g.writeXML(w, r, http.StatusOK, result)
+}
+
+// listStartMarker resolves where a listing resumes from. V2 uses an opaque
+// base64 continuation token (or start-after on the first page); V1 uses a raw
+// marker.
+func listStartMarker(query url.Values, v2 bool) (string, error) {
+	if !v2 {
+		return query.Get("marker"), nil
+	}
+	if token := query.Get("continuation-token"); token != "" {
+		marker, err := decodeToken(token)
+		if err != nil {
+			return "", apperr.InvalidArgument("bad continuation-token")
+		}
+		return marker, nil
+	}
+	return query.Get("start-after"), nil
+}
+
+func (g *Gateway) deleteObjects(w http.ResponseWriter, r *http.Request, namespace string) {
+	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	raw, err := readXMLBody(r)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	var req deleteRequest
+	if err := unmarshalXML(raw, &req); err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	deleted := make([]deletedEntry, 0, len(req.Objects))
+	var failures []deleteErrorEntry
+	for _, entry := range req.Objects {
+		if _, err := g.db.DeleteObject(r.Context(), ns.ID, entry.Key); err != nil {
+			e := apperr.From(err)
+			failures = append(failures, deleteErrorEntry{
+				Key:     entry.Key,
+				Code:    e.S3Code(),
+				Message: e.Error(),
+			})
+			continue
+		}
+		// S3 reports an absent key as deleted too: DELETE is idempotent.
+		// The request and response entries carry the same single Key field,
+		// so a conversion says it without restating the field.
+		deleted = append(deleted, deletedEntry(entry))
+	}
+	if req.Quiet {
+		deleted = nil
+	}
+
+	g.writeXML(w, r, http.StatusOK, deleteResult{
+		Xmlns:   xmlns,
+		Deleted: deleted,
+		Errors:  failures,
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Object level
+// ---------------------------------------------------------------------------
+
+func (g *Gateway) objectDispatch(w http.ResponseWriter, r *http.Request, namespace, key string) {
+	query := r.URL.Query()
+
+	switch r.Method {
+	case http.MethodPut:
+		partNumber, uploadID := query.Get("partNumber"), query.Get("uploadId")
+		switch {
+		case partNumber != "" && uploadID != "":
+			if r.Header.Get("x-amz-copy-source") != "" {
+				g.writeError(w, r, apperr.InvalidArgument("UploadPartCopy is not supported"))
+				return
+			}
+			g.uploadPart(w, r, namespace, key, partNumber, uploadID)
+		case r.Header.Get("x-amz-copy-source") != "":
+			g.copyObject(w, r, namespace, key)
+		default:
+			g.putObject(w, r, namespace, key)
+		}
+
+	case http.MethodGet:
+		if uploadID := query.Get("uploadId"); uploadID != "" {
+			g.listParts(w, r, namespace, key, uploadID, query)
+			return
+		}
+		g.serveObject(w, r, namespace, key, false)
+
+	case http.MethodHead:
+		g.serveObject(w, r, namespace, key, true)
+
+	case http.MethodDelete:
+		if uploadID := query.Get("uploadId"); uploadID != "" {
+			g.abortMultipart(w, r, namespace, key, uploadID)
+			return
+		}
+		g.deleteObject(w, r, namespace, key)
+
+	case http.MethodPost:
+		switch {
+		case query.Has("uploads"):
+			g.initiateMultipart(w, r, namespace, key)
+		case query.Get("uploadId") != "":
+			g.completeMultipart(w, r, namespace, key, query.Get("uploadId"))
+		default:
+			w.Header().Set("Allow", "GET, PUT, HEAD, DELETE, POST")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+
+	default:
+		w.Header().Set("Allow", "GET, PUT, HEAD, DELETE, POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (g *Gateway) putObject(w http.ResponseWriter, r *http.Request, namespace, key string) {
+	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	staged, err := g.cas.Stage(r.Context(), bodyReader(r))
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	etag, err := g.cas.Commit(r.Context(), ns.ID, key, contentTypeOf(r), staged)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	w.Header().Set("ETag", quotedETag(etag))
+	w.WriteHeader(http.StatusOK)
+}
+
+// copyObject is a pure metadata operation under content addressing: the
+// destination claims another reference to the source blob, and no bytes move.
+func (g *Gateway) copyObject(w http.ResponseWriter, r *http.Request, dstNamespace, dstKey string) {
+	source, err := url.PathUnescape(r.Header.Get("x-amz-copy-source"))
+	if err != nil {
+		g.writeError(w, r, apperr.InvalidArgument("bad x-amz-copy-source"))
+		return
+	}
+	srcNamespace, srcKey, ok := strings.Cut(strings.TrimPrefix(source, "/"), "/")
+	if !ok || srcKey == "" {
+		g.writeError(w, r, apperr.InvalidArgument("x-amz-copy-source must be bucket/key"))
+		return
+	}
+
+	srcNS, err := g.db.GetNamespace(r.Context(), srcNamespace)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	src, err := g.db.GetObject(r.Context(), srcNS.ID, srcKey)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	dstNS, err := g.db.GetNamespace(r.Context(), dstNamespace)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	etag, err := g.cas.CopyObject(r.Context(), src, dstNS.ID, dstKey)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	g.writeXML(w, r, http.StatusOK, copyObjectResult{
+		Xmlns:        xmlns,
+		LastModified: iso8601(time.Now()),
+		ETag:         quotedETag(etag),
+	})
+}
+
+func (g *Gateway) deleteObject(w http.ResponseWriter, r *http.Request, namespace, key string) {
+	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	if _, err := g.db.DeleteObject(r.Context(), ns.ID, key); err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ServeObject writes an object (or just its headers) to w. It is exported so
+// the admin API can serve downloads through the same code path.
+func (g *Gateway) ServeObject(w http.ResponseWriter, r *http.Request, namespace, key string) {
+	g.serveObject(w, r, namespace, key, false)
+}
+
+func (g *Gateway) serveObject(w http.ResponseWriter, r *http.Request, namespace, key string, headOnly bool) {
+	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	meta, err := g.db.GetObject(r.Context(), ns.ID, key)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	start, end := int64(0), meta.Size-1
+	status := http.StatusOK
+	// A zero-byte object has no satisfiable range, so the whole (empty) body
+	// is served instead of rejecting the request.
+	if header := r.Header.Get("Range"); header != "" && meta.Size > 0 {
+		rangeStart, rangeEnd, present, err := parseRange(header, meta.Size)
+		if err != nil {
+			g.writeError(w, r, err)
+			return
+		}
+		if present {
+			start, end = rangeStart, rangeEnd
+			status = http.StatusPartialContent
+			w.Header().Set("Content-Range",
+				fmt.Sprintf("bytes %d-%d/%d", start, end, meta.Size))
+		}
+	}
+
+	length := int64(0)
+	if meta.Size > 0 {
+		length = end - start + 1
+	}
+
+	w.Header().Set("Content-Type", meta.ContentType)
+	w.Header().Set("ETag", quotedETag(meta.BlobHash))
+	w.Header().Set("Last-Modified", httpDate(meta.UpdatedAt))
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("x-amz-meta-blake3", meta.BlobHash)
+	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+
+	if headOnly || length == 0 {
+		w.WriteHeader(status)
+		return
+	}
+
+	reader, err := g.blob.NewRangeReader(r.Context(), storage.BlobPath(meta.BlobHash), start, length, nil)
+	if err != nil {
+		g.writeError(w, r, apperr.Internalf("open blob: %w", err))
+		return
+	}
+	defer func() { _ = reader.Close() }()
+
+	w.WriteHeader(status)
+	// Past this point the status and headers are committed, so a failure can
+	// only be logged — the client sees a truncated body.
+	if _, err := io.Copy(w, reader); err != nil {
+		g.log.Warn("object stream interrupted",
+			"namespace", namespace, "key", key, "err", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Multipart
+// ---------------------------------------------------------------------------
+
+func (g *Gateway) initiateMultipart(w http.ResponseWriter, r *http.Request, namespace, key string) {
+	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	id, err := g.db.CreateMultipart(r.Context(), ns.ID, key, contentTypeOf(r))
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	g.writeXML(w, r, http.StatusOK, initiateMultipartUploadResult{
+		Xmlns:    xmlns,
+		Bucket:   namespace,
+		Key:      key,
+		UploadID: id.String(),
+	})
+}
+
+func (g *Gateway) uploadPart(w http.ResponseWriter, r *http.Request, namespace, key, rawPartNumber, rawUploadID string) {
+	partNumber, err := strconv.Atoi(rawPartNumber)
+	if err != nil || partNumber < 1 || partNumber > maxPartNumber {
+		g.writeError(w, r, apperr.InvalidArgument("partNumber must be 1-%d", maxPartNumber))
+		return
+	}
+	uploadID, err := parseUploadID(rawUploadID)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	upload, err := g.db.GetMultipart(r.Context(), ns.ID, key, uploadID)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	// Parts stay in staging under their own part-level digest; dedup happens
+	// once at completion, when the hash of the whole object is known.
+	staged, err := g.cas.Stage(r.Context(), bodyReader(r))
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	replaced, err := g.db.PutPart(r.Context(), upload.ID, int32(partNumber),
+		staged.StagingKey, staged.Size, staged.Hash)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	if replaced != "" {
+		g.cas.DiscardStaging(r.Context(), replaced)
+	}
+
+	w.Header().Set("ETag", quotedETag(staged.Hash))
+	w.WriteHeader(http.StatusOK)
+}
+
+func (g *Gateway) listParts(w http.ResponseWriter, r *http.Request, namespace, key, rawUploadID string, query url.Values) {
+	uploadID, err := parseUploadID(rawUploadID)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	upload, err := g.db.GetMultipart(r.Context(), ns.ID, key, uploadID)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	marker := 0
+	if raw := query.Get("part-number-marker"); raw != "" {
+		if n, convErr := strconv.Atoi(raw); convErr == nil {
+			marker = n
+		}
+	}
+	maxParts := clampInt(query.Get("max-parts"), maxPartsLimit)
+
+	page, err := g.db.ListPartsPage(r.Context(), upload.ID, int32(marker), int64(maxParts))
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	result := listPartsResult{
+		Xmlns:            xmlns,
+		Bucket:           namespace,
+		Key:              key,
+		UploadID:         rawUploadID,
+		PartNumberMarker: int32(marker),
+		MaxParts:         int64(maxParts),
+		IsTruncated:      page.IsTruncated,
+		Parts:            make([]partEntry, 0, len(page.Parts)),
+	}
+	if page.IsTruncated && len(page.Parts) > 0 {
+		next := page.Parts[len(page.Parts)-1].PartNumber
+		result.NextPartNumberMarker = &next
+	}
+	for _, p := range page.Parts {
+		result.Parts = append(result.Parts, partEntry{
+			PartNumber: p.PartNumber,
+			ETag:       quotedETag(p.ETag),
+			Size:       p.Size,
+		})
+	}
+	g.writeXML(w, r, http.StatusOK, result)
+}
+
+func (g *Gateway) listMultipartUploads(w http.ResponseWriter, r *http.Request, namespace string, query url.Values) {
+	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	prefix := query.Get("prefix")
+	maxUploads := clampInt(query.Get("max-uploads"), maxUploadsLimit)
+
+	uploads, err := g.db.ListMultipartUploads(r.Context(), ns.ID, prefix, int64(maxUploads))
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	entries := make([]uploadEntry, 0, len(uploads))
+	for _, u := range uploads {
+		entries = append(entries, uploadEntry{
+			Key:       u.Key,
+			UploadID:  u.ID.String(),
+			Initiated: iso8601(u.CreatedAt),
+		})
+	}
+	g.writeXML(w, r, http.StatusOK, listMultipartUploadsResult{
+		Xmlns:       xmlns,
+		Bucket:      namespace,
+		Prefix:      prefix,
+		MaxUploads:  int64(maxUploads),
+		IsTruncated: false,
+		Uploads:     entries,
+	})
+}
+
+func (g *Gateway) completeMultipart(w http.ResponseWriter, r *http.Request, namespace, key, rawUploadID string) {
+	uploadID, err := parseUploadID(rawUploadID)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	upload, err := g.db.GetMultipart(r.Context(), ns.ID, key, uploadID)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	raw, err := readXMLBody(r)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	var manifest completeMultipartUpload
+	if err := unmarshalXML(raw, &manifest); err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	stored, err := g.db.ListParts(r.Context(), upload.ID)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	ordered, err := resolveManifest(manifest.Parts, stored)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	etag, err := g.cas.CompleteMultipart(r.Context(), upload, ordered)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	g.writeXML(w, r, http.StatusOK, completeMultipartUploadResult{
+		Xmlns:    xmlns,
+		Location: "/" + namespace + "/" + key,
+		Bucket:   namespace,
+		Key:      key,
+		ETag:     quotedETag(etag),
+	})
+}
+
+func (g *Gateway) abortMultipart(w http.ResponseWriter, r *http.Request, namespace, key, rawUploadID string) {
+	uploadID, err := parseUploadID(rawUploadID)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	upload, err := g.db.GetMultipart(r.Context(), ns.ID, key, uploadID)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	keys, err := g.db.RemoveMultipart(r.Context(), upload.ID)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	for _, stagingKey := range keys {
+		g.cas.DiscardStaging(r.Context(), stagingKey)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
