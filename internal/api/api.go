@@ -4,8 +4,11 @@
 // Authorization: when OIDC is enabled the guard middleware attaches the
 // caller's session to each request, and every namespace is scoped to the tenant
 // that owns it — a caller sees and touches only namespaces belonging to a team
-// they are a member of. Namespaces with no tenant (those created through the S3
-// admin plane) are invisible here.
+// they are a member of. Namespaces with no tenant (those created with the S3
+// superuser credential) are invisible here.
+//
+// This plane also mints the per-team S3 credentials the gateway authenticates;
+// see credential.go.
 //
 // When OIDC is disabled there is no caller and this is the unauthenticated
 // full-access plane it has always been: put it behind ingress auth or bind it
@@ -75,6 +78,10 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /api/tenants/{tenant}/members", h.listMembers)
 	mux.HandleFunc("POST /api/tenants/{tenant}/members", h.addMember)
 	mux.HandleFunc("DELETE /api/tenants/{tenant}/members/{email}", h.removeMember)
+
+	mux.HandleFunc("GET /api/tenants/{tenant}/credentials", h.listCredentials)
+	mux.HandleFunc("POST /api/tenants/{tenant}/credentials", h.createCredential)
+	mux.HandleFunc("DELETE /api/tenants/{tenant}/credentials/{accessKeyId}", h.deleteCredential)
 
 	mux.HandleFunc("GET /api/namespaces", h.listNamespaces)
 	mux.HandleFunc("POST /api/namespaces", h.createNamespace)
@@ -452,7 +459,7 @@ func (h *Handler) createNamespace(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name string `json:"name"`
 		// Tenant names the owning team. Required when signed in; ignored on
-		// the unauthenticated admin plane, where namespaces are unowned.
+		// the unauthenticated plane, where namespaces are unowned.
 		Tenant string `json:"tenant"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
@@ -640,9 +647,10 @@ func (h *Handler) getObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The namespace is already authorized; the gateway resolves it again by
-	// name, which keeps one read path for both planes.
-	h.gateway.ServeObject(w, r, namespace, key)
+	// The gateway supplies the read path for both planes; it takes the row
+	// this handler already authorized rather than resolving the name again,
+	// so /api's membership check is the only authorization that applies.
+	h.gateway.ServeObject(w, r, ns, key)
 }
 
 // putObject dispatches a PUT: upload a part (?uploadId&partNumber), link an

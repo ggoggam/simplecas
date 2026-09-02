@@ -9,6 +9,13 @@
 // Deliberately unsupported: versioning, ACLs and policies, presigned URLs,
 // virtual-host addressing, and UploadPartCopy.
 //
+// Authorization: every request is SigV4-verified, and the credential decides
+// what it can address. The key in simplecas.toml is a superuser that reaches
+// every namespace; a key from tenant_credentials reaches only its own tenant's
+// namespaces, with everything else reported as NoSuchBucket. See principal.go —
+// g.namespace is the single chokepoint that turns a name from a request into a
+// row, so no handler here can resolve a namespace outside the caller's scope.
+//
 // The gateway parses the request path itself rather than going through
 // http.ServeMux. ServeMux cleans paths — collapsing "//" and resolving "."
 // and ".." segments, with a redirect — and S3 keys may legitimately contain
@@ -61,13 +68,20 @@ func New(database *db.DB, bucket *storage.Bucket, store *cas.Store, cfg *config.
 	return &Gateway{db: database, blob: bucket, cas: store, cfg: cfg, log: log}
 }
 
-// ServeHTTP verifies the request signature, then dispatches on the addressed
-// level: service, namespace, or object.
+// ServeHTTP verifies the request signature and resolves the tenant scope its
+// credential grants, then dispatches on the addressed level: service,
+// namespace, or object.
+//
+// The resolved principal rides on the request context from here on, and
+// g.namespace is the only way a handler turns a namespace name into a row — so
+// every level below this point is tenant-scoped by construction.
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if err := verify(r, g.cfg.Auth); err != nil {
+	p, err := g.authenticate(r)
+	if err != nil {
 		g.writeError(w, r, err)
 		return
 	}
+	r = r.WithContext(withPrincipal(r.Context(), p))
 
 	namespace, key, err := splitPath(r.URL.EscapedPath())
 	if err != nil {
@@ -302,7 +316,21 @@ func (g *Gateway) serviceDispatch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gateway) listNamespaces(w http.ResponseWriter, r *http.Request) {
-	namespaces, err := g.db.ListNamespaces(r.Context())
+	p, ok := principalFrom(r.Context())
+	if !ok {
+		g.writeError(w, r, apperr.Internalf("s3: ListBuckets without authentication"))
+		return
+	}
+
+	var (
+		namespaces []db.Namespace
+		err        error
+	)
+	if p.tenantID != nil {
+		namespaces, err = g.db.ListNamespacesForTenants(r.Context(), []int64{*p.tenantID})
+	} else {
+		namespaces, err = g.db.ListNamespaces(r.Context())
+	}
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -334,6 +362,13 @@ func (g *Gateway) namespaceDispatch(w http.ResponseWriter, r *http.Request, name
 		g.createNamespace(w, r, namespace)
 
 	case http.MethodDelete:
+		// Resolved in scope first: a tenant must not be able to delete a
+		// namespace it cannot address, and an out-of-scope name has to look
+		// missing rather than forbidden.
+		if _, err := g.namespace(r, namespace); err != nil {
+			g.writeError(w, r, err)
+			return
+		}
 		if err := g.db.DeleteNamespace(r.Context(), namespace); err != nil {
 			g.writeError(w, r, err)
 			return
@@ -341,7 +376,7 @@ func (g *Gateway) namespaceDispatch(w http.ResponseWriter, r *http.Request, name
 		w.WriteHeader(http.StatusNoContent)
 
 	case http.MethodHead:
-		if _, err := g.db.GetNamespace(r.Context(), namespace); err != nil {
+		if _, err := g.namespace(r, namespace); err != nil {
 			g.writeError(w, r, err)
 			return
 		}
@@ -381,9 +416,15 @@ func (g *Gateway) createNamespace(w http.ResponseWriter, r *http.Request, namesp
 		g.writeError(w, r, apperr.ErrInvalidNamespaceName)
 		return
 	}
-	// Namespaces created through the gateway are unowned: the S3 plane is a
-	// single trusted admin plane, with no tenant identity to attribute them to.
-	if err := g.db.CreateNamespace(r.Context(), namespace, nil); err != nil {
+	// A tenanted credential owns what it creates, so the namespace is visible
+	// to that team in /ui and /api too. The admin credential has no tenant
+	// identity to attribute, so its namespaces stay unowned.
+	p, ok := principalFrom(r.Context())
+	if !ok {
+		g.writeError(w, r, apperr.Internalf("s3: CreateBucket without authentication"))
+		return
+	}
+	if err := g.db.CreateNamespace(r.Context(), namespace, p.tenantID); err != nil {
 		g.writeError(w, r, err)
 		return
 	}
@@ -392,7 +433,7 @@ func (g *Gateway) createNamespace(w http.ResponseWriter, r *http.Request, namesp
 }
 
 func (g *Gateway) listObjects(w http.ResponseWriter, r *http.Request, namespace string, query url.Values) {
-	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	ns, err := g.namespace(r, namespace)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -489,7 +530,7 @@ func listStartMarker(query url.Values, v2 bool) (string, error) {
 }
 
 func (g *Gateway) deleteObjects(w http.ResponseWriter, r *http.Request, namespace string) {
-	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	ns, err := g.namespace(r, namespace)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -591,7 +632,7 @@ func (g *Gateway) objectDispatch(w http.ResponseWriter, r *http.Request, namespa
 }
 
 func (g *Gateway) putObject(w http.ResponseWriter, r *http.Request, namespace, key string) {
-	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	ns, err := g.namespace(r, namespace)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -612,6 +653,11 @@ func (g *Gateway) putObject(w http.ResponseWriter, r *http.Request, namespace, k
 
 // copyObject is a pure metadata operation under content addressing: the
 // destination claims another reference to the source blob, and no bytes move.
+//
+// Source and destination are both resolved in the caller's scope, so a tenanted
+// credential can only copy within its own tenant. Naming another tenant's
+// bucket as the source fails as NoSuchBucket — without this, copy would be a
+// way to pull any tenant's object into your own namespace by name.
 func (g *Gateway) copyObject(w http.ResponseWriter, r *http.Request, dstNamespace, dstKey string) {
 	source, err := url.PathUnescape(r.Header.Get("x-amz-copy-source"))
 	if err != nil {
@@ -624,7 +670,7 @@ func (g *Gateway) copyObject(w http.ResponseWriter, r *http.Request, dstNamespac
 		return
 	}
 
-	srcNS, err := g.db.GetNamespace(r.Context(), srcNamespace)
+	srcNS, err := g.namespace(r, srcNamespace)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -634,7 +680,7 @@ func (g *Gateway) copyObject(w http.ResponseWriter, r *http.Request, dstNamespac
 		g.writeError(w, r, err)
 		return
 	}
-	dstNS, err := g.db.GetNamespace(r.Context(), dstNamespace)
+	dstNS, err := g.namespace(r, dstNamespace)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -653,7 +699,7 @@ func (g *Gateway) copyObject(w http.ResponseWriter, r *http.Request, dstNamespac
 }
 
 func (g *Gateway) deleteObject(w http.ResponseWriter, r *http.Request, namespace, key string) {
-	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	ns, err := g.namespace(r, namespace)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -667,16 +713,27 @@ func (g *Gateway) deleteObject(w http.ResponseWriter, r *http.Request, namespace
 
 // ServeObject writes an object (or just its headers) to w. It is exported so
 // the admin API can serve downloads through the same code path.
-func (g *Gateway) ServeObject(w http.ResponseWriter, r *http.Request, namespace, key string) {
-	g.serveObject(w, r, namespace, key, false)
+//
+// It takes an already-resolved namespace rather than a name: /api authorizes
+// through tenant membership, which is a different check from the S3 plane's
+// credential scope, and re-resolving here would either redo the wrong one or
+// silently depend on /api having done it. Passing the row makes the caller's
+// authorization the only one that applies.
+func (g *Gateway) ServeObject(w http.ResponseWriter, r *http.Request, ns db.Namespace, key string) {
+	g.serveResolvedObject(w, r, ns, key, false)
 }
 
+// serveObject resolves the namespace in the caller's S3 scope, then serves it.
 func (g *Gateway) serveObject(w http.ResponseWriter, r *http.Request, namespace, key string, headOnly bool) {
-	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	ns, err := g.namespace(r, namespace)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
 	}
+	g.serveResolvedObject(w, r, ns, key, headOnly)
+}
+
+func (g *Gateway) serveResolvedObject(w http.ResponseWriter, r *http.Request, ns db.Namespace, key string, headOnly bool) {
 	meta, err := g.db.GetObject(r.Context(), ns.ID, key)
 	if err != nil {
 		g.writeError(w, r, err)
@@ -730,7 +787,7 @@ func (g *Gateway) serveObject(w http.ResponseWriter, r *http.Request, namespace,
 	// only be logged — the client sees a truncated body.
 	if _, err := io.Copy(w, reader); err != nil {
 		g.log.Warn("object stream interrupted",
-			"namespace", namespace, "key", key, "err", err)
+			"namespace", ns.Name, "key", key, "err", err)
 	}
 }
 
@@ -739,7 +796,7 @@ func (g *Gateway) serveObject(w http.ResponseWriter, r *http.Request, namespace,
 // ---------------------------------------------------------------------------
 
 func (g *Gateway) initiateMultipart(w http.ResponseWriter, r *http.Request, namespace, key string) {
-	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	ns, err := g.namespace(r, namespace)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -769,7 +826,7 @@ func (g *Gateway) uploadPart(w http.ResponseWriter, r *http.Request, namespace, 
 		return
 	}
 
-	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	ns, err := g.namespace(r, namespace)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -807,7 +864,7 @@ func (g *Gateway) listParts(w http.ResponseWriter, r *http.Request, namespace, k
 		g.writeError(w, r, err)
 		return
 	}
-	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	ns, err := g.namespace(r, namespace)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -857,7 +914,7 @@ func (g *Gateway) listParts(w http.ResponseWriter, r *http.Request, namespace, k
 }
 
 func (g *Gateway) listMultipartUploads(w http.ResponseWriter, r *http.Request, namespace string, query url.Values) {
-	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	ns, err := g.namespace(r, namespace)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -895,7 +952,7 @@ func (g *Gateway) completeMultipart(w http.ResponseWriter, r *http.Request, name
 		g.writeError(w, r, err)
 		return
 	}
-	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	ns, err := g.namespace(r, namespace)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -948,7 +1005,7 @@ func (g *Gateway) abortMultipart(w http.ResponseWriter, r *http.Request, namespa
 		g.writeError(w, r, err)
 		return
 	}
-	ns, err := g.db.GetNamespace(r.Context(), namespace)
+	ns, err := g.namespace(r, namespace)
 	if err != nil {
 		g.writeError(w, r, err)
 		return

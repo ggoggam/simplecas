@@ -10,8 +10,9 @@ import (
 
 const namespaceColumns = "id, name, created_at, tenant_id"
 
-// ListNamespaces returns every namespace in name order. Used by the S3 admin
-// plane, which is untenanted.
+// ListNamespaces returns every namespace in name order, owned or not. Only the
+// superuser planes use it: the S3 gateway's admin credential, and /api when
+// OIDC is off. Tenant-scoped callers go through ListNamespacesForTenants.
 func (d *DB) ListNamespaces(ctx context.Context) ([]Namespace, error) {
 	rows, err := d.pool.Query(ctx,
 		"SELECT "+namespaceColumns+" FROM namespaces ORDER BY name")
@@ -60,6 +61,27 @@ func (d *DB) GetNamespaceForMember(ctx context.Context, name, email string) (Nam
 		FROM namespaces n
 		JOIN tenant_members m ON m.tenant_id = n.tenant_id AND m.email = $2
 		WHERE n.name = $1`, name, email)
+	if err != nil {
+		return Namespace{}, apperr.Internal(err)
+	}
+	ns, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[Namespace])
+	if notFound(err) {
+		return Namespace{}, apperr.ErrNoSuchNamespace
+	}
+	return ns, apperr.Internal(err)
+}
+
+// GetNamespaceForTenant resolves a namespace only if tenantID owns it. A
+// namespace that is missing, unowned, or another tenant's all resolve to
+// NoSuchNamespace, so a tenanted S3 credential cannot tell them apart.
+//
+// This is the S3 plane's counterpart to GetNamespaceForMember: that one scopes
+// by a signed-in human's membership, this one by the tenant a credential
+// belongs to.
+func (d *DB) GetNamespaceForTenant(ctx context.Context, name string, tenantID int64) (Namespace, error) {
+	rows, err := d.pool.Query(ctx,
+		"SELECT "+namespaceColumns+` FROM namespaces
+		 WHERE name = $1 AND tenant_id = $2`, name, tenantID)
 	if err != nil {
 		return Namespace{}, apperr.Internal(err)
 	}

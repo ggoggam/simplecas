@@ -31,6 +31,7 @@ const (
 	KindTenantAlreadyExists
 	KindTenantNotEmpty
 	KindInvalidTenantName
+	KindNoSuchCredential
 	KindForbidden
 	KindInvalidArgument
 	KindInvalidPart
@@ -63,6 +64,7 @@ var (
 	ErrTenantAlreadyExists    = &Error{Kind: KindTenantAlreadyExists, msg: "tenant already exists"}
 	ErrTenantNotEmpty         = &Error{Kind: KindTenantNotEmpty, msg: "tenant still has namespaces"}
 	ErrInvalidTenantName      = &Error{Kind: KindInvalidTenantName, msg: "invalid tenant name"}
+	ErrNoSuchCredential       = &Error{Kind: KindNoSuchCredential, msg: "credential not found"}
 	ErrInvalidRange           = &Error{Kind: KindInvalidRange, msg: "requested range not satisfiable"}
 	ErrAccessDenied           = &Error{Kind: KindAccessDenied, msg: "access denied"}
 	ErrSignatureDoesNotMatch  = &Error{Kind: KindSignatureDoesNotMatch, msg: "signature mismatch"}
@@ -154,6 +156,8 @@ func (e *Error) S3Code() string {
 		return "TenantNotEmpty"
 	case KindInvalidTenantName:
 		return "InvalidTenantName"
+	case KindNoSuchCredential:
+		return "NoSuchCredential"
 	case KindForbidden, KindAccessDenied:
 		return "AccessDenied"
 	case KindInvalidArgument:
@@ -174,7 +178,8 @@ func (e *Error) S3Code() string {
 // Status is the HTTP status this error renders as.
 func (e *Error) Status() int {
 	switch e.Kind {
-	case KindNoSuchNamespace, KindNoSuchKey, KindNoSuchUpload, KindNoSuchTenant:
+	case KindNoSuchNamespace, KindNoSuchKey, KindNoSuchUpload, KindNoSuchTenant,
+		KindNoSuchCredential:
 		return http.StatusNotFound
 	case KindNamespaceAlreadyExists, KindNamespaceNotEmpty,
 		KindTenantAlreadyExists, KindTenantNotEmpty:

@@ -7,6 +7,8 @@ import { useTheme } from "@/lib/theme";
 import {
   api,
   formatBytes,
+  type CreatedCredential,
+  type Credential,
   type Member,
   type Role,
 } from "@/lib/api";
@@ -43,6 +45,7 @@ import {
   Folder,
   FolderOpen,
   HardDrive,
+  Key,
   Layers,
   Eye,
   Loader2,
@@ -154,6 +157,14 @@ export function BrowserPage() {
   const [membersLoading, setMembersLoading] = useState(false);
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<Role>("member");
+  // S3 access keys for the active team, managed from the same dialog.
+  const [credentials, setCredentials] = useState<Credential[]>([]);
+  const [credentialsLoading, setCredentialsLoading] = useState(false);
+  const [keyLabel, setKeyLabel] = useState("");
+  // The just-minted key, held only so its secret can be shown once. The server
+  // stores the secret but never returns it again, so losing this means minting
+  // a replacement.
+  const [freshKey, setFreshKey] = useState<CreatedCredential | null>(null);
 
   const activeRole = useMemo(
     () => teams.find((t) => t.name === activeTeam)?.role ?? null,
@@ -368,12 +379,60 @@ export function BrowserPage() {
     }
   }, [activeTeam]);
 
+  const loadCredentials = useCallback(async () => {
+    if (!activeTeam) return;
+    setCredentialsLoading(true);
+    try {
+      setCredentials(await api.listCredentials(activeTeam));
+    } catch {
+      // Listing keys is owner-only; a member opening this dialog gets a 403,
+      // which is expected rather than an error worth a toast.
+      setCredentials([]);
+    } finally {
+      setCredentialsLoading(false);
+    }
+  }, [activeTeam]);
+
   const openTeamDialog = () => {
     if (!activeTeam) return;
     setInviteEmail("");
     setInviteRole("member");
+    setKeyLabel("");
+    setFreshKey(null);
     setTeamDialogOpen(true);
     loadMembers();
+    if (activeRole === "owner") loadCredentials();
+  };
+
+  const doCreateCredential = async () => {
+    if (!activeTeam) return;
+    try {
+      const created = await api.createCredential(activeTeam, keyLabel.trim());
+      setFreshKey(created);
+      setKeyLabel("");
+      loadCredentials();
+    } catch (e) {
+      toast.error((e as Error).message);
+    }
+  };
+
+  const doDeleteCredential = async (accessKeyId: string) => {
+    if (!activeTeam) return;
+    if (
+      !confirm(
+        `Revoke ${accessKeyId}? Any client still signing with it stops working immediately.`,
+      )
+    ) {
+      return;
+    }
+    try {
+      await api.deleteCredential(activeTeam, accessKeyId);
+      toast.success("key revoked");
+      if (freshKey?.access_key_id === accessKeyId) setFreshKey(null);
+      loadCredentials();
+    } catch (e) {
+      toast.error((e as Error).message);
+    }
   };
 
   const doAddMember = async () => {
@@ -1239,6 +1298,120 @@ export function BrowserPage() {
                 <Button onClick={doAddMember} disabled={!inviteEmail.trim()}>
                   <UserPlus className="size-4" /> Add
                 </Button>
+              </div>
+            )}
+
+            {activeRole === "owner" && (
+              <div className="space-y-2 border-t pt-3">
+                <div>
+                  <h4 className="flex items-center gap-1.5 text-sm font-medium">
+                    <Key className="size-3.5" /> S3 access keys
+                  </h4>
+                  <p className="text-xs text-muted-foreground">
+                    Point any S3 client at this server. A key reaches only this
+                    team’s namespaces — and grants full read/write over all of
+                    them.
+                  </p>
+                </div>
+
+                {freshKey && (
+                  <div className="space-y-1.5 rounded-md border border-amber-500/50 bg-amber-500/10 p-2.5">
+                    <p className="text-xs font-medium">
+                      Copy the secret now — it is not shown again.
+                    </p>
+                    <div className="space-y-1 font-mono text-xs break-all">
+                      <div>
+                        <span className="text-muted-foreground">
+                          access key id:{" "}
+                        </span>
+                        {freshKey.access_key_id}
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">
+                          secret access key:{" "}
+                        </span>
+                        {freshKey.secret_access_key}
+                      </div>
+                    </div>
+                    <div className="flex gap-2">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => {
+                          void navigator.clipboard
+                            .writeText(
+                              `AWS_ACCESS_KEY_ID=${freshKey.access_key_id}\nAWS_SECRET_ACCESS_KEY=${freshKey.secret_access_key}`,
+                            )
+                            .then(() => toast.success("copied"))
+                            .catch(() => toast.error("could not copy"));
+                        }}
+                      >
+                        Copy
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => setFreshKey(null)}
+                      >
+                        Dismiss
+                      </Button>
+                    </div>
+                  </div>
+                )}
+
+                <div className="max-h-32 overflow-y-auto rounded-md border">
+                  {credentialsLoading ? (
+                    <div className="flex items-center justify-center gap-2 py-4 text-sm text-muted-foreground">
+                      <Loader2 className="size-4 animate-spin" /> Loading…
+                    </div>
+                  ) : credentials.length === 0 ? (
+                    <p className="py-4 text-center text-xs text-muted-foreground">
+                      No access keys
+                    </p>
+                  ) : (
+                    credentials.map((c) => (
+                      <div
+                        key={c.access_key_id}
+                        className="flex items-center gap-2 border-b px-3 py-2 text-sm last:border-b-0"
+                      >
+                        <Key className="size-3.5 shrink-0 text-muted-foreground" />
+                        <span className="min-w-0 flex-1 truncate font-mono text-xs">
+                          {c.access_key_id}
+                        </span>
+                        {c.description && (
+                          <span className="shrink-0 truncate text-xs text-muted-foreground">
+                            {c.description}
+                          </span>
+                        )}
+                        <button
+                          onClick={() => doDeleteCredential(c.access_key_id)}
+                          title="Revoke key"
+                        >
+                          <Trash2 className="size-3.5 text-muted-foreground hover:text-destructive" />
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+
+                <div className="flex items-end gap-2">
+                  <div className="min-w-0 flex-1">
+                    <label className="mb-1 block text-xs text-muted-foreground">
+                      Label (optional)
+                    </label>
+                    <Input
+                      value={keyLabel}
+                      onChange={(e) => setKeyLabel(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") doCreateCredential();
+                      }}
+                      placeholder="ci pipeline"
+                    />
+                  </div>
+                  <Button variant="outline" onClick={doCreateCredential}>
+                    <Key className="size-4" /> Create key
+                  </Button>
+                </div>
               </div>
             )}
           </div>

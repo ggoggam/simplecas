@@ -324,5 +324,18 @@ func (c *Config) Validate() error {
 	if c.GC.IntervalSecs < 1 || c.GC.GraceSecs < 0 || c.GC.MultipartExpirySecs < 1 {
 		return fmt.Errorf("gc intervals must be positive")
 	}
+
+	// An enabled-but-blank admin credential would leave the gateway rejecting
+	// every request while looking configured, and per-tenant credentials make
+	// a blank admin key worse than useless: the admin branch is matched before
+	// the tenant lookup, so it must be unmistakable.
+	if c.Auth.Enabled {
+		if strings.TrimSpace(c.Auth.AccessKeyID) == "" {
+			return fmt.Errorf("auth.access_key_id is required when auth.enabled is true")
+		}
+		if strings.TrimSpace(c.Auth.SecretAccessKey) == "" {
+			return fmt.Errorf("auth.secret_access_key is required when auth.enabled is true")
+		}
+	}
 	return nil
 }

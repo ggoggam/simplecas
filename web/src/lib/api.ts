@@ -43,6 +43,23 @@ export interface Member {
   created_at: string;
 }
 
+/** An S3 access key belonging to a team. Never carries the secret. */
+export interface Credential {
+  access_key_id: string;
+  description: string;
+  created_at: string;
+}
+
+/**
+ * The response to minting a key — the only time the secret is ever sent, so
+ * the UI has to show it before this value is discarded.
+ */
+export interface CreatedCredential {
+  access_key_id: string;
+  secret_access_key: string;
+  description: string;
+}
+
 export interface ObjectEntry {
   key: string;
   size: number;
@@ -155,6 +172,34 @@ export const api = {
   async removeMember(tenant: string, email: string): Promise<void> {
     await req(
       `/api/tenants/${encodeURIComponent(tenant)}/members/${encodeURIComponent(email)}`,
+      { method: "DELETE" },
+    );
+  },
+
+  // S3 access keys. All three are owner-only server-side; a member gets 403.
+  async listCredentials(tenant: string): Promise<Credential[]> {
+    return (
+      await req(`/api/tenants/${encodeURIComponent(tenant)}/credentials`)
+    ).json();
+  },
+
+  // The resolved value carries the secret, which the server will not repeat.
+  async createCredential(
+    tenant: string,
+    description: string,
+  ): Promise<CreatedCredential> {
+    return (
+      await req(`/api/tenants/${encodeURIComponent(tenant)}/credentials`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ description }),
+      })
+    ).json();
+  },
+
+  async deleteCredential(tenant: string, accessKeyId: string): Promise<void> {
+    await req(
+      `/api/tenants/${encodeURIComponent(tenant)}/credentials/${encodeURIComponent(accessKeyId)}`,
       { method: "DELETE" },
     );
   },

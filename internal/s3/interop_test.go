@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 
 	"github.com/ggoggam/simplecas/internal/config"
 )
@@ -446,5 +447,175 @@ func TestAWSSDKBucketOperations(t *testing.T) {
 		Bucket: aws.String("photos"),
 	}); err != nil {
 		t.Errorf("DeleteBucket: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Per-tenant credentials, through the real SDK
+// ---------------------------------------------------------------------------
+
+// tenantClient returns an SDK client signing as one tenant's credential,
+// alongside the gateway it points at. Driving tenancy through the real signer
+// is the point: the hand-written test helper elsewhere in this package picks
+// its own signed headers, and only the SDK proves an ordinary S3 client can
+// authenticate as a tenant at all.
+func tenantClients(t *testing.T) (gateway *Gateway, clientA, clientB *awss3.Client, tenantA int64) {
+	t.Helper()
+	gateway = newGateway(t)
+	gateway.cfg.Auth = config.AuthConfig{
+		Enabled:         true,
+		AccessKeyID:     interopKeyID,
+		SecretAccessKey: interopSecret,
+	}
+	server := httptest.NewServer(gateway)
+	t.Cleanup(server.Close)
+
+	ctx := t.Context()
+	var err error
+	tenantA, err = gateway.db.CreateTenant(ctx, "team-a", "a@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantB, err := gateway.db.CreateTenant(ctx, "team-b", "b@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.db.CreateNamespace(ctx, "bucket-a", &tenantA); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.db.CreateNamespace(ctx, "bucket-b", &tenantB); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.db.CreateS3Credential(ctx, tenantA, "SCASTEAMAKEY", "team-a-secret", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.db.CreateS3Credential(ctx, tenantB, "SCASTEAMBKEY", "team-b-secret", "b"); err != nil {
+		t.Fatal(err)
+	}
+
+	build := func(id, secret string) *awss3.Client {
+		cfg, err := awsconfig.LoadDefaultConfig(ctx,
+			awsconfig.WithRegion("us-east-1"),
+			awsconfig.WithCredentialsProvider(
+				credentials.NewStaticCredentialsProvider(id, secret, ""),
+			),
+		)
+		if err != nil {
+			t.Fatalf("load aws config: %v", err)
+		}
+		return awss3.NewFromConfig(cfg, func(o *awss3.Options) {
+			o.BaseEndpoint = aws.String(server.URL)
+			o.UsePathStyle = true
+		})
+	}
+	return gateway, build("SCASTEAMAKEY", "team-a-secret"), build("SCASTEAMBKEY", "team-b-secret"), tenantA
+}
+
+func TestAWSSDKAuthenticatesWithATenantKey(t *testing.T) {
+	_, clientA, _, _ := tenantClients(t)
+	ctx := t.Context()
+
+	_, err := clientA.PutObject(ctx, &awss3.PutObjectInput{
+		Bucket: aws.String("bucket-a"),
+		Key:    aws.String("hello.txt"),
+		Body:   bytes.NewReader([]byte("abc")),
+	})
+	if err != nil {
+		t.Fatalf("a tenant key could not write to its own bucket: %v", err)
+	}
+
+	out, err := clientA.GetObject(ctx, &awss3.GetObjectInput{
+		Bucket: aws.String("bucket-a"),
+		Key:    aws.String("hello.txt"),
+	})
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	defer func() { _ = out.Body.Close() }()
+	body, _ := io.ReadAll(out.Body)
+	if string(body) != "abc" {
+		t.Fatalf("body = %q, want abc", body)
+	}
+
+	// ListBuckets shows only the team's own bucket.
+	listed, err := clientA.ListBuckets(ctx, &awss3.ListBucketsInput{})
+	if err != nil {
+		t.Fatalf("list buckets: %v", err)
+	}
+	if len(listed.Buckets) != 1 || aws.ToString(listed.Buckets[0].Name) != "bucket-a" {
+		t.Fatalf("tenant A sees %d buckets, want only bucket-a", len(listed.Buckets))
+	}
+}
+
+func TestAWSSDKCannotReachAnotherTenantsBucket(t *testing.T) {
+	_, clientA, clientB, _ := tenantClients(t)
+	ctx := t.Context()
+
+	_, err := clientB.PutObject(ctx, &awss3.PutObjectInput{
+		Bucket: aws.String("bucket-b"),
+		Key:    aws.String("secret.txt"),
+		Body:   bytes.NewReader([]byte("abc")),
+	})
+	if err != nil {
+		t.Fatalf("setup write: %v", err)
+	}
+
+	// A real client asking for another team's object gets NoSuchBucket, which
+	// the SDK surfaces as a typed error rather than a permission failure.
+	_, err = clientA.GetObject(ctx, &awss3.GetObjectInput{
+		Bucket: aws.String("bucket-b"),
+		Key:    aws.String("secret.txt"),
+	})
+	if err == nil {
+		t.Fatal("tenant A read tenant B's object")
+	}
+	// NoSuchBucket is not a modeled error on GetObject, so the SDK surfaces it
+	// as a generic API error; the code is what matters. It must be a
+	// missing-bucket code and not an access-denied one — a 403 would confirm
+	// the bucket is there.
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want an API error", err)
+	}
+	if apiErr.ErrorCode() != "NoSuchBucket" {
+		t.Fatalf("error code = %q, want NoSuchBucket", apiErr.ErrorCode())
+	}
+
+	// And CopyObject, the path that names a source bucket in a header.
+	_, err = clientA.CopyObject(ctx, &awss3.CopyObjectInput{
+		Bucket:     aws.String("bucket-a"),
+		Key:        aws.String("stolen.txt"),
+		CopySource: aws.String("bucket-b/secret.txt"),
+	})
+	if err == nil {
+		t.Fatal("tenant A copied tenant B's object into its own bucket")
+	}
+}
+
+func TestAWSSDKBucketCreatedByATenantKeyIsOwned(t *testing.T) {
+	gateway, clientA, clientB, tenantA := tenantClients(t)
+	ctx := t.Context()
+
+	_, err := clientA.CreateBucket(ctx, &awss3.CreateBucketInput{
+		Bucket: aws.String("bucket-a-new"),
+	})
+	if err != nil {
+		t.Fatalf("create bucket: %v", err)
+	}
+
+	ns, err := gateway.db.GetNamespace(ctx, "bucket-a-new")
+	if err != nil {
+		t.Fatalf("get namespace: %v", err)
+	}
+	if ns.TenantID == nil || *ns.TenantID != tenantA {
+		t.Fatalf("tenant_id = %v, want %d", ns.TenantID, tenantA)
+	}
+
+	// The other team cannot see it.
+	_, err = clientB.HeadBucket(ctx, &awss3.HeadBucketInput{
+		Bucket: aws.String("bucket-a-new"),
+	})
+	if err == nil {
+		t.Fatal("tenant B reached a bucket tenant A created")
 	}
 }
