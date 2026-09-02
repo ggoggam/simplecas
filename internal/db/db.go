@@ -86,8 +86,9 @@ type Namespace struct {
 	Name      string
 	CreatedAt time.Time
 	// TenantID is the owning tenant, or nil for an unowned namespace — one
-	// created through the S3 admin plane, or predating tenancy. Unowned
-	// namespaces are invisible to tenant-scoped callers.
+	// created with the S3 superuser credential, or predating tenancy. Unowned
+	// namespaces are invisible to tenant-scoped callers, whether they are
+	// scoped by a signed-in user's membership or by an S3 key's tenant.
 	TenantID *int64
 }
 

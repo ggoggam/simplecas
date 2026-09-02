@@ -165,8 +165,9 @@ func (s *Store) CopyObject(ctx context.Context, src db.ObjectMeta, dstNamespaceI
 //
 // tenantScope bounds visibility: when non-nil, the link succeeds only if the
 // blob is already referenced inside that tenant, so the endpoint cannot be used
-// to confirm the existence of another tenant's content. A nil scope (the S3
-// admin plane, and unowned namespaces) links against any stored blob.
+// to confirm the existence of another tenant's content. A nil scope links
+// against any stored blob, which is correct only for a superuser caller or an
+// unowned namespace — pass the namespace's own TenantID and it is always right.
 func (s *Store) LinkBlob(ctx context.Context, namespaceID int64, key, hash, contentType string, tenantScope *int64) (size int64, linked bool, err error) {
 	err = s.db.InTx(ctx, func(tx pgx.Tx) error {
 		if tenantScope != nil {

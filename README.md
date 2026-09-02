@@ -194,10 +194,42 @@ API (JSON, cookie-authenticated): `GET/POST /api/tenants`,
 `DELETE /api/tenants/{team}/members/{email}`. Creating a namespace
 (`POST /api/namespaces`) takes a `tenant` field naming the owning team.
 
-> **The S3 gateway is a single trusted admin plane** and is *not* tenant-scoped:
-> its one credential has full access, and namespaces it creates are unowned
-> (`tenant_id NULL`) and hidden from the team-scoped UI. Machine-client tenancy
-> (per-team S3 keys) is intentionally out of scope.
+### Per-team S3 credentials
+
+The S3 gateway is tenant-scoped too, via access keys minted per team. A request
+signed with one of them can address **only that team's namespaces**; every other
+name — another team's, an unowned one, or one that doesn't exist — comes back
+`NoSuchBucket`, so the gateway never confirms that a namespace it won't serve
+is there. `CopyObject` resolves *both* source and destination in that scope, so
+it can't be used to pull another team's object into your own namespace.
+
+| Endpoint | |
+| --- | --- |
+| `GET /api/tenants/{team}/credentials` | list keys (no secrets) |
+| `POST /api/tenants/{team}/credentials` | mint one; **the secret is returned once and never again** |
+| `DELETE /api/tenants/{team}/credentials/{accessKeyId}` | revoke |
+
+All three are **owner-only**: a key is unrestricted read/write over everything
+the team owns, so issuing one is closer to adding an owner than adding a member.
+There are no per-namespace or read-only keys.
+
+Buckets created with a team key are **owned by that team**, so they show up in
+`/ui` and `/api` for its members — unlike buckets created with the admin
+credential, which stay unowned (`tenant_id NULL`) and are invisible to every
+team key.
+
+The credential in `simplecas.toml` remains a **superuser**: it is matched before
+the per-team lookup (so a database row can never shadow or impersonate it) and
+it addresses every namespace, owned or not. Treat it as a root key.
+
+> Secrets in `tenant_credentials` are stored **recoverably, not hashed**. SigV4
+> is symmetric HMAC — the server has to re-derive the signing key from the
+> secret to check a signature, so a one-way hash cannot work. Treat that table
+> as equivalent to the objects it grants access to.
+
+Tenanted S3 access requires `[auth] enabled = true`. With auth off there are no
+credentials to tell apart, so the gateway is the open admin plane it has always
+been (`aws s3 --no-sign-request`).
 
 ## S3 gateway
 
@@ -215,7 +247,9 @@ JSON API and PWA call the same thing a namespace. Supported:
 
 Auth is AWS **SigV4** (header-signed), toggled by `[auth] enabled`. When
 disabled, anonymous access works (`aws s3 --no-sign-request`, or put the server
-behind your own ingress auth).
+behind your own ingress auth). Two kinds of credential verify here: the
+superuser key from `simplecas.toml`, and per-team keys that see only their own
+team's buckets — see [Per-team S3 credentials](#per-team-s3-credentials).
 
 Request bodies framed as **`aws-chunked`** are decoded before hashing. The AWS
 SDKs use that framing whenever they cannot hash a payload up front — an

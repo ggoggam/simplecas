@@ -147,6 +147,16 @@ func run(logger *slog.Logger) error {
 		IdleTimeout: 120 * time.Second,
 	}
 
+	// Tenancy is only as strong as its weakest plane. With OIDC on, /ui and
+	// /api scope every namespace to the caller's team — but the S3 gateway
+	// distinguishes callers only by their credential, so with SigV4 off it
+	// serves every team's buckets to anyone who can reach the port.
+	if registry != nil && !cfg.Auth.Enabled {
+		logger.Warn("teams are enabled but the S3 gateway is unauthenticated: "+
+			"anonymous S3 requests can read and write every team's namespaces",
+			"fix", "set [auth] enabled = true, or keep the gateway off the network")
+	}
+
 	logger.Info("simplecas listening",
 		"bind", cfg.Server.Bind,
 		"region", cfg.Server.Region,
