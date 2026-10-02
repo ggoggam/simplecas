@@ -53,6 +53,12 @@ mise run down        # tear down (add down:clean to wipe volumes)
 
 No mise? `docker compose -f docker/docker-compose.yml up --build` works the same.
 
+The stack is for one machine. Sign-in is off, so `/api` is open; the compose
+file sets `server.insecure_open_api` to allow that and publishes port 9000 on
+the host's loopback only. Postgres is not published at all: simplecas reaches
+it on the compose network (`docker compose -f docker/docker-compose.yml exec
+postgres psql -U postgres simplecas` for a shell).
+
 ## Development
 
 Install [mise](https://mise.jdx.dev) — it provisions the toolchain (Go, Bun,
@@ -111,6 +117,26 @@ endpoint = "https://s3.amazonaws.com"   # or MinIO / R2
 access_key_id = "…"
 secret_access_key = "…"
 ```
+
+### Binding without sign-in
+
+With OIDC off nothing authenticates `/api`, which can create and delete every
+namespace and object. So the server **refuses to start** with OIDC off unless
+`server.bind` is a loopback address (`127.0.0.1`, `[::1]`, `localhost`) or the
+open admin plane is accepted explicitly:
+
+```toml
+[server]
+bind = "0.0.0.0:9000"
+insecure_open_api = true    # SIMPLECAS__SERVER__INSECURE_OPEN_API=true
+```
+
+Set it only when something in front (ingress auth, a private network) decides
+who reaches the port; the server logs a warning at startup while it is in
+effect. The shipped `simplecas.toml` binds `0.0.0.0:9000` without it, so a bare
+`go run ./cmd/simplecas` needs `SIMPLECAS__SERVER__BIND=127.0.0.1:9000`, the
+opt-in, or `[oidc]`. `mise run dev` and the compose stack set the opt-in. With
+OIDC on the setting has no effect.
 
 ### Limits and quotas
 
@@ -196,7 +222,23 @@ redirect to `/auth/login`.
 > **Note:** OIDC gates the bundled PWA and admin API only, so with OIDC on the
 > server **refuses to start** unless `[auth] enabled = true` with a secret other
 > than the sample `simplecas-secret` — an unauthenticated gateway would serve
-> every team's namespaces to anyone who can reach the port.
+> every team's namespaces to anyone who can reach the port. With OIDC off, it
+> refuses a non-loopback bind instead; see
+> [Binding without sign-in](#binding-without-sign-in).
+
+### Browser security headers
+
+Every response from `/ui`, `/api` and `/auth` carries
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` (URLs here
+name namespaces and keys, and nothing cross-origin needs a `Referer`),
+`X-Frame-Options: DENY`, and a `Content-Security-Policy` with
+`frame-ancestors 'none'`. The PWA's policy allows only same-origin scripts,
+workers and fetches, plus `'wasm-unsafe-eval'` for the BLAKE3 hasher and inline
+styles that its UI libraries inject; `/api` and `/auth` get `default-src
+'none'`, and the sign-in page admits its one inline stylesheet by hash.
+`Strict-Transport-Security` is added when the request came over TLS or
+`oidc.public_url` is `https://`. Object bytes, at `/` or through `/api`, keep
+the gateway's own headers instead (see [S3 gateway](#s3-gateway)).
 
 ### Teams (multi-tenancy)
 
@@ -232,7 +274,8 @@ leaks across teams.
 
 No config is required — tenancy is automatic whenever OIDC is on. There is no
 users/teams state when OIDC is off; then `/api` is the unauthenticated
-full-access plane it has always been.
+full-access plane it has always been, which is why it only listens beyond
+loopback when told to ([Binding without sign-in](#binding-without-sign-in)).
 
 API (JSON, cookie-authenticated):
 

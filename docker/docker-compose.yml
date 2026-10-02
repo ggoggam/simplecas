@@ -9,8 +9,10 @@ services:
       POSTGRES_DB: simplecas
     volumes:
       - pgdata:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+    # No published port: simplecas reaches it as postgres:5432 on the compose
+    # network, and the well-known postgres/postgres login stays off the host's
+    # interfaces. `docker compose exec postgres psql -U postgres simplecas` for
+    # a shell.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 3s
@@ -28,10 +30,15 @@ services:
       SIMPLECAS__DATABASE__URL: postgres://postgres:postgres@postgres:5432/simplecas
       SIMPLECAS__STORAGE__BACKEND: fs
       SIMPLECAS__STORAGE__ROOT: /data
+      # OIDC is off here, so /api has no sign-in, and inside the container the
+      # server has to bind every interface to be reachable at all. The server
+      # refuses that combination unless told otherwise; the port below is
+      # published on the host's loopback only, which is what makes it safe.
+      SIMPLECAS__SERVER__INSECURE_OPEN_API: "true"
     volumes:
       - blobdata:/data
     ports:
-      - "9000:9000"
+      - "127.0.0.1:9000:9000"
 
 volumes:
   pgdata:

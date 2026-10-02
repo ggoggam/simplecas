@@ -113,6 +113,12 @@ func run(logger *slog.Logger) error {
 	if registry != nil {
 		guard = registry.Guard
 		authHandler = registry.Handler()
+	} else if !config.IsLoopbackBind(cfg.Server.Bind) {
+		// Validate only lets this through with server.insecure_open_api set,
+		// but an open admin plane should still be loud in the log.
+		logger.Warn("/api is unauthenticated and listening beyond loopback",
+			"bind", cfg.Server.Bind,
+			"detail", "anyone who reaches this port controls every namespace; enable oidc or restrict access in front")
 	}
 
 	routes := server.Routes{
@@ -123,6 +129,9 @@ func run(logger *slog.Logger) error {
 		// Uploads and downloads have no total deadline (see srv below), so
 		// this is what stops a stalled one from holding its connection.
 		StallTimeout: time.Duration(cfg.Limits.StallTimeoutSecs) * time.Second,
+		// Only the sign-in configuration records a public URL. Without it,
+		// HSTS goes only on requests that themselves arrived over TLS.
+		HTTPS: registry != nil && cfg.OIDC.PublicHTTPS(),
 	}
 
 	var wg sync.WaitGroup

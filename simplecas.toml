@@ -4,6 +4,11 @@
 [server]
 bind = "0.0.0.0:9000"
 region = "us-east-1"
+# With OIDC off nothing authenticates /api, so the server refuses to start on a
+# non-loopback bind like the one above. Either enable [oidc], bind 127.0.0.1,
+# or, when ingress in front already decides who reaches the port, accept the
+# open admin plane explicitly:
+# insecure_open_api = true
 
 [database]
 url = "postgres://postgres:postgres@localhost:55432/simplecas"

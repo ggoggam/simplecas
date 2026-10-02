@@ -171,6 +171,37 @@ func TestLoginPage(t *testing.T) {
 	}
 }
 
+// The page's policy admits its stylesheet by hash, so the hash has to be of the
+// exact bytes served, and nothing else may load or frame it.
+func TestLoginPagePolicyAdmitsOnlyItsStylesheet(t *testing.T) {
+	reg := testRegistry(t, &Provider{ID: "google", Name: "Google"})
+
+	w := httptest.NewRecorder()
+	reg.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/auth/login", nil))
+
+	body := w.Body.String()
+	_, rest, ok := strings.Cut(body, "<style>")
+	if !ok {
+		t.Fatalf("no inline stylesheet:\n%s", body)
+	}
+	style, _, ok := strings.Cut(rest, "</style>")
+	if !ok {
+		t.Fatalf("unterminated stylesheet:\n%s", body)
+	}
+	if strings.Count(body, "<style") != 1 || strings.Contains(body, "style=") {
+		t.Errorf("the policy admits one stylesheet; the page has more:\n%s", body)
+	}
+
+	sum := sha256.Sum256([]byte(style))
+	want := "style-src 'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
+	policy := w.Header().Get("Content-Security-Policy")
+	for _, directive := range []string{want, "default-src 'none'", "frame-ancestors 'none'"} {
+		if !strings.Contains(policy, directive) {
+			t.Errorf("policy %q lacks %q", policy, directive)
+		}
+	}
+}
+
 // The error code lands in the page via a query parameter, so it must be escaped.
 func TestLoginPageEscapesErrorCode(t *testing.T) {
 	reg := testRegistry(t, &Provider{ID: "google", Name: "Google"})
