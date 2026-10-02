@@ -1,10 +1,13 @@
 package cas
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -89,6 +92,20 @@ func (f *fixture) refcount(t *testing.T, hash string) (int64, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+// driftedBlobs counts blobs whose refcount disagrees with the number of objects
+// actually pointing at them. Every write path must keep this at zero.
+func (f *fixture) driftedBlobs(t *testing.T) int {
+	t.Helper()
+	var n int
+	err := f.pool.QueryRow(t.Context(), `
+		SELECT COUNT(*) FROM blobs b
+		WHERE b.refcount <> (SELECT COUNT(*) FROM objects o WHERE o.blob_hash = b.hash)`).Scan(&n)
+	if err != nil {
+		t.Fatalf("count drifted blobs: %v", err)
+	}
+	return n
 }
 
 // countUnder reports how many objects exist under a key prefix, which is how
@@ -277,6 +294,141 @@ func TestCommitOverwriteReleasesTheOldBlob(t *testing.T) {
 	// dedup link can still reuse them.
 	if ok, _ := f.bucket.Exists(ctx, storage.BlobPath(hashABC)); !ok {
 		t.Error("the superseded blob's bytes should survive until GC collects them")
+	}
+}
+
+// GC deletes a blob's bytes before its transaction commits the row's removal,
+// so a crash or failed commit in between leaves a zero-ref row with no bytes.
+// The next upload of that content revives the row, and must put the bytes back
+// rather than trust that a row means they are there.
+func TestCommitRestoresBytesAfterAnInterruptedSweep(t *testing.T) {
+	f := newFixture(t, collectNow())
+	ctx := t.Context()
+	nsID := f.namespace(t, "ns", nil)
+
+	if _, err := f.store.Commit(ctx, nsID, "k", "text/plain", f.stage(t, "abc")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.DeleteObject(ctx, nsID, "k"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The sweep gets as far as deleting the bytes, then its commit fails.
+	crash := errors.New("crashed before commit")
+	_, err := f.db.GCSweep(ctx, 0, 100, func(ctx context.Context, hash string) error {
+		if err := f.store.deleteIfPresent(ctx, storage.BlobPath(hash)); err != nil {
+			return err
+		}
+		return crash
+	})
+	if !errors.Is(err, crash) {
+		t.Fatalf("sweep err = %v, want the injected crash", err)
+	}
+	if n, ok := f.refcount(t, hashABC); !ok || n != 0 {
+		t.Fatalf("refcount = %d (present=%v), want a surviving zero-ref row", n, ok)
+	}
+	if ok, _ := f.bucket.Exists(ctx, storage.BlobPath(hashABC)); ok {
+		t.Fatal("setup: the interrupted sweep should have removed the bytes")
+	}
+
+	// The link fast path has no bytes to offer and must send the client to
+	// a real upload instead of linking to nothing.
+	_, linked, err := f.store.LinkBlob(ctx, nsID, "linked", hashABC, "text/plain", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linked {
+		t.Error("linking a zero-ref blob whose bytes may be gone must be declined")
+	}
+
+	// A copy from a stale read of the old object has nothing to copy either.
+	stale := db.ObjectMeta{Key: "k", BlobHash: hashABC, Size: 3, ContentType: "text/plain"}
+	if _, err := f.store.CopyObject(ctx, stale, nsID, "copied"); !errors.Is(err, apperr.ErrNoSuchKey) {
+		t.Errorf("copy err = %v, want ErrNoSuchKey", err)
+	}
+
+	// The re-upload revives the row and writes the bytes back.
+	if _, err := f.store.Commit(ctx, nsID, "again", "text/plain", f.stage(t, "abc")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := f.bucket.ReadAll(ctx, storage.BlobPath(hashABC))
+	if err != nil {
+		t.Fatalf("the re-uploaded object has no bytes behind it: %v", err)
+	}
+	if string(got) != "abc" {
+		t.Errorf("blob content = %q, want %q", got, "abc")
+	}
+	if n, _ := f.refcount(t, hashABC); n != 1 {
+		t.Errorf("refcount = %d, want 1", n)
+	}
+	if n := f.driftedBlobs(t); n != 0 {
+		t.Errorf("%d blobs have a refcount that disagrees with their objects", n)
+	}
+}
+
+// Concurrent PUTs of different content to the same new key: exactly one wins,
+// and every loser's reference must be released. SELECT ... FOR UPDATE locks
+// nothing on a key that does not exist yet, so without the key lock in
+// UpsertObject each writer saw no previous object and the overwritten blobs
+// kept a reference forever.
+func TestCommitConcurrentPutsToANewKeyReleaseTheLosers(t *testing.T) {
+	f := newFixture(t, collectNow())
+	ctx := t.Context()
+	nsID := f.namespace(t, "ns", nil)
+
+	const writers, rounds = 8, 5
+	for round := range rounds {
+		key := fmt.Sprintf("contended-%d", round)
+
+		staged := make([]StagedBlob, writers)
+		for i := range staged {
+			staged[i] = f.stage(t, fmt.Sprintf("round %d writer %d", round, i))
+		}
+
+		// Release every writer at once so their transactions overlap.
+		start := make(chan struct{})
+		errs := make([]error, writers)
+		var wg sync.WaitGroup
+		for i := range writers {
+			wg.Go(func() {
+				<-start
+				_, errs[i] = f.store.Commit(ctx, nsID, key, "text/plain", staged[i])
+			})
+		}
+		close(start)
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d writer %d: %v", round, i, err)
+			}
+		}
+	}
+
+	if n := f.driftedBlobs(t); n != 0 {
+		t.Fatalf("%d blobs have a refcount that disagrees with their objects", n)
+	}
+
+	// Every loser is now unreferenced and collectable; only the winners stay.
+	f.store.sweepBlobs(ctx)
+
+	var rows int
+	if err := f.pool.QueryRow(ctx, "SELECT COUNT(*) FROM blobs").Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != rounds {
+		t.Errorf("%d blob rows after GC, want %d — one winner per key", rows, rounds)
+	}
+	if n := f.countUnder(t, "blobs/"); n != rounds {
+		t.Errorf("%d stored blobs after GC, want %d", n, rounds)
+	}
+	for round := range rounds {
+		obj, err := f.db.GetObject(ctx, nsID, fmt.Sprintf("contended-%d", round))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.bucket.ReadAll(ctx, storage.BlobPath(obj.BlobHash)); err != nil {
+			t.Errorf("round %d: the winning object lost its bytes: %v", round, err)
+		}
 	}
 }
 

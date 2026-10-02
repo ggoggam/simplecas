@@ -54,11 +54,10 @@ func (s *Store) sweepBlobs(ctx context.Context) {
 	swept, err := s.db.GCSweep(ctx, s.gc.GraceSecs, gcBatch, func(ctx context.Context, hash string) error {
 		return s.deleteIfPresent(ctx, storage.BlobPath(hash))
 	})
-	if err != nil {
-		if ctx.Err() == nil {
-			s.log.Warn("gc sweep failed", "err", err)
-		}
-		return
+	// A failure on some blobs does not stop the sweep reclaiming the others,
+	// so the count is reported either way.
+	if err != nil && ctx.Err() == nil {
+		s.log.Warn("gc sweep failed", "swept", swept, "err", err)
 	}
 	if swept > 0 {
 		s.log.Info("gc: removed unreferenced blobs", "swept", swept)

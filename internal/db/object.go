@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"encoding/base64"
+	"log/slog"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -21,33 +22,46 @@ import (
 // ---------------------------------------------------------------------------
 
 // ClaimBlob takes a reference to hash inside tx, creating the blob row if it is
-// new. It reports whether this call created the row, in which case the caller
-// must upload the bytes before committing — so a committed row always has bytes
-// behind it.
+// new. It reports needsBytes when no live reference vouches for the bytes, in
+// which case the caller must (re)write them before committing — so a committed
+// reference always has bytes behind it.
+//
+// needsBytes covers two cases. A fresh row obviously has no bytes yet. A row
+// revived from refcount 0 may not either: GCSweep deletes the bytes before its
+// transaction commits, so a crash or failed commit in that window leaves a
+// zero-ref row whose bytes are already gone. The claim cannot tell that row
+// apart from one still awaiting collection, so it treats both as missing. The
+// re-copy is idempotent — the content is addressed by its hash — and only costs
+// anything on the rare revival of a blob GC was about to collect.
 //
 // The ON CONFLICT row lock serialises against GC's SELECT ... FOR UPDATE, so a
-// blob being swept cannot be re-referenced underneath the sweep. `xmax = 0`
-// distinguishes a fresh insert from an update of an existing row.
-func ClaimBlob(ctx context.Context, tx pgx.Tx, hash string, size int64) (isNew bool, err error) {
+// blob being swept cannot be re-referenced underneath the sweep. After the
+// increment, a refcount of 1 means nothing else held a reference before.
+func ClaimBlob(ctx context.Context, tx pgx.Tx, hash string, size int64) (needsBytes bool, err error) {
 	err = tx.QueryRow(ctx, `
 		INSERT INTO blobs (hash, size, refcount) VALUES ($1, $2, 1)
 		ON CONFLICT (hash) DO UPDATE
 		    SET refcount = blobs.refcount + 1, updated_at = now()
-		RETURNING (xmax = 0)`, hash, size).Scan(&isNew)
+		RETURNING refcount = 1`, hash, size).Scan(&needsBytes)
 	if err != nil {
 		return false, apperr.Internal(err)
 	}
-	return isNew, nil
+	return needsBytes, nil
 }
 
-// ClaimExistingBlob takes a reference to hash only if the blob is already
-// stored, returning its authoritative size. ok is false when the blob is absent
-// — never referenced, or already swept — which tells the dedup "link" path to
-// fall back to a real upload rather than create a dangling reference.
+// ClaimExistingBlob takes a reference to hash only if the blob is live — some
+// object already references it — returning its authoritative size. ok is false
+// otherwise, which tells the dedup "link" path to fall back to a real upload
+// rather than create a dangling reference.
+//
+// A blob at refcount 0 is declined even though its row exists: GC may have
+// deleted its bytes and crashed before removing the row (see ClaimBlob), and
+// the link path has no staged copy to restore them from. The fallback upload
+// goes through ClaimBlob, which revives the row and rewrites the bytes.
 func ClaimExistingBlob(ctx context.Context, tx pgx.Tx, hash string) (size int64, ok bool, err error) {
 	err = tx.QueryRow(ctx, `
 		UPDATE blobs SET refcount = refcount + 1, updated_at = now()
-		WHERE hash = $1 RETURNING size`, hash).Scan(&size)
+		WHERE hash = $1 AND refcount > 0 RETURNING size`, hash).Scan(&size)
 	if notFound(err) {
 		return 0, false, nil
 	}
@@ -57,14 +71,27 @@ func ClaimExistingBlob(ctx context.Context, tx pgx.Tx, hash string) (size int64,
 	return size, true, nil
 }
 
-// ReleaseBlob drops one reference. It floors at zero rather than trusting the
-// count, so a double release cannot underflow into a negative refcount that
-// would hide the blob from GC forever.
+// ReleaseBlob drops one reference. It never takes the count below zero, so a
+// double release cannot underflow into a negative refcount that would hide the
+// blob from GC forever.
+//
+// A release that finds nothing to drop — the row already at zero, or gone —
+// means the refcount has drifted from the objects that really reference the
+// blob. That is logged rather than failed: the write it belongs to is still
+// correct, and GCSweep refuses to collect a blob any object still points at, so
+// a count that drifted low costs no data. The warning is there so the drift is
+// noticed rather than silently absorbed.
 func ReleaseBlob(ctx context.Context, tx pgx.Tx, hash string) error {
-	_, err := tx.Exec(ctx, `
-		UPDATE blobs SET refcount = GREATEST(refcount - 1, 0), updated_at = now()
-		WHERE hash = $1`, hash)
-	return apperr.Internal(err)
+	tag, err := tx.Exec(ctx, `
+		UPDATE blobs SET refcount = refcount - 1, updated_at = now()
+		WHERE hash = $1 AND refcount > 0`, hash)
+	if err != nil {
+		return apperr.Internal(err)
+	}
+	if tag.RowsAffected() == 0 {
+		slog.WarnContext(ctx, "blob refcount would go below zero; refcount has drifted", "hash", hash)
+	}
+	return nil
 }
 
 // BlobReferencedInTenant reports whether any object inside tenantID's
@@ -98,9 +125,25 @@ func BlobReferencedInTenant(ctx context.Context, tx pgx.Tx, hash string, tenantI
 // Releasing the old hash also nets out the double count when an object is
 // overwritten with byte-identical content: the claim incremented, this
 // decrements, and the refcount is unchanged.
+//
+// The transaction-scoped advisory lock on (namespace, key) is what makes the
+// read of the old hash trustworthy. SELECT ... FOR UPDATE locks nothing when the
+// key does not exist yet, so two concurrent PUTs to a new key would both see no
+// previous blob; the second upsert would then overwrite the first's row without
+// releasing its reference, and that blob could never be collected. Holding the
+// key lock across the select and the upsert serialises writers per key, and the
+// select runs after the lock is granted, so under READ COMMITTED it sees
+// whatever the previous holder committed. Two keys whose hashes collide merely
+// serialise against each other, which is harmless.
 func UpsertObject(ctx context.Context, tx pgx.Tx, namespaceID int64, key, hash string, size int64, contentType string) error {
+	_, err := tx.Exec(ctx,
+		"SELECT pg_advisory_xact_lock(hashtextextended($2, $1))", namespaceID, key)
+	if err != nil {
+		return apperr.Internal(err)
+	}
+
 	var oldHash string
-	err := tx.QueryRow(ctx,
+	err = tx.QueryRow(ctx,
 		"SELECT blob_hash FROM objects WHERE namespace_id = $1 AND key = $2 FOR UPDATE",
 		namespaceID, key).Scan(&oldHash)
 	hadOld := true
