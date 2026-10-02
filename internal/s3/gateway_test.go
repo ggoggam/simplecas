@@ -198,15 +198,20 @@ func TestPutGetHeadDeleteObject(t *testing.T) {
 		t.Errorf("body = %q", got)
 	}
 	for header, want := range map[string]string{
-		"Content-Type":      "image/jpeg",
-		"ETag":              `"` + abcHash + `"`,
-		"Accept-Ranges":     "bytes",
-		"x-amz-meta-blake3": abcHash,
-		"Content-Length":    "3",
+		"Content-Type":   "image/jpeg",
+		"ETag":           `"` + abcHash + `"`,
+		"Accept-Ranges":  "bytes",
+		"Content-Length": "3",
 	} {
 		if got := w.Header().Get(header); got != want {
 			t.Errorf("%s = %q, want %q", header, got, want)
 		}
+	}
+	// Indexed by its exact spelling: S3 sends user metadata names in
+	// lowercase, and clients report them as they arrive.
+	//nolint:staticcheck // SA1008: the non-canonical key is the point.
+	if got := w.Header()[metaBlake3Header]; len(got) != 1 || got[0] != abcHash {
+		t.Errorf("x-amz-meta-blake3 = %q, want %q", got, abcHash)
 	}
 	if w.Header().Get("Last-Modified") == "" {
 		t.Error("Last-Modified was not set")
@@ -519,6 +524,20 @@ func TestCopyObjectOverHTTP(t *testing.T) {
 	if got := w.Header().Get("Content-Type"); got != "text/plain" {
 		t.Errorf("Content-Type = %q, want the source's", got)
 	}
+
+	// REPLACE takes the media type from the copy request instead.
+	w = do(t, g, http.MethodPut, "/dst/replaced.json", "",
+		"x-amz-copy-source", "/src/orig.txt",
+		"x-amz-metadata-directive", "REPLACE",
+		"Content-Type", "application/json")
+	mustStatus(t, w, http.StatusOK)
+	w = do(t, g, http.MethodHead, "/dst/replaced.json", "")
+	if got := w.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type after REPLACE = %q, want application/json", got)
+	}
+	w = do(t, g, http.MethodPut, "/dst/x", "",
+		"x-amz-copy-source", "/src/orig.txt", "x-amz-metadata-directive", "MERGE")
+	mustStatus(t, w, http.StatusBadRequest)
 
 	// Failure modes.
 	w = do(t, g, http.MethodPut, "/dst/x", "", "x-amz-copy-source", "/src/missing")

@@ -47,6 +47,11 @@ import (
 // delete and multipart completion manifests).
 const maxXMLBody = 8 << 20
 
+// metaBlake3Header carries an object's BLAKE3 digest as user metadata. It is
+// lowercase because S3 sends user metadata names that way, and the header map
+// is written to directly so net/http does not canonicalize it.
+const metaBlake3Header = "x-amz-meta-blake3"
+
 // maxKeysLimit and related caps mirror S3's documented maxima.
 const (
 	maxKeysLimit    = 1000
@@ -686,6 +691,19 @@ func (g *Gateway) copyObject(w http.ResponseWriter, r *http.Request, dstNamespac
 		return
 	}
 
+	// COPY (the default) keeps the source's metadata; REPLACE takes it from
+	// this request instead. Content-Type is the only metadata stored, so it
+	// is all REPLACE can change. `aws s3 cp --content-type` between buckets
+	// relies on this.
+	switch r.Header.Get("x-amz-metadata-directive") {
+	case "", "COPY":
+	case "REPLACE":
+		src.ContentType = contentTypeOf(r)
+	default:
+		g.writeError(w, r, apperr.InvalidArgument("x-amz-metadata-directive must be COPY or REPLACE"))
+		return
+	}
+
 	etag, err := g.cas.CopyObject(r.Context(), src, dstNS.ID, dstKey)
 	if err != nil {
 		g.writeError(w, r, err)
@@ -802,7 +820,11 @@ func (g *Gateway) serveResolvedObject(w http.ResponseWriter, r *http.Request, ns
 	w.Header().Set("ETag", quotedETag(meta.BlobHash))
 	w.Header().Set("Last-Modified", httpDate(meta.UpdatedAt))
 	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("x-amz-meta-blake3", meta.BlobHash)
+	// Assigned rather than Set: Set would canonicalize the name to
+	// X-Amz-Meta-Blake3, and the AWS CLI and SDKs report user metadata keys
+	// exactly as they arrive, so clients would see "Blake3" where S3 always
+	// answers in lowercase.
+	w.Header()[metaBlake3Header] = []string{meta.BlobHash}
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 
 	if headOnly || length == 0 {

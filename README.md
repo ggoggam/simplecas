@@ -276,7 +276,9 @@ JSON API and PWA call the same thing a namespace. Supported:
   `GetBucketLocation`, `ListObjects` (V1) and `ListObjectsV2` — prefix,
   delimiter, pagination, `DeleteObjects` (batch)
 - Object: `PutObject`, `GetObject` (incl. **range** requests), `HeadObject`,
-  `DeleteObject`, `CopyObject` (metadata-only — no bytes moved)
+  `DeleteObject`, `CopyObject` (metadata-only — no bytes moved; keeps the
+  source's `Content-Type`, or takes the request's with
+  `x-amz-metadata-directive: REPLACE`)
 - Multipart: initiate, upload part, upload part copy (`x-amz-copy-source`,
   optionally with `x-amz-copy-source-range`), list parts, list uploads,
   complete, abort
