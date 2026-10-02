@@ -189,9 +189,28 @@ restart. When an allowlist is configured the email must be present **and
 verified** — an unverified email is rejected.
 
 Endpoints: `GET /auth/login` (provider buttons), `/auth/oidc/{id}/start`,
-`/auth/oidc/{id}/callback`, `/auth/logout`, and `/auth/me` (current identity as
-JSON). Unauthenticated `/api` calls get `401`; unauthenticated page loads
-redirect to `/auth/login`.
+`/auth/oidc/{id}/callback`, `POST /auth/logout` (a `GET` is refused with `405`),
+and `/auth/me` (current identity as JSON). Unauthenticated `/api` calls get
+`401`; unauthenticated page loads redirect to `/auth/login`. The post-login
+destination (`?redirect=`) must be `/ui` or a path under `/ui/`; anything else,
+including one carrying a backslash, a control character or a `..` segment,
+lands on `/ui/` instead.
+
+When `public_url` is `https://…` the session and login-flow cookies are named
+`__Host-scas_session` and `__Host-scas_oidc_flow`: `Secure`, `Path=/`, no
+`Domain`, so no other subdomain can set or overwrite them. Over plain HTTP
+(local development) they keep the bare names `scas_session` and
+`scas_oidc_flow`. Changing `public_url` between the two signs everyone out.
+
+**Cross-site requests.** Every `POST`, `PUT`, `PATCH` or `DELETE` (any method
+but `GET`, `HEAD` and `OPTIONS`) to `/api` or `/auth` is refused with `403
+AccessDenied` when the browser says it came from elsewhere: a `Sec-Fetch-Site`
+other than `same-origin` or, from a browser too old to send that, an `Origin`
+whose host is not the one requested. A request with neither header, such as
+from `curl` or a script, is let through; it carries no browser cookies to
+misuse. This applies with OIDC off as well, so a web page can't drive the open
+`/api` plane through a visitor's browser. A reverse proxy must pass the `Host`
+header through unchanged for the `Origin` fallback to match.
 
 > **Note:** OIDC gates the bundled PWA and admin API only, so with OIDC on the
 > server **refuses to start** unless `[auth] enabled = true` with a secret other

@@ -16,6 +16,9 @@
 //   - Login flow state (the CSRF token, nonce and PKCE verifier) rides along in
 //     a second short-lived signed cookie across the redirect to the provider
 //     and back, so the callback needs no shared store either.
+//   - Cross-site requests are refused from the request's own Sec-Fetch-Site
+//     and Origin headers (see RejectCrossSite), so state-changing calls need
+//     no CSRF token either.
 package auth
 
 import (
@@ -24,19 +27,35 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/ggoggam/simplecas/internal/config"
 )
 
 const (
-	// sessionCookie holds the signed identity.
+	// sessionCookie holds the signed identity. Like flowCookie it is a base
+	// name: served over HTTPS the cookie is stored with the __Host- prefix
+	// (see cookieName).
 	sessionCookie = "scas_session"
 	// flowCookie holds the per-login state across the provider round trip.
 	flowCookie = "scas_oidc_flow"
+	// hostCookiePrefix is the prefix a browser accepts only on a cookie that
+	// is Secure, has Path=/ and names no Domain.
+	hostCookiePrefix = "__Host-"
 	// flowTTL bounds how long a login ceremony may take.
 	flowTTL = 10 * time.Minute
+)
+
+// Token types. Both cookies are signed with the same key, so each payload
+// names what it is and is accepted only where that type is read: a flow-state
+// token moved into the session cookie, or a session into the flow cookie, is
+// refused for its type rather than for whichever fields it happens to lack.
+const (
+	typeSession = "session"
+	typeFlow    = "oidc_flow"
 )
 
 // Session is the identity carried in the session cookie.
@@ -54,6 +73,13 @@ type Session struct {
 	Provider      string `json:"provider"`
 	// Expires is a Unix timestamp.
 	Expires int64 `json:"exp"`
+}
+
+// sessionToken is the signed form of a Session: its fields, tagged with their
+// type.
+type sessionToken struct {
+	Type string `json:"typ"`
+	Session
 }
 
 // VerifiedEmail is the caller's address, normalised, if their provider
@@ -77,6 +103,8 @@ func NormalizeEmail(email string) string {
 // flowState is the per-login state that must survive the round trip to the
 // provider.
 type flowState struct {
+	// Type is always typeFlow.
+	Type          string `json:"typ"`
 	Provider      string `json:"provider"`
 	CSRF          string `json:"csrf"`
 	Nonce         string `json:"nonce"`
@@ -128,12 +156,24 @@ func secureCookies(cfg *config.OidcConfig) bool {
 	return strings.HasPrefix(cfg.PublicURL, "https")
 }
 
-// setCookie builds a session-style cookie. HttpOnly keeps it away from page
-// scripts; SameSite=Lax still allows the top-level redirect back from the
-// provider to carry it.
-func setCookie(name, value string, maxAge int, secure bool) *http.Cookie {
+// cookieName is the name a cookie is stored under. Served over HTTPS it carries
+// the __Host- prefix, which a browser honours only on a Secure cookie with
+// Path=/ and no Domain, so neither a sibling subdomain nor a plain-HTTP
+// response can plant or overwrite it. Over plain HTTP (local development) the
+// cookie cannot be Secure, so it keeps the bare name.
+func cookieName(base string, secure bool) string {
+	if secure {
+		return hostCookiePrefix + base
+	}
+	return base
+}
+
+// setCookie builds a session-style cookie under base's effective name (see
+// cookieName). HttpOnly keeps it away from page scripts; SameSite=Lax still
+// allows the top-level redirect back from the provider to carry it.
+func setCookie(base, value string, maxAge int, secure bool) *http.Cookie {
 	return &http.Cookie{
-		Name:     name,
+		Name:     cookieName(base, secure),
 		Value:    value,
 		Path:     "/",
 		MaxAge:   maxAge,
@@ -144,8 +184,8 @@ func setCookie(name, value string, maxAge int, secure bool) *http.Cookie {
 }
 
 // clearCookie expires a cookie immediately.
-func clearCookie(name string, secure bool) *http.Cookie {
-	c := setCookie(name, "", -1, secure)
+func clearCookie(base string, secure bool) *http.Cookie {
+	c := setCookie(base, "", -1, secure)
 	c.Expires = time.Unix(0, 0)
 	return c
 }
@@ -157,7 +197,7 @@ func clearCookie(name string, secure bool) *http.Cookie {
 // CurrentSession returns the caller's session if the cookie is present, signed
 // with the configured secret, and unexpired.
 func CurrentSession(r *http.Request, cfg *config.OidcConfig) *Session {
-	cookie, err := r.Cookie(sessionCookie)
+	cookie, err := r.Cookie(cookieName(sessionCookie, secureCookies(cfg)))
 	if err != nil {
 		return nil
 	}
@@ -165,30 +205,72 @@ func CurrentSession(r *http.Request, cfg *config.OidcConfig) *Session {
 	if payload == nil {
 		return nil
 	}
-	var s Session
-	if err := json.Unmarshal(payload, &s); err != nil {
+	var token sessionToken
+	if err := json.Unmarshal(payload, &token); err != nil {
 		return nil
 	}
+	if token.Type != typeSession {
+		return nil
+	}
+	s := token.Session
 	if s.Expires <= time.Now().Unix() {
 		return nil
 	}
-	// Without both halves of the identity there is nobody to authorize. This
-	// also turns away a cookie minted before sessions carried the issuer, and
-	// a flow-state token, which is signed with the same key, moved into the
-	// session cookie.
+	// Without both halves of the identity there is nobody to authorize.
 	if s.Issuer == "" || s.Subject == "" {
 		return nil
 	}
 	return &s
 }
 
-// sanitizeRedirect keeps a post-login destination on this site. A protocol-
-// relative "//host" would otherwise be an open redirect.
-func sanitizeRedirect(raw string) string {
-	if strings.HasPrefix(raw, "/") && !strings.HasPrefix(raw, "//") {
-		return raw
+// signSession renders s as a session cookie value.
+func signSession(secret string, s Session) (string, error) {
+	payload, err := json.Marshal(sessionToken{Type: typeSession, Session: s})
+	if err != nil {
+		return "", err
 	}
-	return "/ui/"
+	return sign(secret, payload), nil
+}
+
+// defaultLanding is where a login lands when it names no acceptable
+// destination.
+const defaultLanding = "/ui/"
+
+// sanitizeRedirect keeps a post-login destination inside the PWA: "/ui" itself
+// or a path under "/ui/", and nothing else.
+//
+// Browsers read a Location more loosely than url.Parse does, so anything one
+// might take for another host is refused outright: a backslash (a browser reads
+// "/\evil.example" as "//evil.example") and a control character (a browser
+// strips tabs and newlines, which can close "/\t/evil.example" up into
+// "//evil.example"). The decoded path is checked for both as well, and for dot
+// segments, since "/ui/../api/x" resolves outside the PWA and a browser treats
+// "%2e" as a dot when resolving one.
+func sanitizeRedirect(raw string) string {
+	if strings.ContainsFunc(raw, unsafeInRedirect) {
+		return defaultLanding
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "" || u.Host != "" || u.Opaque != "" || u.User != nil {
+		return defaultLanding
+	}
+	if u.Path != "/ui" && !strings.HasPrefix(u.Path, "/ui/") {
+		return defaultLanding
+	}
+	if strings.ContainsFunc(u.Path, unsafeInRedirect) {
+		return defaultLanding
+	}
+	for segment := range strings.SplitSeq(u.Path, "/") {
+		if segment == "." || segment == ".." {
+			return defaultLanding
+		}
+	}
+	return raw
+}
+
+// unsafeInRedirect reports a character a redirect target may never contain.
+func unsafeInRedirect(c rune) bool {
+	return c == '\\' || unicode.IsControl(c)
 }
 
 // admitted decides whether an authenticated identity may sign in.

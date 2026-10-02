@@ -42,9 +42,9 @@ function ThemedToaster() {
 }
 
 const rootRoute = createRootRoute({
-  // Identity + tenancy, resolved before the app chrome renders. `api.me()`
-  // throws on a real load failure (network/5xx/non-JSON) so it lands in
-  // `errorComponent`; `api.tenancy()` never throws (it just picks the mode).
+  // Identity + tenancy, resolved before the app chrome renders. Both throw on
+  // a real load failure (network/5xx/non-JSON) so it lands in
+  // `errorComponent`; `api.tenancy()` sends a lapsed session to the login page.
   loader: async () => {
     const [me, tenancy] = await Promise.all([api.me(), api.tenancy()]);
     const teamsMode = tenancy.mode === "teams";

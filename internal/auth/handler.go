@@ -13,6 +13,8 @@ import (
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
+
+	"github.com/ggoggam/simplecas/internal/apperr"
 )
 
 // sessionContextKey carries the signed-in caller down to the handlers.
@@ -34,14 +36,67 @@ func WithSession(ctx context.Context, s *Session) context.Context {
 
 // Handler serves the sign-in endpoints: the login page, logout, the identity
 // probe, and the two halves of the OIDC authorization-code flow.
+//
+// Logout is POST-only, so another site cannot sign a user out with an image
+// tag or a link, and it is behind RejectCrossSite, so it cannot do so with a
+// form either.
 func (r *Registry) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /auth/login", r.handleLogin)
-	mux.HandleFunc("GET /auth/logout", r.handleLogout)
+	mux.HandleFunc("POST /auth/logout", r.handleLogout)
 	mux.HandleFunc("GET /auth/me", r.handleMe)
 	mux.HandleFunc("GET /auth/oidc/{provider}/start", r.handleStart)
 	mux.HandleFunc("GET /auth/oidc/{provider}/callback", r.handleCallback)
-	return mux
+	return RejectCrossSite(mux)
+}
+
+// RejectCrossSite refuses a state-changing request that a browser reports came
+// from another site, with a 403. Any method but GET, HEAD and OPTIONS counts as
+// state-changing.
+//
+// SameSite=Lax keeps the session cookie off a cross-site POST, but a sibling
+// subdomain is the same site, and a server with sign-in disabled has no cookie
+// to withhold. So the decision rests on what the browser says about the
+// request's origin instead:
+//
+//   - Sec-Fetch-Site, which every current browser sends, must be same-origin.
+//   - Without it, an Origin header, if any, must name this host.
+//   - A request carrying neither is not from a browser (curl, a script), has
+//     no ambient credentials to abuse, and is let through.
+//
+// The Origin comparison is by host alone: behind a TLS-terminating proxy the
+// request's own scheme is not known here.
+func RejectCrossSite(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+		default:
+			if !sameOrigin(req) {
+				apperr.WriteJSON(w, apperr.Forbidden("cross-origin request refused"))
+				return
+			}
+		}
+		next.ServeHTTP(w, req)
+	})
+}
+
+// sameOrigin reports whether req came from a page on this origin, or from a
+// client that is not a browser at all.
+func sameOrigin(req *http.Request) bool {
+	if site := req.Header.Get("Sec-Fetch-Site"); site != "" {
+		return site == "same-origin"
+	}
+	origin := req.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	// An opaque origin ("null", from a sandboxed frame or a file) parses to
+	// no host, and matches nothing.
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, req.Host)
 }
 
 // Guard protects the /ui and /api surfaces. An unauthenticated API call gets a
@@ -121,6 +176,8 @@ const loginPageTemplate = `<!doctype html><html lang="en"><head><meta charset="u
 	`.btn:hover{background:#388bfd}.err{color:#f85149;text-align:center;margin:0}</style></head>` +
 	`<body><div class="card"><h1>simplecas</h1>%s%s</div></body></html>`
 
+// handleLogout clears the session. The redirect suits a plain form post; the
+// PWA posts with fetch and then navigates to the login page itself.
 func (r *Registry) handleLogout(w http.ResponseWriter, req *http.Request) {
 	http.SetCookie(w, clearCookie(sessionCookie, secureCookies(r.cfg)))
 	http.Redirect(w, req, "/auth/login", http.StatusSeeOther)
@@ -171,6 +228,7 @@ func (r *Registry) handleStart(w http.ResponseWriter, req *http.Request) {
 	verifier := oauth2.GenerateVerifier()
 
 	flow := flowState{
+		Type:          typeFlow,
 		Provider:      p.ID,
 		CSRF:          csrf,
 		Nonce:         nonce,
@@ -238,22 +296,22 @@ func (r *Registry) handleCallback(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	payload, err := json.Marshal(session)
+	token, err := signSession(r.cfg.SessionSecret, *session)
 	if err != nil {
 		r.loginError(w, req, "server_error")
 		return
 	}
 	secure := secureCookies(r.cfg)
-	http.SetCookie(w, setCookie(sessionCookie,
-		sign(r.cfg.SessionSecret, payload),
-		int(r.cfg.SessionTTLSecs), secure))
+	http.SetCookie(w, setCookie(sessionCookie, token, int(r.cfg.SessionTTLSecs), secure))
 	http.SetCookie(w, clearCookie(flowCookie, secure))
-	http.Redirect(w, req, flow.RedirectAfter, http.StatusSeeOther)
+	// The destination was sanitized when the flow began; checking it again
+	// costs nothing.
+	http.Redirect(w, req, sanitizeRedirect(flow.RedirectAfter), http.StatusSeeOther)
 }
 
 // readFlow recovers the per-login state from its signed cookie.
 func (r *Registry) readFlow(req *http.Request) (flowState, bool) {
-	cookie, err := req.Cookie(flowCookie)
+	cookie, err := req.Cookie(cookieName(flowCookie, secureCookies(r.cfg)))
 	if err != nil {
 		return flowState{}, false
 	}
@@ -263,6 +321,9 @@ func (r *Registry) readFlow(req *http.Request) (flowState, bool) {
 	}
 	var flow flowState
 	if err := json.Unmarshal(payload, &flow); err != nil {
+		return flowState{}, false
+	}
+	if flow.Type != typeFlow {
 		return flowState{}, false
 	}
 	return flow, true

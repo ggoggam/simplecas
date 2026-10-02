@@ -1120,7 +1120,11 @@ export function BrowserPage() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => api.logout()}
+                onClick={() =>
+                  api
+                    .logout()
+                    .catch((e) => toast.error((e as Error).message))
+                }
                 title="Sign out"
               >
                 <LogOut className="size-4" />

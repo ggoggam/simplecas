@@ -67,6 +67,11 @@ func New(database *db.DB, store *cas.Store, gateway *s3.Gateway, log *slog.Logge
 
 // Routes returns the API's routes. The object endpoints use a trailing wildcard
 // because keys are hierarchical.
+//
+// Every state-changing call must come from this origin (auth.RejectCrossSite),
+// whether or not sign-in is enabled: with it, a cross-site form must not ride
+// the session cookie; without it, a page on any site must still not drive the
+// open admin plane through a visitor's browser.
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 
@@ -101,7 +106,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("POST /api/namespaces/{namespace}/objects/{key...}", h.postObject)
 	mux.HandleFunc("DELETE /api/namespaces/{namespace}/objects/{key...}", h.deleteObject)
 
-	return h.identify(mux)
+	return auth.RejectCrossSite(h.identify(mux))
 }
 
 // ---------------------------------------------------------------------------

@@ -329,6 +329,50 @@ func TestNamespaceEndpointsUntenanted(t *testing.T) {
 	mustStatus(t, f.do(t, http.MethodDelete, "/api/namespaces/photos", ""), http.StatusNotFound)
 }
 
+// A page on another site must not drive the API through a visitor's browser,
+// whether the API is the open untenanted plane or rides a session cookie.
+func TestCrossSiteWritesAreRefused(t *testing.T) {
+	f := newFixture(t)
+
+	t.Run("untenanted", func(t *testing.T) {
+		w := f.do(t, http.MethodPost, "/api/namespaces", `{"name":"photos"}`,
+			"Sec-Fetch-Site", "cross-site", "Origin", "https://evil.example")
+		mustStatus(t, w, http.StatusForbidden)
+		if code, _ := errorBody(t, w); code != "AccessDenied" {
+			t.Errorf("code = %q", code)
+		}
+		// Without Sec-Fetch-Site, a foreign Origin is refused too.
+		w = f.do(t, http.MethodPost, "/api/namespaces", `{"name":"photos"}`,
+			"Origin", "https://evil.example")
+		mustStatus(t, w, http.StatusForbidden)
+
+		w = f.do(t, http.MethodGet, "/api/namespaces", "")
+		mustStatus(t, w, http.StatusOK)
+		if list := decodeArray(t, w); len(list) != 0 {
+			t.Fatalf("a refused request created %#v", list)
+		}
+
+		// The PWA's own requests, and clients that are not browsers, pass.
+		mustStatus(t, f.do(t, http.MethodPost, "/api/namespaces", `{"name":"photos"}`,
+			"Sec-Fetch-Site", "same-origin"), http.StatusCreated)
+		mustStatus(t, f.do(t, http.MethodDelete, "/api/namespaces/photos", ""), http.StatusNoContent)
+	})
+
+	t.Run("signed in", func(t *testing.T) {
+		f.signIn("dev@example.com")
+		defer func() { f.caller = nil }()
+
+		w := f.do(t, http.MethodPost, "/api/tenants", `{"name":"acme"}`,
+			"Sec-Fetch-Site", "same-site")
+		mustStatus(t, w, http.StatusForbidden)
+		w = f.do(t, http.MethodGet, "/api/tenants", "", "Sec-Fetch-Site", "cross-site")
+		mustStatus(t, w, http.StatusOK)
+		if list := decodeArray(t, w); len(list) != 0 {
+			t.Fatalf("a refused request created %#v", list)
+		}
+	})
+}
+
 // An empty listing must be [] so the PWA can map over it.
 func TestEmptyListsSerialiseAsArrays(t *testing.T) {
 	f := newFixture(t)
