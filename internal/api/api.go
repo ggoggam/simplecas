@@ -22,6 +22,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"mime"
@@ -36,6 +37,7 @@ import (
 	"github.com/ggoggam/simplecas/internal/auth"
 	"github.com/ggoggam/simplecas/internal/cas"
 	"github.com/ggoggam/simplecas/internal/db"
+	"github.com/ggoggam/simplecas/internal/reserved"
 	"github.com/ggoggam/simplecas/internal/s3"
 )
 
@@ -449,6 +451,10 @@ func (h *Handler) createNamespace(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, apperr.ErrInvalidNamespaceName)
 		return
 	}
+	if reserved.Name(req.Name) {
+		h.writeError(w, r, apperr.ErrReservedNamespaceName)
+		return
+	}
 
 	var tenantID *int64
 	if auth.FromContext(r.Context()) != nil {
@@ -465,10 +471,31 @@ func (h *Handler) createNamespace(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.db.CreateNamespace(r.Context(), req.Name, tenantID); err != nil {
+		if errors.Is(err, apperr.ErrNamespaceAlreadyExists) {
+			err = h.nameTaken(r, req.Name)
+		}
 		h.writeError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
+}
+
+// nameTaken answers a create whose name already exists, the way the gateway's
+// CreateBucket does: names are global, so the clash only says the name is in
+// use, and BucketAlreadyOwnedByYou is reserved for a namespace that resolves
+// through authorizeNamespace. That is any namespace with OIDC off, and with a
+// caller, one owned by any team they belong to, not only the team they asked
+// to create it in.
+func (h *Handler) nameTaken(r *http.Request, name string) error {
+	_, err := h.authorizeNamespace(r, name)
+	switch {
+	case err == nil:
+		return apperr.ErrNamespaceAlreadyOwned
+	case errors.Is(err, apperr.ErrNoSuchNamespace):
+		return apperr.ErrNamespaceAlreadyExists
+	default:
+		return err
+	}
 }
 
 func (h *Handler) deleteNamespace(w http.ResponseWriter, r *http.Request) {

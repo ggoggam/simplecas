@@ -121,7 +121,8 @@ func TestNamespaceLifecycleOverHTTP(t *testing.T) {
 		t.Errorf("Location = %q, want /photos", got)
 	}
 
-	// Duplicate create.
+	// Duplicate create. With auth off every caller is the admin, which owns
+	// whatever it can address.
 	w = do(t, g, http.MethodPut, "/photos", "")
 	mustStatus(t, w, http.StatusConflict)
 	if code := errorCode(t, w); code != "BucketAlreadyOwnedByYou" {
@@ -157,6 +158,40 @@ func TestNamespaceLifecycleOverHTTP(t *testing.T) {
 	}
 	mustStatus(t, do(t, g, http.MethodDelete, "/photos/cat.jpg", ""), http.StatusNoContent)
 	mustStatus(t, do(t, g, http.MethodDelete, "/photos", ""), http.StatusNoContent)
+}
+
+// The router hands these first segments to other surfaces, so a namespace with
+// one of these names could never be reached over S3. "ui" is also too short for
+// a bucket name; the rest are refused for being reserved.
+func TestReservedNamespaceNamesAreRefused(t *testing.T) {
+	g := newGateway(t)
+	for _, name := range []string{"ui", "api", "auth", "healthz", "readyz"} {
+		w := do(t, g, http.MethodPut, "/"+name, "")
+		mustStatus(t, w, http.StatusBadRequest)
+		if code := errorCode(t, w); code != "InvalidBucketName" {
+			t.Errorf("create %s: code = %q", name, code)
+		}
+		mustStatus(t, do(t, g, http.MethodHead, "/"+name, ""), http.StatusNotFound)
+	}
+}
+
+// A namespace that took a reserved name before it was reserved keeps working;
+// only creating one is refused.
+func TestExistingNamespaceWithAReservedNameStillWorks(t *testing.T) {
+	g := newGateway(t)
+	if err := g.db.CreateNamespace(t.Context(), "healthz", nil); err != nil {
+		t.Fatalf("create namespace: %v", err)
+	}
+
+	mustStatus(t, do(t, g, http.MethodHead, "/healthz", ""), http.StatusOK)
+	putObj(t, g, "healthz", "k", "kept", "text/plain")
+	w := do(t, g, http.MethodGet, "/healthz/k", "")
+	mustStatus(t, w, http.StatusOK)
+	if w.Body.String() != "kept" {
+		t.Errorf("body = %q", w.Body.String())
+	}
+	mustStatus(t, do(t, g, http.MethodDelete, "/healthz/k", ""), http.StatusNoContent)
+	mustStatus(t, do(t, g, http.MethodDelete, "/healthz", ""), http.StatusNoContent)
 }
 
 func TestGetBucketLocationAndVersioning(t *testing.T) {
