@@ -63,3 +63,19 @@ grace_secs = 300
 # How long a multipart upload may sit inactive (no initiation or new part)
 # before it's abandoned and its staged parts reclaimed. Default: 86400 (24h).
 multipart_expiry_secs = 86400
+
+# Request and storage limits. Over-limit uploads get 400 EntityTooLarge, and
+# writes past a team's quota get 403 QuotaExceeded.
+[limits]
+# A single PUT, or the assembled size of a multipart upload. Default: 5 TiB.
+max_object_bytes = 5497558138880
+# One multipart part. Default: 5 GiB. Keep it at 8 MiB or more: the PWA uploads
+# in 8 MiB parts.
+max_part_bytes = 5368709120
+# Logical bytes each team may store: its objects plus the parts of unfinished
+# multipart uploads, with content shared with other teams counted in full.
+# 0 = no quota. Namespaces without a team are never charged.
+tenant_quota_bytes = 0
+# Drop a connection whose upload or download body moves no bytes for this long.
+# There is no cap on the total time a transfer takes.
+stall_timeout_secs = 60

@@ -25,6 +25,7 @@ type Config struct {
 	Auth     AuthConfig     `toml:"auth"`
 	OIDC     OidcConfig     `toml:"oidc"`
 	GC       GcConfig       `toml:"gc"`
+	Limits   LimitsConfig   `toml:"limits"`
 }
 
 // ServerConfig covers the listener and the S3 region the gateway advertises.
@@ -137,6 +138,25 @@ type GcConfig struct {
 	MultipartExpirySecs int64 `toml:"multipart_expiry_secs"`
 }
 
+// LimitsConfig bounds what one request, and one team, can consume.
+type LimitsConfig struct {
+	// MaxObjectBytes caps a single PUT and the assembled size of a multipart
+	// upload. Defaults to S3's 5 TiB.
+	MaxObjectBytes int64 `toml:"max_object_bytes"`
+	// MaxPartBytes caps one multipart part. Defaults to S3's 5 GiB.
+	MaxPartBytes int64 `toml:"max_part_bytes"`
+	// TenantQuotaBytes caps the logical bytes each team stores: the size of
+	// every object in its namespaces, plus the parts of its unfinished
+	// multipart uploads. Content deduplicated against another team still
+	// counts in full, so usage reveals nothing about what other teams store.
+	// 0 means no quota. Namespaces without a team are never charged.
+	TenantQuotaBytes int64 `toml:"tenant_quota_bytes"`
+	// StallTimeoutSecs is how long a request or response body may go without
+	// moving a byte before the connection is dropped. There is no cap on the
+	// total duration, since a large object legitimately streams for a long time.
+	StallTimeoutSecs int64 `toml:"stall_timeout_secs"`
+}
+
 // Default returns the configuration before any file or environment layer is
 // applied. Decoding only overwrites keys that are actually present, so these
 // act as the defaults for everything left unset.
@@ -150,6 +170,11 @@ func Default() Config {
 			IntervalSecs:        60,
 			GraceSecs:           300,
 			MultipartExpirySecs: 86400,
+		},
+		Limits: LimitsConfig{
+			MaxObjectBytes:   5 << 40,
+			MaxPartBytes:     5 << 30,
+			StallTimeoutSecs: 60,
 		},
 	}
 }
@@ -323,6 +348,16 @@ func (c *Config) Validate() error {
 
 	if c.GC.IntervalSecs < 1 || c.GC.GraceSecs < 0 || c.GC.MultipartExpirySecs < 1 {
 		return fmt.Errorf("gc intervals must be positive")
+	}
+
+	if c.Limits.MaxObjectBytes < 1 || c.Limits.MaxPartBytes < 1 {
+		return fmt.Errorf("limits.max_object_bytes and limits.max_part_bytes must be positive")
+	}
+	if c.Limits.TenantQuotaBytes < 0 {
+		return fmt.Errorf("limits.tenant_quota_bytes must not be negative (0 means no quota)")
+	}
+	if c.Limits.StallTimeoutSecs < 1 {
+		return fmt.Errorf("limits.stall_timeout_secs must be positive")
 	}
 
 	// An enabled-but-blank admin credential would leave the gateway rejecting

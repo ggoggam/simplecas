@@ -35,6 +35,9 @@ func TestCodesAndStatuses(t *testing.T) {
 		{"malformed xml", MalformedXML("eof"), "MalformedXML", http.StatusBadRequest},
 		{"not implemented", NotImplemented("?acl"), "NotImplemented", http.StatusNotImplemented},
 		{"request time skewed", ErrRequestTimeTooSkewed, "RequestTimeTooSkewed", http.StatusForbidden},
+		{"entity too large", EntityTooLarge("%d bytes", 9), "EntityTooLarge", http.StatusBadRequest},
+		{"quota exceeded", QuotaExceeded("full"), "QuotaExceeded", http.StatusForbidden},
+		{"request timeout", ErrRequestTimeout, "RequestTimeout", http.StatusBadRequest},
 		{"internal", From(errors.New("boom")), "InternalError", http.StatusInternalServerError},
 	}
 	for _, tc := range tests {

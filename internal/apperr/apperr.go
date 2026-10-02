@@ -41,6 +41,9 @@ const (
 	KindMalformedXML
 	KindNotImplemented
 	KindRequestTimeTooSkewed
+	KindEntityTooLarge
+	KindQuotaExceeded
+	KindRequestTimeout
 )
 
 // Error is a classified failure. Sentinel values below cover the kinds that
@@ -71,6 +74,7 @@ var (
 	ErrAccessDenied           = &Error{Kind: KindAccessDenied, msg: "access denied"}
 	ErrSignatureDoesNotMatch  = &Error{Kind: KindSignatureDoesNotMatch, msg: "signature mismatch"}
 	ErrRequestTimeTooSkewed   = &Error{Kind: KindRequestTimeTooSkewed, msg: "the difference between the request time and the server's time is too large"}
+	ErrRequestTimeout         = &Error{Kind: KindRequestTimeout, msg: "the request body stopped arriving and the connection timed out"}
 )
 
 // RequestIDHeader carries the per-request ID the router assigns. The error
@@ -106,6 +110,17 @@ func NotImplemented(format string, a ...any) *Error {
 // MalformedXML rejects an unparseable request body.
 func MalformedXML(format string, a ...any) *Error {
 	return &Error{Kind: KindMalformedXML, msg: "malformed request: " + fmt.Sprintf(format, a...)}
+}
+
+// EntityTooLarge rejects an upload, part, or assembled object over the
+// configured size limit.
+func EntityTooLarge(format string, a ...any) *Error {
+	return &Error{Kind: KindEntityTooLarge, msg: fmt.Sprintf(format, a...)}
+}
+
+// QuotaExceeded rejects a write that would take a team past its storage quota.
+func QuotaExceeded(format string, a ...any) *Error {
+	return &Error{Kind: KindQuotaExceeded, msg: fmt.Sprintf(format, a...)}
 }
 
 // newInternal builds an internal error from a non-nil cause.
@@ -192,6 +207,12 @@ func (e *Error) S3Code() string {
 		return "NotImplemented"
 	case KindRequestTimeTooSkewed:
 		return "RequestTimeTooSkewed"
+	case KindEntityTooLarge:
+		return "EntityTooLarge"
+	case KindQuotaExceeded:
+		return "QuotaExceeded"
+	case KindRequestTimeout:
+		return "RequestTimeout"
 	default:
 		return "InternalError"
 	}
@@ -207,12 +228,13 @@ func (e *Error) Status() int {
 		KindTenantAlreadyExists, KindTenantNotEmpty:
 		return http.StatusConflict
 	case KindInvalidNamespaceName, KindInvalidTenantName,
-		KindInvalidArgument, KindInvalidPart, KindMalformedXML:
+		KindInvalidArgument, KindInvalidPart, KindMalformedXML,
+		KindEntityTooLarge, KindRequestTimeout:
 		return http.StatusBadRequest
 	case KindInvalidRange:
 		return http.StatusRequestedRangeNotSatisfiable
 	case KindAccessDenied, KindSignatureDoesNotMatch, KindForbidden,
-		KindRequestTimeTooSkewed:
+		KindRequestTimeTooSkewed, KindQuotaExceeded:
 		return http.StatusForbidden
 	case KindNotImplemented:
 		return http.StatusNotImplemented

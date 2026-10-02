@@ -653,12 +653,7 @@ func (g *Gateway) putObject(w http.ResponseWriter, r *http.Request, namespace, k
 		g.writeError(w, r, err)
 		return
 	}
-	staged, err := g.cas.Stage(r.Context(), bodyReader(r))
-	if err != nil {
-		g.writeError(w, r, err)
-		return
-	}
-	etag, err := g.cas.Commit(r.Context(), ns.ID, key, contentTypeOf(r), staged)
+	etag, _, err := g.cas.Put(r.Context(), ns.ID, key, contentTypeOf(r), bodyReader(r), declaredLength(r))
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -856,19 +851,10 @@ func (g *Gateway) uploadPart(w http.ResponseWriter, r *http.Request, namespace, 
 
 	// Parts stay in staging under their own part-level digest; dedup happens
 	// once at completion, when the hash of the whole object is known.
-	staged, err := g.cas.Stage(r.Context(), bodyReader(r))
+	staged, err := g.cas.PutPart(r.Context(), upload, int32(partNumber), bodyReader(r), declaredLength(r))
 	if err != nil {
 		g.writeError(w, r, err)
 		return
-	}
-	replaced, err := g.db.PutPart(r.Context(), upload.ID, int32(partNumber),
-		staged.StagingKey, staged.Size, staged.Hash)
-	if err != nil {
-		g.writeError(w, r, err)
-		return
-	}
-	if replaced != "" {
-		g.cas.DiscardStaging(r.Context(), replaced)
 	}
 
 	w.Header().Set("ETag", quotedETag(staged.Hash))

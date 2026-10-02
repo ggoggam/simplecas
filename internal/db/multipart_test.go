@@ -76,7 +76,7 @@ func TestPutPartReplacementReturnsTheOldStagingKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	replaced, err := d.PutPart(ctx, id, 1, "staging/first", 100, hashOf("p1"))
+	replaced, err := d.PutPart(ctx, id, 1, "staging/first", 100, hashOf("p1"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +84,7 @@ func TestPutPartReplacementReturnsTheOldStagingKey(t *testing.T) {
 		t.Errorf("first upload of a part replaced %q, want nothing", replaced)
 	}
 
-	replaced, err = d.PutPart(ctx, id, 1, "staging/second", 120, hashOf("p1b"))
+	replaced, err = d.PutPart(ctx, id, 1, "staging/second", 120, hashOf("p1b"), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestListPartsPage(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := int32(1); i <= 5; i++ {
-		if _, err := d.PutPart(ctx, id, i, "staging/p", 10, hashOf("p")); err != nil {
+		if _, err := d.PutPart(ctx, id, i, "staging/p", 10, hashOf("p"), 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -200,10 +200,10 @@ func TestRemoveMultipartReturnsStagingKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.PutPart(ctx, id, 1, "staging/a", 10, hashOf("a")); err != nil {
+	if _, err := d.PutPart(ctx, id, 1, "staging/a", 10, hashOf("a"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.PutPart(ctx, id, 2, "staging/b", 10, hashOf("b")); err != nil {
+	if _, err := d.PutPart(ctx, id, 2, "staging/b", 10, hashOf("b"), 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -238,14 +238,14 @@ func TestSweepMultipart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.PutPart(ctx, stale, 1, "staging/stale", 10, hashOf("s")); err != nil {
+	if _, err := d.PutPart(ctx, stale, 1, "staging/stale", 10, hashOf("s"), 0); err != nil {
 		t.Fatal(err)
 	}
 	fresh, err := d.CreateMultipart(ctx, nsID, "fresh.bin", "application/octet-stream")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.PutPart(ctx, fresh, 1, "staging/fresh", 10, hashOf("f")); err != nil {
+	if _, err := d.PutPart(ctx, fresh, 1, "staging/fresh", 10, hashOf("f"), 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -285,13 +285,13 @@ func TestSweepMultipartSparesRecentlyActiveUploads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.PutPart(ctx, id, 1, "staging/old", 10, hashOf("o")); err != nil {
+	if _, err := d.PutPart(ctx, id, 1, "staging/old", 10, hashOf("o"), 0); err != nil {
 		t.Fatal(err)
 	}
 	age(t, d, id, 7200)
 
 	// A part uploaded just now resets the activity clock.
-	if _, err := d.PutPart(ctx, id, 2, "staging/new", 10, hashOf("n")); err != nil {
+	if _, err := d.PutPart(ctx, id, 2, "staging/new", 10, hashOf("n"), 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -312,7 +312,7 @@ func TestStagingKeyReferenced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.PutPart(ctx, id, 1, "staging/live", 10, hashOf("l")); err != nil {
+	if _, err := d.PutPart(ctx, id, 1, "staging/live", 10, hashOf("l"), 0); err != nil {
 		t.Fatal(err)
 	}
 

@@ -102,7 +102,7 @@ func run(logger *slog.Logger) error {
 	}
 	cancelStartup()
 
-	store := cas.New(database, bucket, cfg.GC, logger)
+	store := cas.New(database, bucket, cfg.GC, cfg.Limits, logger)
 	gateway := s3.New(database, bucket, store, cfg, logger)
 
 	// When OIDC is on, the guard wraps the /ui and /api surfaces only: the S3
@@ -120,6 +120,9 @@ func run(logger *slog.Logger) error {
 		API:     guard(api.New(database, store, gateway, logger).Routes()),
 		UI:      guard(ui.New(web.Dist()).Routes()),
 		Auth:    authHandler,
+		// Uploads and downloads have no total deadline (see srv below), so
+		// this is what stops a stalled one from holding its connection.
+		StallTimeout: time.Duration(cfg.Limits.StallTimeoutSecs) * time.Second,
 	}
 
 	var wg sync.WaitGroup
@@ -143,7 +146,8 @@ func run(logger *slog.Logger) error {
 		// No ReadTimeout or WriteTimeout: uploads and downloads stream, and a
 		// multi-gigabyte object legitimately takes longer than any fixed
 		// deadline would allow. ReadHeaderTimeout still bounds slow-header
-		// attacks, and IdleTimeout reaps abandoned keep-alive connections.
+		// attacks, IdleTimeout reaps abandoned keep-alive connections, and
+		// the router's StallTimeout drops a body that stops moving.
 		IdleTimeout: 120 * time.Second,
 	}
 

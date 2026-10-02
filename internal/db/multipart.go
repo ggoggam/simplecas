@@ -40,7 +40,10 @@ func (d *DB) GetMultipart(ctx context.Context, namespaceID int64, key string, id
 // PutPart records a staged part. It returns the staging key of any previous
 // upload of the same part number, whose bytes the caller must delete — a client
 // retrying a part would otherwise orphan the first attempt.
-func (d *DB) PutPart(ctx context.Context, uploadID uuid.UUID, partNumber int32, stagingKey string, size int64, etag string) (replaced string, err error) {
+//
+// Staged parts count against the team's quota (0 means none): without that, a
+// team could park unbounded bytes in uploads it never completes.
+func (d *DB) PutPart(ctx context.Context, uploadID uuid.UUID, partNumber int32, stagingKey string, size int64, etag string, quota int64) (replaced string, err error) {
 	err = d.InTx(ctx, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx, `
 			SELECT staging_key FROM multipart_parts
@@ -59,7 +62,17 @@ func (d *DB) PutPart(ctx context.Context, uploadID uuid.UUID, partNumber int32, 
 			ON CONFLICT (upload_id, part_number) DO UPDATE
 			    SET staging_key = $3, size = $4, etag = $5, created_at = now()`,
 			uploadID, partNumber, stagingKey, size, etag)
-		return apperr.Internal(err)
+		if err != nil || quota <= 0 {
+			return apperr.Internal(err)
+		}
+
+		var namespaceID int64
+		err = tx.QueryRow(ctx,
+			"SELECT namespace_id FROM multipart_uploads WHERE id = $1", uploadID).Scan(&namespaceID)
+		if err != nil {
+			return apperr.Internal(err)
+		}
+		return EnforceQuota(ctx, tx, quota, namespaceID, uuid.Nil)
 	})
 	if err != nil {
 		return "", err

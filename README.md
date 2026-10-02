@@ -111,6 +111,34 @@ access_key_id = "…"
 secret_access_key = "…"
 ```
 
+### Limits and quotas
+
+The `[limits]` section bounds what one request and one team can consume:
+
+| Setting | Default | Over the limit |
+| --- | --- | --- |
+| `max_object_bytes` | 5 TiB | `400 EntityTooLarge` for a PUT, or a multipart completion whose parts add up past it |
+| `max_part_bytes` | 5 GiB | `400 EntityTooLarge` for an upload part |
+| `tenant_quota_bytes` | 0 (off) | `403 QuotaExceeded` |
+| `stall_timeout_secs` | 60 | `400 RequestTimeout`, and the connection is dropped |
+
+A body whose `Content-Length` (or `x-amz-decoded-content-length`) is already
+over a size limit is refused before it is read. An undeclared one is cut off one
+byte past the limit.
+
+The quota charges each team the **logical** size of what it stores: every
+object in its namespaces plus the parts of its unfinished multipart uploads.
+Dedup stays global, but content another team also stores is charged in full, so
+a team's usage never reveals what other teams hold. Overwriting a key charges the
+difference; copies and dedup links are charged like uploads. Namespaces without a
+team are never charged. Usage is summed from the rows on each write rather than
+kept as a counter, which costs a scan of the team's objects per write while a
+quota is set.
+
+The stall timeout is on silence, not duration: a multi-gigabyte transfer may
+take as long as it needs while bytes keep moving, but one that stops for
+`stall_timeout_secs` is dropped instead of holding its connection open.
+
 ## Authentication
 
 There are two independent auth mechanisms for the two kinds of client:
@@ -187,6 +215,8 @@ leaks across teams.
   another team holds a given blob: linking a hash only another team stores
   returns the same `404 NoSuchKey` as a hash nobody stores. A genuine re-upload of identical bytes is
   still physically de-duplicated (nothing new is stored).
+- **Quota**: `limits.tenant_quota_bytes` caps each team's logical usage; see
+  [Limits and quotas](#limits-and-quotas).
 
 No config is required — tenancy is automatic whenever OIDC is on. There is no
 users/teams state when OIDC is off; then `/api` is the unauthenticated

@@ -21,7 +21,8 @@ import (
 const abcHash = "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
 
 // newGateway builds a gateway over a scratch database and a scratch fs bucket.
-func newGateway(t *testing.T) *Gateway {
+// Each option adjusts the configuration before the gateway is built.
+func newGateway(t *testing.T, options ...func(*config.Config)) *Gateway {
 	t.Helper()
 	ctx := t.Context()
 	dsn := testdb.URL(t)
@@ -40,10 +41,13 @@ func newGateway(t *testing.T) *Gateway {
 
 	cfg := config.Default()
 	cfg.Database.URL = dsn
+	for _, option := range options {
+		option(&cfg)
+	}
 	log := slog.New(slog.DiscardHandler)
 	gc := config.GcConfig{IntervalSecs: 60, GraceSecs: 300, MultipartExpirySecs: 86400}
 
-	return New(database, bucket, cas.New(database, bucket, gc, log), &cfg, log)
+	return New(database, bucket, cas.New(database, bucket, gc, cfg.Limits, log), &cfg, log)
 }
 
 // do issues a request against the gateway and returns the recorded response.
@@ -939,5 +943,38 @@ func TestObjectsAreServedDefused(t *testing.T) {
 	}
 	if got := w.Header().Get("X-Content-Type-Options"); got != "nosniff" {
 		t.Errorf("HEAD X-Content-Type-Options = %q, want nosniff", got)
+	}
+}
+
+func TestSizeLimitsOverHTTP(t *testing.T) {
+	g := newGateway(t, func(c *config.Config) {
+		c.Limits.MaxObjectBytes = 3
+		c.Limits.MaxPartBytes = 2
+	})
+	if w := do(t, g, http.MethodPut, "/bucket", ""); w.Code != http.StatusOK {
+		t.Fatalf("create bucket: %d", w.Code)
+	}
+
+	w := do(t, g, http.MethodPut, "/bucket/big", "abcd")
+	if w.Code != http.StatusBadRequest || errorCode(t, w) != "EntityTooLarge" {
+		t.Errorf("oversize PUT: %d %s, want 400 EntityTooLarge", w.Code, w.Body.String())
+	}
+
+	// The framing makes this body longer than the limit on the wire, but the
+	// object it decodes to fits.
+	framed := "3\r\nabc\r\n0\r\n\r\n"
+	w = do(t, g, http.MethodPut, "/bucket/framed", framed,
+		"x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+		"x-amz-decoded-content-length", "3")
+	if w.Code != http.StatusOK {
+		t.Errorf("framed PUT that decodes within the limit: %d %s", w.Code, w.Body.String())
+	}
+
+	w = do(t, g, http.MethodPost, "/bucket/parts?uploads", "")
+	var initiated initiateMultipartUploadResult
+	decode(t, w, &initiated)
+	w = do(t, g, http.MethodPut, "/bucket/parts?partNumber=1&uploadId="+initiated.UploadID, "abc")
+	if w.Code != http.StatusBadRequest || errorCode(t, w) != "EntityTooLarge" {
+		t.Errorf("oversize part: %d %s, want 400 EntityTooLarge", w.Code, w.Body.String())
 	}
 }

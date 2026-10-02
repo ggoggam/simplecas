@@ -676,18 +676,13 @@ func (h *Handler) putObject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	contentType := resolveContentType(r, key)
-	staged, err := h.cas.Stage(r.Context(), r.Body)
-	if err != nil {
-		h.writeError(w, r, err)
-		return
-	}
-	etag, err := h.cas.Commit(r.Context(), ns.ID, key, contentType, staged)
+	etag, size, err := h.cas.Put(r.Context(), ns.ID, key, contentType, r.Body, r.ContentLength)
 	if err != nil {
 		h.writeError(w, r, err)
 		return
 	}
 	h.writeJSON(w, http.StatusOK, map[string]any{
-		"key": key, "etag": etag, "size": staged.Size,
+		"key": key, "etag": etag, "size": size,
 	})
 }
 
@@ -732,19 +727,10 @@ func (h *Handler) uploadPart(w http.ResponseWriter, r *http.Request, ns db.Names
 		return
 	}
 
-	staged, err := h.cas.Stage(r.Context(), r.Body)
+	staged, err := h.cas.PutPart(r.Context(), upload, int32(partNumber), r.Body, r.ContentLength)
 	if err != nil {
 		h.writeError(w, r, err)
 		return
-	}
-	replaced, err := h.db.PutPart(r.Context(), upload.ID, int32(partNumber),
-		staged.StagingKey, staged.Size, staged.Hash)
-	if err != nil {
-		h.writeError(w, r, err)
-		return
-	}
-	if replaced != "" {
-		h.cas.DiscardStaging(r.Context(), replaced)
 	}
 	h.writeJSON(w, http.StatusOK, map[string]any{
 		"part_number": partNumber, "etag": staged.Hash,

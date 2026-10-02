@@ -382,3 +382,25 @@ func TestAWSSDKStreamingMultipartPartIsDecoded(t *testing.T) {
 		t.Errorf("part ETag = %s, want %s", got, `"`+abcHash+`"`)
 	}
 }
+
+// The size a client announces is what limits are checked against before the
+// body is read. For an aws-chunked body that is the decoded length: its
+// Content-Length counts the chunk framing too.
+func TestDeclaredLength(t *testing.T) {
+	plain := httptest.NewRequest(http.MethodPut, "/ns/key", strings.NewReader("abc"))
+	if got := declaredLength(plain); got != 3 {
+		t.Errorf("plain body: declared %d, want 3", got)
+	}
+
+	framed := httptest.NewRequest(http.MethodPut, "/ns/key", strings.NewReader("3\r\nabc\r\n0\r\n\r\n"))
+	framed.Header.Set("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+	framed.Header.Set("x-amz-decoded-content-length", "3")
+	if got := declaredLength(framed); got != 3 {
+		t.Errorf("framed body: declared %d, want the decoded 3", got)
+	}
+
+	framed.Header.Del("x-amz-decoded-content-length")
+	if got := declaredLength(framed); got != -1 {
+		t.Errorf("framed body with no decoded length: declared %d, want -1 (unknown)", got)
+	}
+}
