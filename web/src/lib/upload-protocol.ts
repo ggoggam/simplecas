@@ -26,6 +26,24 @@ export type WorkerMessage =
   | { id: number; type: "done"; etag: string; size: number; deduped: boolean }
   | { id: number; type: "error"; message: string };
 
+/** A non-2xx response, keeping its status so callers can tell a refusal from
+ *  a transient failure. */
+export class HttpError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+/** Whether a failed request is worth sending again. Network errors, server
+ *  errors, timeouts and rate limits may pass on a retry; any other 4xx (over
+ *  quota, too large, not found) is the server's answer and will not change. */
+export function isRetryable(err: unknown): boolean {
+  if (!(err instanceof HttpError)) return true;
+  return err.status >= 500 || err.status === 408 || err.status === 429;
+}
+
 /** Encode a hierarchical key without escaping the "/" separators. */
 export function encodeKey(key: string): string {
   return key.split("/").map(encodeURIComponent).join("/");
