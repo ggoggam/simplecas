@@ -80,6 +80,7 @@ on backend startup.
 | `mise run build`    | Production build: PWA then the binary with the UI embedded |
 | `mise run test`     | Unit tests (database-backed tests skip without a DB)     |
 | `mise run test:integration` | Full suite against the dev Postgres              |
+| `mise run test:e2e` | AWS CLI end-to-end suite against the dev Postgres        |
 | `mise run check`    | `lint` + `test` (`fmt`, `vet`, `lint` also defined)      |
 | `mise run web:build`| Build the PWA into `web/dist`                            |
 
@@ -389,6 +390,7 @@ internal/
   ui/                serves the embedded PWA
   server/            route precedence across the four surfaces + request logging
   testdb/            per-test Postgres schemas (test-only)
+e2e/                 AWS CLI end-to-end tests against the assembled server
 web/                 Vite + React + Tailwind PWA (shadcn/ui, ggoggam/shadcn-treeview)
 web/embed.go         go:embed of web/dist, so the PWA ships inside the binary
 mise.toml            toolchain pins + dev/build/test tasks (`mise tasks`)
@@ -409,3 +411,10 @@ are unavailable.
 `SIMPLECAS_TEST_DATABASE_URL` is set (`mise run test:integration` starts the dev
 Postgres and sets it). Each such test provisions its own Postgres schema and
 drops it afterwards, so packages can run concurrently without interfering.
+
+`e2e/` runs the real AWS CLI v2 (`aws s3` and `aws s3api`) against an in-process
+server assembled the way `main.go` does: buckets, `cp` up, down and between
+buckets, `mv`, `sync`, `rm`, listings and pagination, multipart (including
+`UploadPartCopy`), signatures, team keys, and aws-chunked uploads over TLS. It
+skips unless the database variable is set and `aws` v2 is on `PATH`; mise
+installs the CLI, and `mise run test:e2e` runs just this suite.

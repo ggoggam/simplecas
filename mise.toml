@@ -6,6 +6,8 @@
 go = "1.26"
 golangci-lint = "2.12.2"
 bun = "latest"
+# The e2e suite (./e2e) drives the real AWS CLI v2 against the gateway.
+aws-cli = "2"
 # prek: a fast, Rust reimplementation of pre-commit; runs the hooks in
 # .pre-commit-config.yaml (see `mise run pre-commit`).
 prek = "latest"
@@ -180,6 +182,16 @@ depends = ["db"]
 run = "go test -race -count=1 ./..."
 
 [tasks."test:integration".env]
+SIMPLECAS_TEST_DATABASE_URL = "postgres://postgres:postgres@localhost:55432/simplecas"
+
+# End-to-end: the AWS CLI against a fully assembled server. Skips without a
+# database or without AWS CLI v2 on PATH; `test:integration` runs it too.
+[tasks."test:e2e"]
+description = "Run the AWS CLI end-to-end suite (starts the dev Postgres)"
+depends = ["db"]
+run = "go test -race -count=1 ./e2e/..."
+
+[tasks."test:e2e".env]
 SIMPLECAS_TEST_DATABASE_URL = "postgres://postgres:postgres@localhost:55432/simplecas"
 
 [tasks."test:coverage"]
