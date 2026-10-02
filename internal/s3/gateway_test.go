@@ -2,6 +2,7 @@ package s3
 
 import (
 	"encoding/xml"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -524,11 +525,111 @@ func TestCopyObjectOverHTTP(t *testing.T) {
 	mustStatus(t, w, http.StatusNotFound)
 	w = do(t, g, http.MethodPut, "/dst/x", "", "x-amz-copy-source", "nokey")
 	mustStatus(t, w, http.StatusBadRequest)
+}
 
-	// UploadPartCopy is explicitly unsupported.
-	w = do(t, g, http.MethodPut, "/dst/x?uploadId=6ba7b810-9dad-11d1-80b4-00c04fd430c8&partNumber=1", "",
-		"x-amz-copy-source", "/src/orig.txt")
-	mustStatus(t, w, http.StatusBadRequest)
+// The AWS CLI copies anything over its multipart threshold as UploadPartCopy
+// calls, one byte range of the source per part.
+func TestUploadPartCopyOverHTTP(t *testing.T) {
+	g := newGateway(t)
+	createNS(t, g, "src")
+	createNS(t, g, "dst")
+	putObj(t, g, "src", "orig.txt", "abcdef", "text/plain")
+	wantETag := putObj(t, g, "src", "reference.txt", "abcdef", "text/plain")
+
+	w := do(t, g, http.MethodPost, "/dst/copy.txt?uploads", "")
+	mustStatus(t, w, http.StatusOK)
+	var initiated initiateMultipartUploadResult
+	decode(t, w, &initiated)
+	partURL := func(n int) string {
+		return fmt.Sprintf("/dst/copy.txt?partNumber=%d&uploadId=%s", n, initiated.UploadID)
+	}
+
+	var etags []string
+	for i, rng := range []string{"bytes=0-3", "bytes=4-5"} {
+		w := do(t, g, http.MethodPut, partURL(i+1), "",
+			"x-amz-copy-source", "/src/orig.txt", "x-amz-copy-source-range", rng)
+		mustStatus(t, w, http.StatusOK)
+		var result copyPartResult
+		decode(t, w, &result)
+		if result.ETag == "" || result.LastModified == "" {
+			t.Fatalf("part %d: incomplete CopyPartResult %s", i+1, w.Body.String())
+		}
+		etags = append(etags, result.ETag)
+	}
+
+	manifest := fmt.Sprintf(`<CompleteMultipartUpload>
+		<Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part>
+		<Part><PartNumber>2</PartNumber><ETag>%s</ETag></Part>
+	</CompleteMultipartUpload>`, etags[0], etags[1])
+	w = do(t, g, http.MethodPost, "/dst/copy.txt?uploadId="+initiated.UploadID, manifest)
+	mustStatus(t, w, http.StatusOK)
+
+	w = do(t, g, http.MethodGet, "/dst/copy.txt", "")
+	mustStatus(t, w, http.StatusOK)
+	if w.Body.String() != "abcdef" {
+		t.Errorf("assembled copy = %q, want abcdef", w.Body.String())
+	}
+	if got := w.Header().Get("ETag"); got != wantETag {
+		t.Errorf("ETag = %s, want %s: the copy must dedup against the source", got, wantETag)
+	}
+
+	// Failure modes.
+	w = do(t, g, http.MethodPost, "/dst/other.txt?uploads", "")
+	decode(t, w, &initiated)
+	other := fmt.Sprintf("/dst/other.txt?partNumber=1&uploadId=%s", initiated.UploadID)
+	for _, rng := range []string{"bytes=0-6", "bytes=3-2", "bytes=2-", "0-1"} {
+		w = do(t, g, http.MethodPut, other, "", "x-amz-copy-source", "/src/orig.txt", "x-amz-copy-source-range", rng)
+		if w.Code != http.StatusBadRequest || errorCode(t, w) != "InvalidArgument" {
+			t.Errorf("range %q: %d %s, want 400 InvalidArgument", rng, w.Code, w.Body.String())
+		}
+	}
+	w = do(t, g, http.MethodPut, other, "", "x-amz-copy-source", "/src/missing")
+	mustStatus(t, w, http.StatusNotFound)
+}
+
+func TestUploadPartCopyEnforcesThePartLimit(t *testing.T) {
+	g := newGateway(t, func(c *config.Config) { c.Limits.MaxPartBytes = 3 })
+	createNS(t, g, "bkt")
+	putObj(t, g, "bkt", "src", "abcdef", "text/plain")
+	w := do(t, g, http.MethodPost, "/bkt/dst?uploads", "")
+	var initiated initiateMultipartUploadResult
+	decode(t, w, &initiated)
+
+	w = do(t, g, http.MethodPut, "/bkt/dst?partNumber=1&uploadId="+initiated.UploadID, "",
+		"x-amz-copy-source", "/bkt/src")
+	if w.Code != http.StatusBadRequest || errorCode(t, w) != "EntityTooLarge" {
+		t.Errorf("whole-source part copy over the limit: %d %s", w.Code, w.Body.String())
+	}
+	w = do(t, g, http.MethodPut, "/bkt/dst?partNumber=1&uploadId="+initiated.UploadID, "",
+		"x-amz-copy-source", "/bkt/src", "x-amz-copy-source-range", "bytes=0-2")
+	mustStatus(t, w, http.StatusOK)
+}
+
+// Tags are not stored, but the AWS CLI reads them before every s3-to-s3 copy,
+// so reading them must work.
+func TestGetObjectTaggingIsEmpty(t *testing.T) {
+	g := newGateway(t)
+	createNS(t, g, "bkt")
+	putObj(t, g, "bkt", "doc", "abc", "text/plain")
+
+	w := do(t, g, http.MethodGet, "/bkt/doc?tagging", "")
+	mustStatus(t, w, http.StatusOK)
+	var got struct {
+		XMLName xml.Name
+		TagSet  *struct {
+			Tags []struct{} `xml:"Tag"`
+		} `xml:"TagSet"`
+	}
+	decode(t, w, &got)
+	if got.XMLName.Local != "Tagging" || got.TagSet == nil || len(got.TagSet.Tags) != 0 {
+		t.Errorf("body = %s, want an empty TagSet", w.Body.String())
+	}
+
+	w = do(t, g, http.MethodGet, "/bkt/missing?tagging", "")
+	mustStatus(t, w, http.StatusNotFound)
+	if code := errorCode(t, w); code != "NoSuchKey" {
+		t.Errorf("code = %q, want NoSuchKey", code)
+	}
 }
 
 func TestDeleteObjectsBatch(t *testing.T) {

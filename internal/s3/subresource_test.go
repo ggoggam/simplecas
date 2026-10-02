@@ -26,6 +26,7 @@ func TestUnsupportedSubresource(t *testing.T) {
 		{"listing parameters are not subresources", http.MethodGet, levelNamespace, "list-type=2&prefix=a&max-keys=5", ""},
 		{"SDK operation hints are ignored", http.MethodPut, levelObject, "x-id=PutObject", ""},
 		{"the null version is the current object", http.MethodGet, levelObject, "versionId=null", ""},
+		{"object tags are readable", http.MethodGet, levelObject, "tagging", ""},
 
 		// The review's reported cases: each used to act on the resource.
 		{"PUT ?tagging overwrote the object", http.MethodPut, levelObject, "tagging", "tagging"},

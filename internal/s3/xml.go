@@ -110,7 +110,23 @@ type copyObjectResult struct {
 	ETag         string   `xml:"ETag"`
 }
 
+// ---- Tagging ----
+
+// tagging is a GetObjectTagging response; the tag set is always empty.
+type tagging struct {
+	XMLName xml.Name `xml:"Tagging"`
+	Xmlns   string   `xml:"xmlns,attr"`
+	TagSet  struct{} `xml:"TagSet"`
+}
+
 // ---- Multipart ----
+
+type copyPartResult struct {
+	XMLName      xml.Name `xml:"CopyPartResult"`
+	Xmlns        string   `xml:"xmlns,attr"`
+	LastModified string   `xml:"LastModified"`
+	ETag         string   `xml:"ETag"`
+}
 
 type initiateMultipartUploadResult struct {
 	XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
