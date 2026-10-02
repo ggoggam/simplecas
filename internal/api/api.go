@@ -692,9 +692,13 @@ func (h *Handler) putObject(w http.ResponseWriter, r *http.Request) {
 }
 
 // linkObject points key at content that is already stored, transferring no
-// bytes. It answers {linked: true, …} on a dedup hit, or {linked: false} when
-// the blob is not present (or not visible to this tenant) so the client uploads
-// it for real.
+// bytes. It answers {linked: true, …} on a dedup hit, and 404 NoSuchKey
+// otherwise, so the client uploads the bytes for real.
+//
+// Dedup is global, but a link only succeeds for content the caller's own team
+// already holds. Every miss — a hash nobody stores, or one only another team
+// stores — gets the same 404 with the same body: if those two answers differed
+// in any way, this endpoint would tell a caller what other teams have stored.
 func (h *Handler) linkObject(w http.ResponseWriter, r *http.Request, ns db.Namespace, key, hash string) {
 	contentType := resolveContentType(r, key)
 	size, linked, err := h.cas.LinkBlob(r.Context(), ns.ID, key, hash, contentType, ns.TenantID)
@@ -703,7 +707,7 @@ func (h *Handler) linkObject(w http.ResponseWriter, r *http.Request, ns db.Names
 		return
 	}
 	if !linked {
-		h.writeJSON(w, http.StatusOK, map[string]any{"linked": false})
+		h.writeError(w, r, apperr.ErrNoSuchKey)
 		return
 	}
 	h.writeJSON(w, http.StatusOK, map[string]any{

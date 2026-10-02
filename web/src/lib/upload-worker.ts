@@ -176,11 +176,14 @@ async function handle(job: UploadJob) {
     return;
   }
 
-  // Large files: hash, try a zero-byte link, else multipart.
+  // Large files: hash, try a zero-byte link, else multipart. A 404 means the
+  // content isn't stored where this team can link it; upload the bytes.
   const hash = await hashFile(job);
-  const linked = await okJson<{ linked: boolean; etag?: string; size?: number }>(
-    xhrSend("PUT", `${base}?link=${hash}`, null, job.contentType),
-  );
+  const attempt = await xhrSend("PUT", `${base}?link=${hash}`, null, job.contentType);
+  const linked =
+    attempt.status === 404
+      ? { linked: false }
+      : await okJson<{ linked: boolean; etag?: string; size?: number }>(Promise.resolve(attempt));
   if (linked.linked) {
     post({
       id: job.id,
