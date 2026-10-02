@@ -503,10 +503,10 @@ func TestLinkEndpoint(t *testing.T) {
 
 	// Miss: nothing stored yet.
 	w := f.do(t, http.MethodPut, "/api/namespaces/files/objects/copy.txt?link="+abcHash, "")
-	mustStatus(t, w, http.StatusOK)
+	mustStatus(t, w, http.StatusNotFound)
 	body := decodeObject(t, w)
-	if body["linked"] != false {
-		t.Fatalf("link on an empty store = %#v, want linked:false", body)
+	if body["code"] != "NoSuchKey" {
+		t.Fatalf("link on an empty store = %#v, want NoSuchKey", body)
 	}
 	// The declined link must not have created the object.
 	mustStatus(t, f.do(t, http.MethodGet, "/api/namespaces/files/objects/copy.txt", ""),

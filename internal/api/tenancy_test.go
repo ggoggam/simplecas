@@ -396,11 +396,17 @@ func TestLinkIsTenantScoped(t *testing.T) {
 	createTenant(t, f, "team-b")
 	createNamespaceIn(t, f, "bob-ns", "team-b")
 
-	// Bob knows the hash but not the content. The link must be declined.
+	// Bob knows the hash but not the content. The link must be declined with
+	// exactly the answer a hash nobody stores gets, or the difference would
+	// tell Bob that some other team holds this content.
 	w := f.do(t, http.MethodPut, "/api/namespaces/bob-ns/objects/guess.txt?link="+abcHash, "")
-	mustStatus(t, w, http.StatusOK)
-	if decodeObject(t, w)["linked"] != false {
-		t.Fatalf("link across tenants = %s, want linked:false", w.Body.String())
+	mustStatus(t, w, http.StatusNotFound)
+	const unstored = "0000000000000000000000000000000000000000000000000000000000000000"
+	miss := f.do(t, http.MethodPut, "/api/namespaces/bob-ns/objects/guess.txt?link="+unstored, "")
+	mustStatus(t, miss, http.StatusNotFound)
+	if w.Body.String() != miss.Body.String() {
+		t.Errorf("another team's hash answers %q but an unstored hash answers %q; they must be identical",
+			w.Body.String(), miss.Body.String())
 	}
 	mustStatus(t, f.do(t, http.MethodGet, "/api/namespaces/bob-ns/objects/guess.txt", ""),
 		http.StatusNotFound)

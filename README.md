@@ -184,7 +184,8 @@ leaks across teams.
 - **Self-serve**: any signed-in user can create a team and becomes its owner.
 - **Dedup stays global** across all content, but the client-side dedup "link"
   fast path is scoped to your own team, so it can't be used to probe whether
-  another team holds a given blob. A genuine re-upload of identical bytes is
+  another team holds a given blob: linking a hash only another team stores
+  returns the same `404 NoSuchKey` as a hash nobody stores. A genuine re-upload of identical bytes is
   still physically de-duplicated (nothing new is stored).
 
 No config is required — tenancy is automatic whenever OIDC is on. There is no
@@ -306,7 +307,8 @@ the UI thread never blocks:
   arrival, so nothing extra is needed client-side.
 - **Large files** (≥ 16 MiB) — the worker BLAKE3-hashes the file, then attempts a
   zero-byte **link** (`PUT …/{key}?link=<hash>`). If the content already exists
-  the object is created without transferring a byte; otherwise the worker streams
+  in your team the object is created without transferring a byte; otherwise
+  (`404`) the worker streams
   it as **parallel multipart** (initiate → upload parts with bounded concurrency
   and per-part retries → complete), auto-aborting on failure. Part size scales up
   automatically so the part count stays within S3's 10 000 limit.
