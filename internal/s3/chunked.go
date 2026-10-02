@@ -60,12 +60,49 @@ func isChunkedPayload(r *http.Request) bool {
 
 // bodyReader returns the request body, unwrapping AWS chunk framing when
 // present so the caller always sees the object's real bytes.
+//
+// A framed body is also held to x-amz-decoded-content-length when the client
+// sends it (the SDKs always do), so a body that decodes cleanly but to the
+// wrong length fails instead of being stored short.
 func bodyReader(r *http.Request) io.Reader {
-	if isChunkedPayload(r) {
-		return newChunkedReader(r.Body)
+	if !isChunkedPayload(r) {
+		return r.Body
 	}
-	return r.Body
+	decoded := newChunkedReader(r.Body)
+	raw := r.Header.Get("x-amz-decoded-content-length")
+	if raw == "" {
+		return decoded
+	}
+	want, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || want < 0 {
+		return errReader{fmt.Errorf("aws-chunked: bad x-amz-decoded-content-length %q", raw)}
+	}
+	return &lengthCheckedReader{r: decoded, remaining: want}
 }
+
+// lengthCheckedReader fails unless its source yields exactly the declared
+// number of bytes.
+type lengthCheckedReader struct {
+	r         io.Reader
+	remaining int64
+}
+
+func (l *lengthCheckedReader) Read(p []byte) (int, error) {
+	n, err := l.r.Read(p)
+	l.remaining -= int64(n)
+	if l.remaining < 0 {
+		return n, errors.New("aws-chunked: body is longer than x-amz-decoded-content-length")
+	}
+	if errors.Is(err, io.EOF) && l.remaining > 0 {
+		return n, fmt.Errorf("aws-chunked: body is %d bytes shorter than x-amz-decoded-content-length", l.remaining)
+	}
+	return n, err
+}
+
+// errReader fails every read with err.
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }
 
 // chunkedReader decodes AWS chunk framing into the underlying payload.
 type chunkedReader struct {
@@ -93,6 +130,12 @@ func (c *chunkedReader) Read(p []byte) (int, error) {
 	// Start the next chunk when the current one is exhausted.
 	if c.remaining == 0 {
 		size, err := c.readChunkHeader()
+		if errors.Is(err, io.EOF) {
+			// The body ended between chunks without the terminating
+			// zero-length chunk: the client stopped early, and what
+			// arrived is a prefix of the object, not the object.
+			err = io.ErrUnexpectedEOF
+		}
 		if err != nil {
 			return 0, c.fail(err)
 		}

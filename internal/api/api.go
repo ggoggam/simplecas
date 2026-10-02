@@ -113,7 +113,8 @@ func (h *Handler) writeJSON(w http.ResponseWriter, status int, v any) {
 // internal ones.
 func (h *Handler) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	if e := apperr.From(err); e.IsInternal() {
-		h.log.Error("admin api error", "method", r.Method, "path", r.URL.Path, "err", err)
+		h.log.Error("admin api error", "method", r.Method, "path", r.URL.Path,
+			"requestId", w.Header().Get(apperr.RequestIDHeader), "err", err)
 	}
 	apperr.WriteJSON(w, err)
 }

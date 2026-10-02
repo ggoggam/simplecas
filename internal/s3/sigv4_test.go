@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ggoggam/simplecas/internal/apperr"
 	"github.com/ggoggam/simplecas/internal/config"
@@ -147,6 +148,10 @@ func TestVerifyRejects(t *testing.T) {
 		AccessKeyID:     "AKID",
 		SecretAccessKey: "secret",
 	}
+	// Current, so these cases reach the check they name rather than failing
+	// the freshness check first.
+	amzDate := now().UTC().Format(amzDateFormat)
+	dateStamp := amzDate[:8]
 
 	tests := []struct {
 		name    string
@@ -169,9 +174,9 @@ func TestVerifyRejects(t *testing.T) {
 			name: "unknown access key",
 			prepare: func(r *http.Request) {
 				r.Header.Set("Authorization", "AWS4-HMAC-SHA256 "+
-					"Credential=OTHER/20130524/us-east-1/s3/aws4_request, "+
+					"Credential=OTHER/"+dateStamp+"/us-east-1/s3/aws4_request, "+
 					"SignedHeaders=host, Signature=abc")
-				r.Header.Set("x-amz-date", "20130524T000000Z")
+				r.Header.Set("x-amz-date", amzDate)
 			},
 			want: apperr.ErrAccessDenied,
 		},
@@ -179,7 +184,7 @@ func TestVerifyRejects(t *testing.T) {
 			name: "missing x-amz-date",
 			prepare: func(r *http.Request) {
 				r.Header.Set("Authorization", "AWS4-HMAC-SHA256 "+
-					"Credential=AKID/20130524/us-east-1/s3/aws4_request, "+
+					"Credential=AKID/"+dateStamp+"/us-east-1/s3/aws4_request, "+
 					"SignedHeaders=host, Signature=abc")
 			},
 			want: apperr.ErrAccessDenied,
@@ -188,9 +193,9 @@ func TestVerifyRejects(t *testing.T) {
 			name: "a signed header the request does not carry",
 			prepare: func(r *http.Request) {
 				r.Header.Set("Authorization", "AWS4-HMAC-SHA256 "+
-					"Credential=AKID/20130524/us-east-1/s3/aws4_request, "+
+					"Credential=AKID/"+dateStamp+"/us-east-1/s3/aws4_request, "+
 					"SignedHeaders=host;x-amz-absent, Signature=abc")
-				r.Header.Set("x-amz-date", "20130524T000000Z")
+				r.Header.Set("x-amz-date", amzDate)
 			},
 			want: apperr.ErrSignatureDoesNotMatch,
 		},
@@ -198,9 +203,9 @@ func TestVerifyRejects(t *testing.T) {
 			name: "wrong signature",
 			prepare: func(r *http.Request) {
 				r.Header.Set("Authorization", "AWS4-HMAC-SHA256 "+
-					"Credential=AKID/20130524/us-east-1/s3/aws4_request, "+
+					"Credential=AKID/"+dateStamp+"/us-east-1/s3/aws4_request, "+
 					"SignedHeaders=host, Signature=0000000000000000")
-				r.Header.Set("x-amz-date", "20130524T000000Z")
+				r.Header.Set("x-amz-date", amzDate)
 			},
 			want: apperr.ErrSignatureDoesNotMatch,
 		},
@@ -217,34 +222,26 @@ func TestVerifyRejects(t *testing.T) {
 	}
 }
 
-// A correctly signed request must actually pass, exercising the same path a
-// real client takes: sign the canonical request, then verify it.
-func TestVerifyAcceptsACorrectlySignedRequest(t *testing.T) {
-	auth := config.AuthConfig{
-		Enabled:         true,
-		AccessKeyID:     "AKID",
-		SecretAccessKey: "secret",
-	}
-	const (
-		amzDate   = "20130524T000000Z"
-		dateStamp = "20130524"
-		payload   = "UNSIGNED-PAYLOAD"
-	)
+// signAt signs r with UNSIGNED-PAYLOAD as keyID/secret at the given time and
+// scope service, the way a real client does: build the canonical request, sign
+// it, and set the Authorization header.
+func signAt(r *http.Request, keyID, secret string, at time.Time, service string) {
+	const payload = "UNSIGNED-PAYLOAD"
+	amzDate := at.UTC().Format(amzDateFormat)
+	dateStamp := amzDate[:8]
 
-	r := httptest.NewRequest(http.MethodGet, "/ns/key?list-type=2&prefix=a/b", nil)
-	r.Host = "cas.example.com"
 	r.Header.Set("x-amz-date", amzDate)
 	r.Header.Set("x-amz-content-sha256", payload)
 
 	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
-	canonicalHeaders := "host:cas.example.com\n" +
+	canonicalHeaders := "host:" + r.Host + "\n" +
 		"x-amz-content-sha256:" + payload + "\n" +
 		"x-amz-date:" + amzDate + "\n"
 
 	sig := computeSignature(signatureInput{
-		secret:           auth.SecretAccessKey,
-		method:           http.MethodGet,
-		canonicalURI:     "/ns/key",
+		secret:           secret,
+		method:           r.Method,
+		canonicalURI:     r.URL.EscapedPath(),
 		canonicalQuery:   canonicalQueryString(r.URL.RawQuery),
 		signedHeaders:    signedHeaders,
 		canonicalHeaders: canonicalHeaders,
@@ -252,15 +249,74 @@ func TestVerifyAcceptsACorrectlySignedRequest(t *testing.T) {
 		amzDate:          amzDate,
 		dateStamp:        dateStamp,
 		region:           "us-east-1",
-		service:          "s3",
+		service:          service,
 	})
 	r.Header.Set("Authorization", strings.Join([]string{
-		sigV4Algorithm + " Credential=AKID/" + dateStamp + "/us-east-1/s3/aws4_request",
+		sigV4Algorithm + " Credential=" + keyID + "/" + dateStamp + "/us-east-1/" + service + "/aws4_request",
 		"SignedHeaders=" + signedHeaders,
 		"Signature=" + sig,
 	}, ", "))
+}
 
-	if err := verify(r, auth); err != nil {
+var testAuth = config.AuthConfig{
+	Enabled:         true,
+	AccessKeyID:     "AKID",
+	SecretAccessKey: "secret",
+}
+
+// A correctly signed request must actually pass, exercising the same path a
+// real client takes: sign the canonical request, then verify it.
+func TestVerifyAcceptsACorrectlySignedRequest(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/ns/key?list-type=2&prefix=a/b", nil)
+	r.Host = "cas.example.com"
+	signAt(r, "AKID", "secret", now(), "s3")
+
+	if err := verify(r, testAuth); err != nil {
 		t.Fatalf("a correctly signed request was rejected: %v", err)
+	}
+}
+
+// A validly signed request is only good for maxClockSkew either side of the
+// server's clock; past that, a captured request must stop verifying.
+func TestVerifyEnforcesFreshness(t *testing.T) {
+	tests := []struct {
+		name    string
+		at      time.Duration
+		service string
+		want    error
+	}{
+		{"within the window, behind", -14 * time.Minute, "s3", nil},
+		{"within the window, ahead", 14 * time.Minute, "s3", nil},
+		{"replayed after the window", -16 * time.Minute, "s3", apperr.ErrRequestTimeTooSkewed},
+		{"a year old", -365 * 24 * time.Hour, "s3", apperr.ErrRequestTimeTooSkewed},
+		{"signed for the future", 16 * time.Minute, "s3", apperr.ErrRequestTimeTooSkewed},
+		{"scoped to another service", 0, "iam", apperr.ErrAccessDenied},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/ns/key", nil)
+			r.Host = "cas.example.com"
+			signAt(r, "AKID", "secret", now().Add(tc.at), tc.service)
+			if err := verify(r, testAuth); err != tc.want {
+				t.Errorf("verify = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+// The credential scope's date must be x-amz-date's, so a signature cannot be
+// re-dated by editing one of the two.
+func TestVerifyRejectsMismatchedScopeDate(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/ns/key", nil)
+	r.Host = "cas.example.com"
+	signAt(r, "AKID", "secret", now(), "s3")
+	r.Header.Set("x-amz-date", now().Add(-48*time.Hour).UTC().Format(amzDateFormat))
+	if err := verify(r, testAuth); err != apperr.ErrAccessDenied {
+		t.Errorf("verify = %v, want AccessDenied", err)
+	}
+
+	r.Header.Set("x-amz-date", "not-a-date")
+	if err := verify(r, testAuth); err != apperr.ErrAccessDenied {
+		t.Errorf("verify with a malformed x-amz-date = %v, want AccessDenied", err)
 	}
 }

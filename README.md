@@ -163,8 +163,10 @@ Endpoints: `GET /auth/login` (provider buttons), `/auth/oidc/{id}/start`,
 JSON). Unauthenticated `/api` calls get `401`; unauthenticated page loads
 redirect to `/auth/login`.
 
-> **Note:** OIDC gates the bundled PWA and admin API only. If you expose the S3
-> gateway publicly, protect it with `[auth]` SigV4 or your own ingress.
+> **Note:** OIDC gates the bundled PWA and admin API only, so with OIDC on the
+> server **refuses to start** unless `[auth] enabled = true` with a secret other
+> than the sample `simplecas-secret` — an unauthenticated gateway would serve
+> every team's namespaces to anyone who can reach the port.
 
 ### Teams (multi-tenancy)
 
@@ -227,9 +229,10 @@ it addresses every namespace, owned or not. Treat it as a root key.
 > secret to check a signature, so a one-way hash cannot work. Treat that table
 > as equivalent to the objects it grants access to.
 
-Tenanted S3 access requires `[auth] enabled = true`. With auth off there are no
-credentials to tell apart, so the gateway is the open admin plane it has always
-been (`aws s3 --no-sign-request`).
+Tenanted S3 access requires `[auth] enabled = true`, and with OIDC on the server
+will not start without it. With auth off (and OIDC off) there are no credentials
+to tell apart, so the gateway is the open admin plane it has always been
+(`aws s3 --no-sign-request`).
 
 ## S3 gateway
 
@@ -251,11 +254,32 @@ behind your own ingress auth). Two kinds of credential verify here: the
 superuser key from `simplecas.toml`, and per-team keys that see only their own
 team's buckets — see [Per-team S3 credentials](#per-team-s3-credentials).
 
+A signed request is good for **15 minutes** either side of the server's clock
+(`RequestTimeTooSkewed` past that), and its credential scope must carry the same
+date as `x-amz-date` and the `s3` service, so a captured request cannot be
+replayed later. Keep server clocks synced.
+
 Request bodies framed as **`aws-chunked`** are decoded before hashing. The AWS
 SDKs use that framing whenever they cannot hash a payload up front — an
 unseekable stream, or a request carrying a trailing checksum — so a server that
 ignored it would store the chunk headers as part of the object. Chunk signatures
-themselves are not verified; the credential on the request line already is.
+themselves are not verified; the credential on the request line already is. The
+decoded body must match `x-amz-decoded-content-length` and end with the final
+zero-length chunk, so a cut-off upload is rejected rather than stored short.
+
+S3 subresources the gateway does not implement (`?tagging`, `?acl`, `?cors`,
+`?lifecycle`, …) are answered **`501 NotImplemented`** instead of falling through
+to the plain object or bucket operation.
+
+Objects are served with `X-Content-Type-Options: nosniff` and
+`Content-Security-Policy: sandbox` (PDF excepted), and with
+`Content-Disposition: attachment` unless they are a raster image, audio, video,
+PDF or plain text. Uploads share the PWA's origin and session cookie, so an
+uploaded HTML or SVG file must never render there as a page.
+
+Every response carries an `X-Amz-Request-Id`. Internal errors return a generic
+message plus that ID (`<RequestId>` in XML, `request_id` in JSON); the cause is
+logged server-side under the same ID.
 
 **Deliberately unsupported:** versioning, ACLs/bucket policies, presigned URLs,
 POST-policy uploads, virtual-host-style addressing. ETags are BLAKE3 digests,

@@ -337,5 +337,25 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("auth.secret_access_key is required when auth.enabled is true")
 		}
 	}
+
+	// Tenancy is only as strong as its weakest plane. OIDC scopes /ui and /api
+	// to the caller's team, but an unauthenticated gateway serves every team's
+	// buckets to anyone who can reach the port, and the sample admin secret is
+	// public in this repository. Either one makes the team boundary decorative,
+	// so a multi-tenant deployment refuses to start with them rather than warn.
+	if c.OIDC.Enabled {
+		if !c.Auth.Enabled {
+			return fmt.Errorf("auth.enabled must be true when oidc.enabled is true: " +
+				"an unauthenticated S3 gateway serves every team's namespaces to anyone")
+		}
+		if c.Auth.SecretAccessKey == SampleSecretAccessKey {
+			return fmt.Errorf("auth.secret_access_key is still the sample value from simplecas.toml; " +
+				"set a private secret before enabling oidc")
+		}
+	}
 	return nil
 }
+
+// SampleSecretAccessKey is the admin secret shipped in simplecas.toml. It is
+// fine for a local instance and refused for a multi-tenant one.
+const SampleSecretAccessKey = "simplecas-secret"

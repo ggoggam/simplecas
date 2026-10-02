@@ -10,10 +10,14 @@
 package server
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/ggoggam/simplecas/internal/apperr"
 )
 
 // Routes are the surfaces to mount. Gateway is the fallback: anything not
@@ -90,11 +94,25 @@ func (s *statusRecorder) Write(p []byte) (int, error) {
 // like flushing still reach it through this wrapper.
 func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
-// logRequests emits one line per request at debug level, and promotes server
-// errors to warnings so they surface at the default level.
+// newRequestID returns a random ID in the 16-hex-digit shape S3 uses.
+func newRequestID() string {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	return strings.ToUpper(hex.EncodeToString(b[:]))
+}
+
+// logRequests tags every response with a request ID, emits one line per
+// request at debug level, and promotes server errors to warnings so they
+// surface at the default level.
+//
+// The ID is set on the response before any handler runs, so the error writers
+// can echo it in the body and the handlers' own error logs can carry it: a
+// client reporting a 500 has the ID, and the ID finds the cause in the log.
 func logRequests(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		requestID := newRequestID()
+		w.Header().Set(apperr.RequestIDHeader, requestID)
 		rec := &statusRecorder{ResponseWriter: w}
 		next.ServeHTTP(rec, r)
 
@@ -113,6 +131,7 @@ func logRequests(log *slog.Logger, next http.Handler) http.Handler {
 			"status", status,
 			"bytes", rec.bytes,
 			"duration", time.Since(start),
+			"requestId", requestID,
 		)
 	})
 }

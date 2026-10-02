@@ -33,6 +33,8 @@ func TestCodesAndStatuses(t *testing.T) {
 		{"invalid argument", InvalidArgument("bad %s", "arg"), "InvalidArgument", http.StatusBadRequest},
 		{"invalid part", InvalidPart("part %d", 2), "InvalidPart", http.StatusBadRequest},
 		{"malformed xml", MalformedXML("eof"), "MalformedXML", http.StatusBadRequest},
+		{"not implemented", NotImplemented("?acl"), "NotImplemented", http.StatusNotImplemented},
+		{"request time skewed", ErrRequestTimeTooSkewed, "RequestTimeTooSkewed", http.StatusForbidden},
 		{"internal", From(errors.New("boom")), "InternalError", http.StatusInternalServerError},
 	}
 	for _, tc := range tests {
@@ -165,5 +167,43 @@ func TestInternalNilIsATrueNilInterface(t *testing.T) {
 	pass := func() (int, error) { return 7, Internal(nil) }
 	if _, err := pass(); err != nil {
 		t.Fatalf("success path reported an error: %#v", err)
+	}
+}
+
+// An internal error's cause (pgx text, storage paths) is for the log, never
+// the client; the client gets a fixed message and the request ID to quote.
+func TestWritersHideInternalCauses(t *testing.T) {
+	cause := errors.New(`pq: relation "blobs" does not exist at 10.0.3.7:5432`)
+
+	xmlW := httptest.NewRecorder()
+	xmlW.Header().Set(RequestIDHeader, "ABC123")
+	WriteXML(xmlW, Internalf("claim blob: %w", cause))
+	body := xmlW.Body.String()
+	if strings.Contains(body, "relation") || strings.Contains(body, "10.0.3.7") {
+		t.Errorf("XML body leaked the cause: %q", body)
+	}
+	if !strings.Contains(body, "<Message>"+internalMessage+"</Message>") {
+		t.Errorf("XML body lacks the generic message: %q", body)
+	}
+	if !strings.Contains(body, "<RequestId>ABC123</RequestId>") {
+		t.Errorf("XML body lacks the request ID: %q", body)
+	}
+
+	jsonW := httptest.NewRecorder()
+	jsonW.Header().Set(RequestIDHeader, "ABC123")
+	WriteJSON(jsonW, cause)
+	var got map[string]string
+	if err := json.Unmarshal(jsonW.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["message"] != internalMessage || got["request_id"] != "ABC123" {
+		t.Errorf("JSON body = %#v", got)
+	}
+
+	// Client errors keep their detail: it is the caller's own input.
+	clientW := httptest.NewRecorder()
+	WriteXML(clientW, InvalidArgument("bad part number"))
+	if !strings.Contains(clientW.Body.String(), "bad part number") {
+		t.Errorf("client error lost its message: %q", clientW.Body.String())
 	}
 }

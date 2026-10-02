@@ -226,6 +226,23 @@ func TestValidate(t *testing.T) {
 		}
 	})
 
+	t.Run("oidc with a private gateway credential", func(t *testing.T) {
+		c := base()
+		c.OIDC.Enabled = true
+		c.Auth = AuthConfig{Enabled: true, AccessKeyID: "admin", SecretAccessKey: "a-private-secret"}
+		if err := c.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("the sample secret is fine without oidc", func(t *testing.T) {
+		c := base()
+		c.Auth = AuthConfig{Enabled: true, AccessKeyID: "simplecas", SecretAccessKey: SampleSecretAccessKey}
+		if err := c.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
 	t.Run("non-fs backends get no root default", func(t *testing.T) {
 		c := base()
 		c.Storage.Backend = "s3"
@@ -250,6 +267,13 @@ func TestValidate(t *testing.T) {
 		{"gcs without a bucket", func(c *Config) { c.Storage.Backend = "gcs" }},
 		{"azblob without a container", func(c *Config) { c.Storage.Backend = "azblob" }},
 		{"zero gc interval", func(c *Config) { c.GC.IntervalSecs = 0 }},
+		{"oidc with an unauthenticated gateway", func(c *Config) {
+			c.OIDC.Enabled = true
+		}},
+		{"oidc with the sample admin secret", func(c *Config) {
+			c.OIDC.Enabled = true
+			c.Auth = AuthConfig{Enabled: true, AccessKeyID: "simplecas", SecretAccessKey: SampleSecretAccessKey}
+		}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

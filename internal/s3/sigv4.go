@@ -20,12 +20,23 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/ggoggam/simplecas/internal/apperr"
 	"github.com/ggoggam/simplecas/internal/config"
 )
 
 const sigV4Algorithm = "AWS4-HMAC-SHA256"
+
+// amzDateFormat is the ISO 8601 basic form x-amz-date carries.
+const amzDateFormat = "20060102T150405Z"
+
+// maxClockSkew is how far x-amz-date may sit from the server's clock, as on
+// AWS. Without a bound, a captured signed request verifies forever.
+const maxClockSkew = 15 * time.Minute
+
+// now is the clock the skew check reads; tests replace it.
+var now = time.Now
 
 // authHeader is the parsed Authorization header of a signed request.
 type authHeader struct {
@@ -222,10 +233,13 @@ func signedHeaderValue(r *http.Request, name string) (string, bool) {
 // verify checks the request signature against the configured credential.
 // It is called at the top of every S3 handler.
 //
-// The credential scope's region and service are taken from the request rather
-// than pinned to the server's configured region: the signature is computed over
-// whatever scope the client declared, so a mismatched scope simply fails to
-// verify. This matches how the gateway behaved before.
+// The request must be fresh: x-amz-date within maxClockSkew of the server's
+// clock, and the credential scope's date equal to it, so a captured request
+// stops verifying after the window and cannot be re-scoped to another day.
+// The scope's service must be s3. Its region is taken from the request rather
+// than pinned to the server's configured region: the signature covers whatever
+// region the client declared, a mismatch does nothing for replay, and pinning
+// it would reject clients signing for their own default region.
 func verify(r *http.Request, auth config.AuthConfig) error {
 	if !auth.Enabled {
 		return nil
@@ -244,8 +258,8 @@ func verify(r *http.Request, auth config.AuthConfig) error {
 	}
 
 	amzDate := r.Header.Get("x-amz-date")
-	if amzDate == "" {
-		return apperr.ErrAccessDenied
+	if err := checkFreshness(amzDate, parsed); err != nil {
+		return err
 	}
 	hashedPayload := r.Header.Get("x-amz-content-sha256")
 	if hashedPayload == "" {
@@ -273,6 +287,23 @@ func verify(r *http.Request, auth config.AuthConfig) error {
 
 	if !hmac.Equal([]byte(expected), []byte(parsed.signature)) {
 		return apperr.ErrSignatureDoesNotMatch
+	}
+	return nil
+}
+
+// checkFreshness validates x-amz-date against the clock and the credential
+// scope. See verify.
+func checkFreshness(amzDate string, parsed authHeader) error {
+	signedAt, err := time.Parse(amzDateFormat, amzDate)
+	if err != nil {
+		return apperr.ErrAccessDenied
+	}
+	if parsed.dateStamp != signedAt.Format("20060102") || parsed.service != "s3" {
+		return apperr.ErrAccessDenied
+	}
+	skew := now().Sub(signedAt)
+	if skew > maxClockSkew || skew < -maxClockSkew {
+		return apperr.ErrRequestTimeTooSkewed
 	}
 	return nil
 }

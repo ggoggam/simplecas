@@ -175,6 +175,8 @@ func TestChunkedReaderRejectsMalformedFraming(t *testing.T) {
 		{"chunk shorter than declared", "10\r\nabc"},
 		{"missing CRLF after data", "3\r\nabcXX\r\n0\r\n\r\n"},
 		{"absurd chunk size", "ffffffffffff\r\nabc\r\n"},
+		{"ends at a chunk boundary without the final chunk", "3\r\nabc\r\n"},
+		{"empty body", ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -221,6 +223,41 @@ func TestBodyReaderDecodesFramedBodies(t *testing.T) {
 	}
 	if string(got) != "abc" {
 		t.Errorf("body = %q, want abc", got)
+	}
+}
+
+// x-amz-decoded-content-length is the client's statement of the object size;
+// a framed body that decodes to anything else must not be stored.
+func TestBodyReaderEnforcesDecodedLength(t *testing.T) {
+	framed := "3\r\nabc\r\n0\r\n\r\n"
+	tests := []struct {
+		name     string
+		declared string
+		wantErr  bool
+	}{
+		{"matching length", "3", false},
+		{"body shorter than declared", "5", true},
+		{"body longer than declared", "2", true},
+		{"unparseable length", "three", true},
+		{"negative length", "-1", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPut, "/ns/key", strings.NewReader(framed))
+			r.Header.Set("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+			r.Header.Set("x-amz-decoded-content-length", tc.declared)
+
+			got, err := io.ReadAll(bodyReader(r))
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("declared %s for a 3-byte body was accepted", tc.declared)
+				}
+				return
+			}
+			if err != nil || string(got) != "abc" {
+				t.Errorf("body = %q, err = %v; want abc, nil", got, err)
+			}
+		})
 	}
 }
 
