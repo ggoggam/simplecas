@@ -60,7 +60,7 @@ func TestGuard(t *testing.T) {
 		reached, seen = false, nil
 		r := httptest.NewRequest(http.MethodGet, "/api/stats", nil)
 		r.AddCookie(issueSession(t, testSecret, Session{
-			Subject: "sub-1", Email: "dev@example.com", EmailVerified: true,
+			Issuer: "https://idp.test", Subject: "sub-1", Email: "dev@example.com", EmailVerified: true,
 			Provider: "google", Expires: time.Now().Add(time.Hour).Unix(),
 		}))
 		guarded.ServeHTTP(httptest.NewRecorder(), r)
@@ -68,7 +68,7 @@ func TestGuard(t *testing.T) {
 		if !reached {
 			t.Fatal("the guarded handler was not reached")
 		}
-		if seen == nil || seen.TenantEmail() != "dev@example.com" {
+		if seen == nil || seen.VerifiedEmail() != "dev@example.com" {
 			t.Errorf("session in context = %+v", seen)
 		}
 	})
@@ -125,7 +125,7 @@ func TestGuard(t *testing.T) {
 		reached = false
 		r := httptest.NewRequest(http.MethodGet, "/api/stats", nil)
 		r.AddCookie(issueSession(t, testSecret, Session{
-			Subject: "sub-1", Expires: time.Now().Add(-time.Hour).Unix(),
+			Issuer: "https://idp.test", Subject: "sub-1", Expires: time.Now().Add(-time.Hour).Unix(),
 		}))
 		w := httptest.NewRecorder()
 		guarded.ServeHTTP(w, r)
@@ -193,7 +193,7 @@ func TestLoginPageRedirectsWhenAlreadySignedIn(t *testing.T) {
 
 	r := httptest.NewRequest(http.MethodGet, "/auth/login?redirect=/ui/x", nil)
 	r.AddCookie(issueSession(t, testSecret, Session{
-		Subject: "s", Provider: "google", Expires: time.Now().Add(time.Hour).Unix(),
+		Issuer: "https://idp.test", Subject: "s", Provider: "google", Expires: time.Now().Add(time.Hour).Unix(),
 	}))
 	w := httptest.NewRecorder()
 	reg.Handler().ServeHTTP(w, r)
@@ -243,7 +243,7 @@ func TestHandleMe(t *testing.T) {
 	t.Run("signed in", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "/auth/me", nil)
 		r.AddCookie(issueSession(t, testSecret, Session{
-			Subject: "sub-1", Email: "dev@example.com", EmailVerified: true,
+			Issuer: "https://idp.test", Subject: "sub-1", Email: "dev@example.com", EmailVerified: true,
 			Name: "Dev", Provider: "google", Expires: time.Now().Add(time.Hour).Unix(),
 		}))
 		w := httptest.NewRecorder()
@@ -271,7 +271,7 @@ func TestHandleMe(t *testing.T) {
 	t.Run("absent claims serialise as null", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "/auth/me", nil)
 		r.AddCookie(issueSession(t, testSecret, Session{
-			Subject: "sub-1", Provider: "google", Expires: time.Now().Add(time.Hour).Unix(),
+			Issuer: "https://idp.test", Subject: "sub-1", Provider: "google", Expires: time.Now().Add(time.Hour).Unix(),
 		}))
 		w := httptest.NewRecorder()
 		reg.Handler().ServeHTTP(w, r)
@@ -583,20 +583,22 @@ func TestFullLoginFlow(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
 	r.AddCookie(session)
 	got := mustSession(t, r, reg.cfg)
-	if got.Subject != "sub-abc" || got.Provider != "fake" {
+	// Membership is keyed on (issuer, subject), so the issuer must be the
+	// one the ID token was verified against.
+	if got.Issuer != idp.server.URL || got.Subject != "sub-abc" || got.Provider != "fake" {
 		t.Errorf("session = %+v", got)
 	}
-	if got.TenantEmail() != "dev@example.com" {
-		t.Errorf("TenantEmail = %q, want dev@example.com", got.TenantEmail())
+	if got.VerifiedEmail() != "dev@example.com" {
+		t.Errorf("VerifiedEmail = %q, want dev@example.com", got.VerifiedEmail())
 	}
 	if got.Name != "Dev Eloper" {
 		t.Errorf("Name = %q", got.Name)
 	}
 }
 
-// An unverified email still signs in (with no allowlist) but grants no tenant
-// identity, so the caller can see nothing.
-func TestLoginWithUnverifiedEmailGrantsNoTenantAccess(t *testing.T) {
+// An unverified email still signs in (with no allowlist), but carries no
+// address to accept invitations with.
+func TestLoginWithUnverifiedEmailCarriesNoVerifiedAddress(t *testing.T) {
 	idp := newFakeIdP(t)
 	reg := flowRegistry(t, idp, &config.OidcConfig{})
 
@@ -615,8 +617,8 @@ func TestLoginWithUnverifiedEmailGrantsNoTenantAccess(t *testing.T) {
 		if c.Name == sessionCookie && c.MaxAge > 0 {
 			r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
 			r.AddCookie(c)
-			if email := CurrentSession(r, reg.cfg).TenantEmail(); email != "" {
-				t.Errorf("TenantEmail = %q, want empty for an unverified address", email)
+			if email := CurrentSession(r, reg.cfg).VerifiedEmail(); email != "" {
+				t.Errorf("VerifiedEmail = %q, want empty for an unverified address", email)
 			}
 			return
 		}
@@ -640,8 +642,8 @@ func TestLoginWithStringEmailVerified(t *testing.T) {
 		if c.Name == sessionCookie && c.MaxAge > 0 {
 			r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
 			r.AddCookie(c)
-			if email := CurrentSession(r, reg.cfg).TenantEmail(); email != "dev@example.com" {
-				t.Errorf("TenantEmail = %q, want the verified address", email)
+			if email := CurrentSession(r, reg.cfg).VerifiedEmail(); email != "dev@example.com" {
+				t.Errorf("VerifiedEmail = %q, want the verified address", email)
 			}
 			return
 		}

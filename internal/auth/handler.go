@@ -333,6 +333,7 @@ func (r *Registry) completeLogin(ctx context.Context, p *Provider, flow flowStat
 	}
 
 	return &Session{
+		Issuer:        idToken.Issuer,
 		Subject:       idToken.Subject,
 		Email:         claims.Email,
 		EmailVerified: bool(claims.EmailVerified),

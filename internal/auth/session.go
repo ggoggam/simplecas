@@ -5,11 +5,11 @@
 // Everything here is stateless, which is what lets any number of instances sit
 // behind a load balancer sharing only a session secret:
 //
-//   - Authentication has no users table. Any identity that authenticates at a
+//   - Authentication needs no database. Any identity that authenticates at a
 //     configured provider is admitted, optionally narrowed by an email
-//     allowlist. Authorization is a separate layer — the tenants and
-//     tenant_members tables scope each namespace to the team that owns it,
-//     keyed on the caller's verified email.
+//     allowlist. Authorization is a separate layer in the admin API: it maps
+//     the session's (issuer, subject) to a users row and scopes each namespace
+//     to the teams that user belongs to.
 //   - Sessions are HMAC-signed cookies carrying the identity and an expiry.
 //     There is no session table and no server-side revocation; logging out
 //     clears the cookie.
@@ -41,10 +41,14 @@ const (
 
 // Session is the identity carried in the session cookie.
 type Session struct {
+	// Issuer and Subject together are the identity: the subject is the
+	// provider's never-reassigned id for the account, and the issuer keeps two
+	// providers' subjects apart. Team membership is keyed on the pair.
+	Issuer  string `json:"iss"`
 	Subject string `json:"sub"`
 	Email   string `json:"email,omitempty"`
-	// EmailVerified records whether the provider asserted the address. Tenancy
-	// is keyed on email, so tenant access requires it.
+	// EmailVerified records whether the provider asserted the address. Only a
+	// verified address may accept an invitation addressed to it.
 	EmailVerified bool   `json:"email_verified,omitempty"`
 	Name          string `json:"name,omitempty"`
 	Provider      string `json:"provider"`
@@ -52,15 +56,22 @@ type Session struct {
 	Expires int64 `json:"exp"`
 }
 
-// TenantEmail is the caller's tenant identity: their verified address,
-// normalised. It is empty when the email is absent or unverified, in which case
-// the caller has no tenant access at all — an unverified address must never be
-// enough to join a team, since membership is granted by email.
-func (s *Session) TenantEmail() string {
+// VerifiedEmail is the caller's address, normalised, if their provider
+// verified it, and empty otherwise. Invitations are addressed by email, so this
+// is what decides which ones the caller may accept; an unverified address must
+// never be enough to join a team.
+func (s *Session) VerifiedEmail() string {
 	if s == nil || !s.EmailVerified {
 		return ""
 	}
-	return strings.ToLower(strings.TrimSpace(s.Email))
+	return NormalizeEmail(s.Email)
+}
+
+// NormalizeEmail is the one canonical form of an address, so an invitation
+// addressed to "Dev@Example.com " matches the login that presents
+// "dev@example.com".
+func NormalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
 }
 
 // flowState is the per-login state that must survive the round trip to the
@@ -159,6 +170,13 @@ func CurrentSession(r *http.Request, cfg *config.OidcConfig) *Session {
 		return nil
 	}
 	if s.Expires <= time.Now().Unix() {
+		return nil
+	}
+	// Without both halves of the identity there is nobody to authorize. This
+	// also turns away a cookie minted before sessions carried the issuer, and
+	// a flow-state token, which is signed with the same key, moved into the
+	// session cookie.
+	if s.Issuer == "" || s.Subject == "" {
 		return nil
 	}
 	return &s

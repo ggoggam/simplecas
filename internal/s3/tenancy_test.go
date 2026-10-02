@@ -93,9 +93,13 @@ func newTenantFixture(t *testing.T) *tenantFixture {
 	return f
 }
 
-func mustCreateTenant(t *testing.T, d *db.DB, name, owner string) int64 {
+func mustCreateTenant(t *testing.T, d *db.DB, name, ownerEmail string) int64 {
 	t.Helper()
-	id, err := d.CreateTenant(context.Background(), name, owner)
+	owner, err := d.ResolveUser(context.Background(), "https://issuer.test", ownerEmail, ownerEmail, "")
+	if err != nil {
+		t.Fatalf("resolve owner %s: %v", ownerEmail, err)
+	}
+	id, err := d.CreateTenant(context.Background(), name, owner.ID)
 	if err != nil {
 		t.Fatalf("create tenant %s: %v", name, err)
 	}

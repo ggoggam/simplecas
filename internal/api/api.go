@@ -20,6 +20,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -27,7 +28,6 @@ import (
 	"net/http"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -76,8 +76,16 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("POST /api/tenants", h.createTenant)
 	mux.HandleFunc("DELETE /api/tenants/{tenant}", h.deleteTenant)
 	mux.HandleFunc("GET /api/tenants/{tenant}/members", h.listMembers)
-	mux.HandleFunc("POST /api/tenants/{tenant}/members", h.addMember)
-	mux.HandleFunc("DELETE /api/tenants/{tenant}/members/{email}", h.removeMember)
+	mux.HandleFunc("PATCH /api/tenants/{tenant}/members/{user}", h.setMemberRole)
+	mux.HandleFunc("DELETE /api/tenants/{tenant}/members/{user}", h.removeMember)
+
+	mux.HandleFunc("GET /api/tenants/{tenant}/invitations", h.listInvitations)
+	mux.HandleFunc("POST /api/tenants/{tenant}/invitations", h.createInvitation)
+	mux.HandleFunc("DELETE /api/tenants/{tenant}/invitations/{email}", h.revokeInvitation)
+
+	mux.HandleFunc("GET /api/invitations", h.myInvitations)
+	mux.HandleFunc("POST /api/invitations/{tenant}/accept", h.acceptInvitation)
+	mux.HandleFunc("POST /api/invitations/{tenant}/decline", h.declineInvitation)
 
 	mux.HandleFunc("GET /api/tenants/{tenant}/credentials", h.listCredentials)
 	mux.HandleFunc("POST /api/tenants/{tenant}/credentials", h.createCredential)
@@ -93,7 +101,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("POST /api/namespaces/{namespace}/objects/{key...}", h.postObject)
 	mux.HandleFunc("DELETE /api/namespaces/{namespace}/objects/{key...}", h.deleteObject)
 
-	return mux
+	return h.identify(mux)
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +143,44 @@ func decodeJSON(r *http.Request, v any) error {
 // Authorization
 // ---------------------------------------------------------------------------
 
+// userContextKey carries the caller's users row down to the handlers.
+type userContextKey struct{}
+
+// identify maps the signed-in identity the guard attached to its users row,
+// creating the row on first sight, so every handler authorizes on a user id.
+// With no session (OIDC off) the request passes through untouched and is
+// served by the untenanted plane.
+func (h *Handler) identify(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		session := auth.FromContext(r.Context())
+		if session == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if session.Issuer == "" || session.Subject == "" {
+			h.writeError(w, r, apperr.Forbidden("the session carries no identity"))
+			return
+		}
+		user, err := h.db.ResolveUser(r.Context(),
+			session.Issuer, session.Subject, session.VerifiedEmail(), session.Name)
+		if err != nil {
+			h.writeError(w, r, err)
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userContextKey{}, user)))
+	})
+}
+
+// requireUser returns the signed-in caller, or a 403 on the untenanted plane,
+// where there is nobody for a team to belong to.
+func requireUser(r *http.Request) (db.User, error) {
+	user, ok := r.Context().Value(userContextKey{}).(db.User)
+	if !ok {
+		return db.User{}, apperr.Forbidden("sign-in is required")
+	}
+	return user, nil
+}
+
 // authorizeNamespace resolves a namespace, enforcing tenant membership when
 // there is a caller.
 //
@@ -143,50 +189,56 @@ func decodeJSON(r *http.Request, v any) error {
 // missing, unowned, or another tenant's — is NoSuchNamespace, so existence
 // never leaks across tenants.
 func (h *Handler) authorizeNamespace(r *http.Request, name string) (db.Namespace, error) {
-	session := auth.FromContext(r.Context())
-	if session == nil {
+	if auth.FromContext(r.Context()) == nil {
 		return h.db.GetNamespace(r.Context(), name)
 	}
-	email := session.TenantEmail()
-	if email == "" {
-		return db.Namespace{}, apperr.ErrNoSuchNamespace
-	}
-	return h.db.GetNamespaceForMember(r.Context(), name, email)
-}
-
-// requireTenantEmail returns the caller's verified email, or a 403 when tenancy
-// cannot apply — no signed-in identity, or an absent/unverified address.
-func requireTenantEmail(r *http.Request) (string, error) {
-	email := auth.FromContext(r.Context()).TenantEmail()
-	if email == "" {
-		return "", apperr.Forbidden("sign-in with a verified email is required")
-	}
-	return email, nil
-}
-
-// authorizeTenant resolves a tenant by name and checks the caller's role in it.
-// A non-member gets NoSuchTenant, hiding its existence; when needOwner is set,
-// a member who is not an owner gets a 403.
-func (h *Handler) authorizeTenant(r *http.Request, name string, needOwner bool) (int64, error) {
-	email, err := requireTenantEmail(r)
+	user, err := requireUser(r)
 	if err != nil {
-		return 0, err
+		return db.Namespace{}, err
+	}
+	return h.db.GetNamespaceForMember(r.Context(), name, user.ID)
+}
+
+// tenantAccess is what authorizeTenantAccess establishes: which tenant, who is
+// asking, and the role they hold in it.
+type tenantAccess struct {
+	id   int64
+	user db.User
+	role string
+}
+
+// authorizeTenantAccess resolves a tenant by name and the caller's role in it.
+// A non-member gets NoSuchTenant, hiding its existence.
+func (h *Handler) authorizeTenantAccess(r *http.Request, name string) (tenantAccess, error) {
+	user, err := requireUser(r)
+	if err != nil {
+		return tenantAccess{}, err
 	}
 	tenantID, err := h.db.TenantIDByName(r.Context(), name)
 	if err != nil {
-		return 0, err
+		return tenantAccess{}, err
 	}
-	role, ok, err := h.db.TenantRole(r.Context(), tenantID, email)
+	role, ok, err := h.db.TenantRole(r.Context(), tenantID, user.ID)
+	if err != nil {
+		return tenantAccess{}, err
+	}
+	if !ok {
+		return tenantAccess{}, apperr.ErrNoSuchTenant
+	}
+	return tenantAccess{id: tenantID, user: user, role: role}, nil
+}
+
+// authorizeTenant is authorizeTenantAccess for the common case: when needOwner
+// is set, a member who is not an owner gets a 403.
+func (h *Handler) authorizeTenant(r *http.Request, name string, needOwner bool) (int64, error) {
+	access, err := h.authorizeTenantAccess(r, name)
 	if err != nil {
 		return 0, err
 	}
-	if !ok {
-		return 0, apperr.ErrNoSuchTenant
-	}
-	if needOwner && role != "owner" {
+	if needOwner && access.role != "owner" {
 		return 0, apperr.Forbidden("owner role required")
 	}
-	return tenantID, nil
+	return access.id, nil
 }
 
 // validName is the shared naming rule for tenants and namespaces (the S3
@@ -227,15 +279,13 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 		stats db.Stats
 		err   error
 	)
-	if session := auth.FromContext(r.Context()); session != nil {
+	if auth.FromContext(r.Context()) != nil {
 		// A signed-in caller sees only their own teams' footprint.
-		ids := []int64{}
-		if email := session.TenantEmail(); email != "" {
-			ids, err = h.db.TenantIDsForEmail(r.Context(), email)
-			if err != nil {
-				h.writeError(w, r, err)
-				return
-			}
+		var ids []int64
+		ids, err = h.callerTenantIDs(r)
+		if err != nil {
+			h.writeError(w, r, err)
+			return
 		}
 		stats, err = h.db.StatsForTenants(r.Context(), ids)
 	} else {
@@ -268,13 +318,22 @@ type tenantJSON struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// callerTenantIDs returns the ids of the teams the signed-in caller belongs to.
+func (h *Handler) callerTenantIDs(r *http.Request) ([]int64, error) {
+	user, err := requireUser(r)
+	if err != nil {
+		return nil, err
+	}
+	return h.db.TenantIDsForUser(r.Context(), user.ID)
+}
+
 func (h *Handler) listTenants(w http.ResponseWriter, r *http.Request) {
-	email, err := requireTenantEmail(r)
+	user, err := requireUser(r)
 	if err != nil {
 		h.writeError(w, r, err)
 		return
 	}
-	tenants, err := h.db.ListTenantsForEmail(r.Context(), email)
+	tenants, err := h.db.ListTenantsForUser(r.Context(), user.ID)
 	if err != nil {
 		h.writeError(w, r, err)
 		return
@@ -288,7 +347,7 @@ func (h *Handler) listTenants(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) createTenant(w http.ResponseWriter, r *http.Request) {
-	email, err := requireTenantEmail(r)
+	user, err := requireUser(r)
 	if err != nil {
 		h.writeError(w, r, err)
 		return
@@ -304,7 +363,7 @@ func (h *Handler) createTenant(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, apperr.ErrInvalidTenantName)
 		return
 	}
-	if _, err := h.db.CreateTenant(r.Context(), req.Name, email); err != nil {
+	if _, err := h.db.CreateTenant(r.Context(), req.Name, user.ID); err != nil {
 		h.writeError(w, r, err)
 		return
 	}
@@ -318,85 +377,6 @@ func (h *Handler) deleteTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.db.DeleteTenant(r.Context(), tenantID); err != nil {
-		h.writeError(w, r, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-type memberJSON struct {
-	Email     string    `json:"email"`
-	Role      string    `json:"role"`
-	CreatedAt time.Time `json:"created_at"`
-}
-
-func (h *Handler) listMembers(w http.ResponseWriter, r *http.Request) {
-	tenantID, err := h.authorizeTenant(r, r.PathValue("tenant"), false)
-	if err != nil {
-		h.writeError(w, r, err)
-		return
-	}
-	members, err := h.db.ListMembers(r.Context(), tenantID)
-	if err != nil {
-		h.writeError(w, r, err)
-		return
-	}
-
-	out := make([]memberJSON, 0, len(members))
-	for _, m := range members {
-		out = append(out, memberJSON{Email: m.Email, Role: m.Role, CreatedAt: m.CreatedAt})
-	}
-	h.writeJSON(w, http.StatusOK, out)
-}
-
-func (h *Handler) addMember(w http.ResponseWriter, r *http.Request) {
-	tenantID, err := h.authorizeTenant(r, r.PathValue("tenant"), true)
-	if err != nil {
-		h.writeError(w, r, err)
-		return
-	}
-	var req struct {
-		Email string `json:"email"`
-		Role  string `json:"role"`
-	}
-	if err := decodeJSON(r, &req); err != nil {
-		h.writeError(w, r, err)
-		return
-	}
-
-	// Membership is keyed on the address, so normalise it the same way
-	// Session.TenantEmail does or an invitation will never match a login.
-	email := strings.ToLower(strings.TrimSpace(req.Email))
-	if email == "" || !strings.Contains(email, "@") {
-		h.writeError(w, r, apperr.InvalidArgument("a valid email is required"))
-		return
-	}
-
-	role := req.Role
-	switch role {
-	case "":
-		role = "member"
-	case "member", "owner":
-	default:
-		h.writeError(w, r, apperr.InvalidArgument("role must be 'owner' or 'member'"))
-		return
-	}
-
-	if err := h.db.AddMember(r.Context(), tenantID, email, role); err != nil {
-		h.writeError(w, r, err)
-		return
-	}
-	w.WriteHeader(http.StatusCreated)
-}
-
-func (h *Handler) removeMember(w http.ResponseWriter, r *http.Request) {
-	tenantID, err := h.authorizeTenant(r, r.PathValue("tenant"), true)
-	if err != nil {
-		h.writeError(w, r, err)
-		return
-	}
-	email := strings.ToLower(strings.TrimSpace(r.PathValue("email")))
-	if err := h.db.RemoveMember(r.Context(), tenantID, email); err != nil {
 		h.writeError(w, r, err)
 		return
 	}
@@ -434,13 +414,11 @@ func (h *Handler) listNamespaces(w http.ResponseWriter, r *http.Request) {
 
 	default:
 		// Every team the caller belongs to.
-		ids := []int64{}
-		if email := session.TenantEmail(); email != "" {
-			ids, err = h.db.TenantIDsForEmail(r.Context(), email)
-			if err != nil {
-				h.writeError(w, r, err)
-				return
-			}
+		var ids []int64
+		ids, err = h.callerTenantIDs(r)
+		if err != nil {
+			h.writeError(w, r, err)
+			return
 		}
 		namespaces, err = h.db.ListNamespacesForTenants(r.Context(), ids)
 	}

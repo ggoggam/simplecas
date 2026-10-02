@@ -25,6 +25,17 @@ func testDB(t *testing.T) *DB {
 	return d
 }
 
+// mustUser returns the id of a user signed in with email, creating it on first
+// use the way a login does.
+func mustUser(t *testing.T, d *DB, email string) int64 {
+	t.Helper()
+	u, err := d.ResolveUser(t.Context(), "https://issuer.test", "sub-"+email, email, "")
+	if err != nil {
+		t.Fatalf("resolve user %s: %v", email, err)
+	}
+	return u.ID
+}
+
 // mustNamespace creates a namespace and returns its id.
 func mustNamespace(t *testing.T, d *DB, name string, tenantID *int64) int64 {
 	t.Helper()
@@ -194,11 +205,11 @@ func TestListNamespaces(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
 
-	tenantA, err := d.CreateTenant(ctx, "team-a", "a@example.com")
+	tenantA, err := d.CreateTenant(ctx, "team-a", mustUser(t, d, "a@example.com"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	tenantB, err := d.CreateTenant(ctx, "team-b", "b@example.com")
+	tenantB, err := d.CreateTenant(ctx, "team-b", mustUser(t, d, "b@example.com"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,11 +261,11 @@ func TestGetNamespaceForMemberHidesEverythingElse(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
 
-	mine, err := d.CreateTenant(ctx, "mine", "me@example.com")
+	mine, err := d.CreateTenant(ctx, "mine", mustUser(t, d, "me@example.com"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	theirs, err := d.CreateTenant(ctx, "theirs", "them@example.com")
+	theirs, err := d.CreateTenant(ctx, "theirs", mustUser(t, d, "them@example.com"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,12 +273,12 @@ func TestGetNamespaceForMemberHidesEverythingElse(t *testing.T) {
 	mustNamespace(t, d, "hidden", &theirs)
 	mustNamespace(t, d, "unowned", nil)
 
-	if _, err := d.GetNamespaceForMember(ctx, "ours", "me@example.com"); err != nil {
+	if _, err := d.GetNamespaceForMember(ctx, "ours", mustUser(t, d, "me@example.com")); err != nil {
 		t.Errorf("a member should resolve their own namespace: %v", err)
 	}
 
 	for _, name := range []string{"hidden", "unowned", "does-not-exist"} {
-		if _, err := d.GetNamespaceForMember(ctx, name, "me@example.com"); !errors.Is(err, apperr.ErrNoSuchNamespace) {
+		if _, err := d.GetNamespaceForMember(ctx, name, mustUser(t, d, "me@example.com")); !errors.Is(err, apperr.ErrNoSuchNamespace) {
 			t.Errorf("%s resolved to %v, want ErrNoSuchNamespace", name, err)
 		}
 	}

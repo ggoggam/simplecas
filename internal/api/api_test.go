@@ -76,15 +76,21 @@ func newFixture(t *testing.T) *fixture {
 // guard would.
 func (f *fixture) signIn(email string) {
 	f.caller = &auth.Session{
-		Subject: "sub-" + email, Email: email, EmailVerified: true, Provider: "test",
+		Issuer: testIssuer, Subject: "sub-" + email, Email: email, EmailVerified: true, Provider: "test",
 	}
 }
 
 // signInUnverified establishes a caller whose address the provider did not
-// verify, which must grant no tenant access.
+// verify: a distinct account that can hold its own teams, but cannot accept an
+// invitation addressed to that address.
 func (f *fixture) signInUnverified(email string) {
-	f.caller = &auth.Session{Subject: "sub", Email: email, Provider: "test"}
+	f.caller = &auth.Session{
+		Issuer: testIssuer, Subject: "unverified-" + email, Email: email, Provider: "test",
+	}
 }
+
+// testIssuer is the issuer every fixture session claims.
+const testIssuer = "https://idp.test"
 
 func (f *fixture) do(t *testing.T, method, target, body string, headers ...string) *httptest.ResponseRecorder {
 	t.Helper()

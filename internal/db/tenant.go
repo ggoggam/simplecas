@@ -8,18 +8,20 @@ import (
 	"github.com/ggoggam/simplecas/internal/apperr"
 )
 
-// Membership is keyed by verified email rather than by a user id, because
-// invitations are issued by email — before the invitee has ever signed in.
+// Membership is keyed by user id, which is keyed by the identity provider's
+// (issuer, subject). An email address grants nothing by itself: it addresses an
+// invitation (see invitation.go), and a membership exists only once a
+// signed-in user accepts one.
 
-// ListTenantsForEmail returns the tenants email belongs to, each with the
+// ListTenantsForUser returns the tenants userID belongs to, each with the
 // caller's own role, in name order.
-func (d *DB) ListTenantsForEmail(ctx context.Context, email string) ([]TenantMembership, error) {
+func (d *DB) ListTenantsForUser(ctx context.Context, userID int64) ([]TenantMembership, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT t.name, m.role, t.created_at
 		FROM tenants t
 		JOIN tenant_members m ON m.tenant_id = t.id
-		WHERE m.email = $1
-		ORDER BY t.name`, email)
+		WHERE m.user_id = $1
+		ORDER BY t.name`, userID)
 	if err != nil {
 		return nil, apperr.Internal(err)
 	}
@@ -27,11 +29,11 @@ func (d *DB) ListTenantsForEmail(ctx context.Context, email string) ([]TenantMem
 	return out, apperr.Internal(err)
 }
 
-// TenantIDsForEmail returns the tenant ids email belongs to, for scoping
+// TenantIDsForUser returns the tenant ids userID belongs to, for scoping
 // listings and stats.
-func (d *DB) TenantIDsForEmail(ctx context.Context, email string) ([]int64, error) {
+func (d *DB) TenantIDsForUser(ctx context.Context, userID int64) ([]int64, error) {
 	rows, err := d.pool.Query(ctx,
-		"SELECT tenant_id FROM tenant_members WHERE email = $1", email)
+		"SELECT tenant_id FROM tenant_members WHERE user_id = $1", userID)
 	if err != nil {
 		return nil, apperr.Internal(err)
 	}
@@ -59,12 +61,12 @@ func (d *DB) TenantIDByName(ctx context.Context, name string) (int64, error) {
 	return id, nil
 }
 
-// TenantRole returns the caller's role in tenantID, or ok=false when they are
-// not a member.
-func (d *DB) TenantRole(ctx context.Context, tenantID int64, email string) (role string, ok bool, err error) {
+// TenantRole returns userID's role in tenantID, or ok=false when they are not a
+// member.
+func (d *DB) TenantRole(ctx context.Context, tenantID, userID int64) (role string, ok bool, err error) {
 	err = d.pool.QueryRow(ctx,
-		"SELECT role FROM tenant_members WHERE tenant_id = $1 AND email = $2",
-		tenantID, email).Scan(&role)
+		"SELECT role FROM tenant_members WHERE tenant_id = $1 AND user_id = $2",
+		tenantID, userID).Scan(&role)
 	if notFound(err) {
 		return "", false, nil
 	}
@@ -74,9 +76,9 @@ func (d *DB) TenantRole(ctx context.Context, tenantID int64, email string) (role
 	return role, true, nil
 }
 
-// CreateTenant creates a tenant with ownerEmail as its sole owner. Both rows go
-// in together, so a tenant never exists without an owner.
-func (d *DB) CreateTenant(ctx context.Context, name, ownerEmail string) (int64, error) {
+// CreateTenant creates a tenant with ownerID as its sole owner. Both rows go in
+// together, so a tenant never exists without an owner.
+func (d *DB) CreateTenant(ctx context.Context, name string, ownerID int64) (int64, error) {
 	var id int64
 	err := d.InTx(ctx, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx,
@@ -89,8 +91,8 @@ func (d *DB) CreateTenant(ctx context.Context, name, ownerEmail string) (int64, 
 			return apperr.Internal(err)
 		}
 		_, err = tx.Exec(ctx,
-			"INSERT INTO tenant_members (tenant_id, email, role) VALUES ($1, $2, 'owner')",
-			id, ownerEmail)
+			"INSERT INTO tenant_members (tenant_id, user_id, role) VALUES ($1, $2, 'owner')",
+			id, ownerID)
 		return apperr.Internal(err)
 	})
 	if err != nil {
@@ -99,11 +101,15 @@ func (d *DB) CreateTenant(ctx context.Context, name, ownerEmail string) (int64, 
 	return id, nil
 }
 
-// ListMembers returns a tenant's membership in email order.
+// ListMembers returns a tenant's membership, ordered by email and then by user
+// id so members with no address still list in a stable order.
 func (d *DB) ListMembers(ctx context.Context, tenantID int64) ([]Member, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT email, role, created_at FROM tenant_members
-		WHERE tenant_id = $1 ORDER BY email`, tenantID)
+		SELECT u.id, u.email, u.name, m.role, m.created_at
+		FROM tenant_members m
+		JOIN users u ON u.id = m.user_id
+		WHERE m.tenant_id = $1
+		ORDER BY u.email, u.id`, tenantID)
 	if err != nil {
 		return nil, apperr.Internal(err)
 	}
@@ -111,24 +117,86 @@ func (d *DB) ListMembers(ctx context.Context, tenantID int64) ([]Member, error) 
 	return out, apperr.Internal(err)
 }
 
-// AddMember invites a member, or re-roles one who is already there.
-func (d *DB) AddMember(ctx context.Context, tenantID int64, email, role string) error {
-	_, err := d.pool.Exec(ctx, `
-		INSERT INTO tenant_members (tenant_id, email, role) VALUES ($1, $2, $3)
-		ON CONFLICT (tenant_id, email) DO UPDATE SET role = $3`,
-		tenantID, email, role)
+// lockTenant serialises membership changes within one tenant.
+//
+// The last-owner checks below count owners and then write. Locking only the
+// member row being changed is not enough under READ COMMITTED: two owners
+// removing (or demoting) each other at once would each lock their own target,
+// each count two owners, and together leave none. Taking the tenant row first
+// makes the second change wait and then count what the first left behind.
+//
+// NO KEY UPDATE rather than UPDATE, so it does not also block the foreign-key
+// checks of unrelated inserts that reference the tenant.
+func lockTenant(ctx context.Context, tx pgx.Tx, tenantID int64) error {
+	var id int64
+	err := tx.QueryRow(ctx,
+		"SELECT id FROM tenants WHERE id = $1 FOR NO KEY UPDATE", tenantID).Scan(&id)
+	if notFound(err) {
+		return apperr.ErrNoSuchTenant
+	}
 	return apperr.Internal(err)
 }
 
-// RemoveMember removes a member, refusing to strip a tenant of its last owner —
-// which would leave it unmanageable. Removing someone who is not a member
-// succeeds, so the call is idempotent.
-func (d *DB) RemoveMember(ctx context.Context, tenantID int64, email string) error {
+// otherOwners counts tenantID's owners other than userID. Call it only with the
+// tenant locked.
+func otherOwners(ctx context.Context, tx pgx.Tx, tenantID, userID int64) (int64, error) {
+	var n int64
+	err := tx.QueryRow(ctx, `
+		SELECT COUNT(*) FROM tenant_members
+		WHERE tenant_id = $1 AND role = 'owner' AND user_id <> $2`,
+		tenantID, userID).Scan(&n)
+	return n, apperr.Internal(err)
+}
+
+// SetMemberRole changes an existing member's role, refusing to demote a
+// tenant's last owner — which would leave it unmanageable.
+func (d *DB) SetMemberRole(ctx context.Context, tenantID, userID int64, role string) error {
 	return d.InTx(ctx, func(tx pgx.Tx) error {
+		if err := lockTenant(ctx, tx, tenantID); err != nil {
+			return err
+		}
+		var current string
+		err := tx.QueryRow(ctx,
+			"SELECT role FROM tenant_members WHERE tenant_id = $1 AND user_id = $2",
+			tenantID, userID).Scan(&current)
+		if notFound(err) {
+			return apperr.ErrNoSuchMember
+		}
+		if err != nil {
+			return apperr.Internal(err)
+		}
+		if current == role {
+			return nil
+		}
+
+		if current == "owner" {
+			owners, err := otherOwners(ctx, tx, tenantID, userID)
+			if err != nil {
+				return err
+			}
+			if owners == 0 {
+				return apperr.InvalidArgument("cannot demote the last owner of a tenant")
+			}
+		}
+
+		_, err = tx.Exec(ctx,
+			"UPDATE tenant_members SET role = $3 WHERE tenant_id = $1 AND user_id = $2",
+			tenantID, userID, role)
+		return apperr.Internal(err)
+	})
+}
+
+// RemoveMember removes a member, refusing to strip a tenant of its last owner.
+// Removing someone who is not a member succeeds, so the call is idempotent.
+func (d *DB) RemoveMember(ctx context.Context, tenantID, userID int64) error {
+	return d.InTx(ctx, func(tx pgx.Tx) error {
+		if err := lockTenant(ctx, tx, tenantID); err != nil {
+			return err
+		}
 		var role string
 		err := tx.QueryRow(ctx,
-			"SELECT role FROM tenant_members WHERE tenant_id = $1 AND email = $2 FOR UPDATE",
-			tenantID, email).Scan(&role)
+			"SELECT role FROM tenant_members WHERE tenant_id = $1 AND user_id = $2",
+			tenantID, userID).Scan(&role)
 		if notFound(err) {
 			return nil
 		}
@@ -137,27 +205,25 @@ func (d *DB) RemoveMember(ctx context.Context, tenantID int64, email string) err
 		}
 
 		if role == "owner" {
-			var owners int64
-			err := tx.QueryRow(ctx,
-				"SELECT COUNT(*) FROM tenant_members WHERE tenant_id = $1 AND role = 'owner'",
-				tenantID).Scan(&owners)
+			owners, err := otherOwners(ctx, tx, tenantID, userID)
 			if err != nil {
-				return apperr.Internal(err)
+				return err
 			}
-			if owners <= 1 {
+			if owners == 0 {
 				return apperr.InvalidArgument("cannot remove the last owner of a tenant")
 			}
 		}
 
 		_, err = tx.Exec(ctx,
-			"DELETE FROM tenant_members WHERE tenant_id = $1 AND email = $2",
-			tenantID, email)
+			"DELETE FROM tenant_members WHERE tenant_id = $1 AND user_id = $2",
+			tenantID, userID)
 		return apperr.Internal(err)
 	})
 }
 
-// DeleteTenant deletes an empty tenant; its membership cascades. A tenant that
-// still owns namespaces is a conflict, mirroring non-empty namespace deletion.
+// DeleteTenant deletes an empty tenant; its membership, invitations and S3
+// credentials cascade. A tenant that still owns namespaces is a conflict,
+// mirroring non-empty namespace deletion.
 func (d *DB) DeleteTenant(ctx context.Context, tenantID int64) error {
 	return d.InTx(ctx, func(tx pgx.Tx) error {
 		var occupied bool

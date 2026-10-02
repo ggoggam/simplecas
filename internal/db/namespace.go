@@ -51,16 +51,16 @@ func (d *DB) GetNamespace(ctx context.Context, name string) (Namespace, error) {
 	return ns, apperr.Internal(err)
 }
 
-// GetNamespaceForMember resolves a namespace only if email is a member of its
+// GetNamespaceForMember resolves a namespace only if userID is a member of its
 // owning tenant. Every other case — missing namespace, unowned namespace, or a
 // caller who is not a member — resolves to NoSuchNamespace, so the tenant plane
 // never reveals that a namespace it cannot reach exists.
-func (d *DB) GetNamespaceForMember(ctx context.Context, name, email string) (Namespace, error) {
+func (d *DB) GetNamespaceForMember(ctx context.Context, name string, userID int64) (Namespace, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT n.id, n.name, n.created_at, n.tenant_id
 		FROM namespaces n
-		JOIN tenant_members m ON m.tenant_id = n.tenant_id AND m.email = $2
-		WHERE n.name = $1`, name, email)
+		JOIN tenant_members m ON m.tenant_id = n.tenant_id AND m.user_id = $2
+		WHERE n.name = $1`, name, userID)
 	if err != nil {
 		return Namespace{}, apperr.Internal(err)
 	}

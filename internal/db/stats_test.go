@@ -70,11 +70,11 @@ func TestStatsForTenants(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
 
-	one, err := d.CreateTenant(ctx, "one", "a@example.com")
+	one, err := d.CreateTenant(ctx, "one", mustUser(t, d, "a@example.com"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	two, err := d.CreateTenant(ctx, "two", "b@example.com")
+	two, err := d.CreateTenant(ctx, "two", mustUser(t, d, "b@example.com"))
 	if err != nil {
 		t.Fatal(err)
 	}

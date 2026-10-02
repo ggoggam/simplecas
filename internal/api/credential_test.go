@@ -71,9 +71,7 @@ func TestCredentialManagementIsOwnerOnly(t *testing.T) {
 	f := newFixture(t)
 	f.signIn("owner@example.com")
 	createTenant(t, f, "team-a")
-	mustStatus(t, f.do(t, http.MethodPost, "/api/tenants/team-a/members",
-		`{"email":"member@example.com","role":"member"}`,
-		"Content-Type", "application/json"), http.StatusCreated)
+	join(t, f, "team-a", "member@example.com", "member")
 	created := mintCredential(t, f, "team-a", "owned")
 	accessKeyID, _ := created["access_key_id"].(string)
 
@@ -147,14 +145,17 @@ func TestOwnerCannotRevokeAnotherTenantsCredential(t *testing.T) {
 	}
 }
 
-func TestCredentialEndpointsRequireAVerifiedEmail(t *testing.T) {
+func TestCredentialEndpointsRequireMembership(t *testing.T) {
 	f := newFixture(t)
+	f.signIn("owner@example.com")
+	createTenant(t, f, "team-a")
 
 	// No caller at all.
+	f.caller = nil
 	mustStatus(t, f.do(t, http.MethodGet, "/api/tenants/team-a/credentials", ""), http.StatusForbidden)
 
-	// Signed in but unverified: membership is keyed on the address, so an
-	// unverified one must not reach a tenant's keys.
-	f.signInUnverified("dev@example.com")
-	mustStatus(t, f.do(t, http.MethodGet, "/api/tenants/team-a/credentials", ""), http.StatusForbidden)
+	// Signed in with the owner's address, but unverified, which makes it a
+	// different account: membership is keyed on the account, not the address.
+	f.signInUnverified("owner@example.com")
+	mustStatus(t, f.do(t, http.MethodGet, "/api/tenants/team-a/credentials", ""), http.StatusNotFound)
 }

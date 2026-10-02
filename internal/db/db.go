@@ -131,11 +131,33 @@ type TenantMembership struct {
 	CreatedAt time.Time
 }
 
+// User is a signed-in identity, keyed by its provider's (issuer, subject).
+type User struct {
+	ID    int64
+	Email string
+	Name  string
+}
+
 // Member is one row of a tenant's membership list.
 type Member struct {
+	UserID    int64
 	Email     string
+	Name      string
 	Role      string
 	CreatedAt time.Time
+}
+
+// Invitation is a pending offer of membership in a tenant, addressed to an
+// email. InvitedBy is the inviter's address (empty when they had none, or their
+// user is gone). ExpiresAt is nil only for memberships carried over from before
+// invitations existed.
+type Invitation struct {
+	Tenant    string
+	Email     string
+	Role      string
+	InvitedBy string
+	CreatedAt time.Time
+	ExpiresAt *time.Time
 }
 
 // Stats is the dedup accounting the admin API reports. The JSON names are part
