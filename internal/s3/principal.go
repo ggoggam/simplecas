@@ -41,19 +41,20 @@ func principalFrom(ctx context.Context) (principal, bool) {
 // authenticate verifies the request signature and resolves the tenant scope its
 // credential grants. Signature checking and scope resolution are deliberately
 // one call: a caller cannot obtain one without the other, so no handler can end
-// up authenticated but unscoped.
-func (g *Gateway) authenticate(r *http.Request) (principal, error) {
+// up authenticated but unscoped. The signing context comes back too, for the
+// body's chunk signatures (see verify).
+func (g *Gateway) authenticate(r *http.Request) (principal, *chunkSigner, error) {
 	// With auth disabled there are no credentials to distinguish, so the
 	// gateway is the open admin plane it has always been — which is what lets
 	// `aws s3 --no-sign-request` work against a dev instance. Tenanted S3
 	// access requires auth.enabled.
 	if !g.cfg.Auth.Enabled {
-		return principal{}, nil
+		return principal{}, nil, nil
 	}
 
 	parsed, ok := parseAuthHeader(r.Header.Get("Authorization"))
 	if !ok {
-		return principal{}, apperr.ErrAccessDenied
+		return principal{}, nil, apperr.ErrAccessDenied
 	}
 
 	// The configured admin credential is matched first, so a row in
@@ -63,34 +64,35 @@ func (g *Gateway) authenticate(r *http.Request) (principal, error) {
 	// would otherwise match a request whose credential scope parsed empty.
 	adminKey := g.cfg.Auth.AccessKeyID
 	if adminKey != "" && hmac.Equal([]byte(parsed.accessKeyID), []byte(adminKey)) {
-		if err := verify(r, g.cfg.Auth); err != nil {
-			return principal{}, err
+		signer, err := verify(r, g.cfg.Auth)
+		if err != nil {
+			return principal{}, nil, err
 		}
-		return principal{}, nil
+		return principal{}, signer, nil
 	}
 
 	cred, found, err := g.db.LookupS3Credential(r.Context(), parsed.accessKeyID)
 	if err != nil {
-		return principal{}, err
+		return principal{}, nil, err
 	}
 	if !found {
 		// An unknown key is reported the same way a bad signature is, so the
 		// gateway is not an oracle for which access key ids exist.
-		return principal{}, apperr.ErrAccessDenied
+		return principal{}, nil, apperr.ErrAccessDenied
 	}
 
 	// Reuse the single-credential path rather than reimplementing the
 	// canonicalisation, so the tenanted and admin credentials cannot drift in
 	// what they accept.
-	err = verify(r, config.AuthConfig{
+	signer, err := verify(r, config.AuthConfig{
 		Enabled:         true,
 		AccessKeyID:     cred.AccessKeyID,
 		SecretAccessKey: cred.SecretAccessKey,
 	})
 	if err != nil {
-		return principal{}, err
+		return principal{}, nil, err
 	}
-	return principal{tenantID: &cred.TenantID}, nil
+	return principal{tenantID: &cred.TenantID}, signer, nil
 }
 
 // namespace resolves a namespace name within the caller's scope. Every handler

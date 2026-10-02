@@ -2,9 +2,10 @@
 //
 // Header-signed requests only (`Authorization: AWS4-HMAC-SHA256 …`).
 // Presigned-URL query auth and POST-policy uploads are rejected outright
-// rather than half-supported. The payload hash is taken from
-// x-amz-content-sha256 exactly as sent (streaming uploads send
-// UNSIGNED-PAYLOAD), so nothing has to buffer a request body.
+// rather than half-supported. The signature covers x-amz-content-sha256 as
+// sent, which is only a claim about the body: the body itself is checked
+// against it while it streams into staging (see payload.go), so nothing has to
+// buffer a request body and a body swapped under valid headers is refused.
 //
 // When auth.enabled is false the check is skipped entirely, which is what lets
 // `aws s3 --no-sign-request` and the bundled PWA work against a dev instance.
@@ -230,9 +231,60 @@ func signedHeaderValue(r *http.Request, name string) (string, bool) {
 	return strings.Join(values, ","), true
 }
 
+// chunkSigner holds what the signatures of a STREAMING-AWS4-HMAC-SHA256 body
+// chain from. Each chunk is signed over its own hash and the signature before
+// it, starting from the request's own (the seed), so a chunk cannot be altered,
+// dropped, reordered or appended without breaking every signature after it.
+type chunkSigner struct {
+	key     []byte
+	amzDate string
+	scope   string
+	prev    string
+}
+
+// emptySHA256 is the hash of no bytes, which stands in for the (absent)
+// headers of each chunk in its string-to-sign.
+const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+// chunkSignature is the signature the next chunk must carry, given the SHA-256
+// of its data.
+func (s *chunkSigner) chunkSignature(dataHash []byte) string {
+	return s.sign(strings.Join([]string{
+		"AWS4-HMAC-SHA256-PAYLOAD", s.amzDate, s.scope, s.prev,
+		emptySHA256, hex.EncodeToString(dataHash),
+	}, "\n"))
+}
+
+// trailerSignature is the signature the trailing headers must carry, given the
+// SHA-256 of their canonical form. It chains from the final chunk's.
+func (s *chunkSigner) trailerSignature(trailerHash []byte) string {
+	return s.sign(strings.Join([]string{
+		"AWS4-HMAC-SHA256-TRAILER", s.amzDate, s.scope, s.prev,
+		hex.EncodeToString(trailerHash),
+	}, "\n"))
+}
+
+func (s *chunkSigner) sign(stringToSign string) string {
+	return hex.EncodeToString(hmacSHA256(s.key, []byte(stringToSign)))
+}
+
+// accept compares a received signature with the expected one and, on a match,
+// makes it the link the next signature chains from.
+func (s *chunkSigner) accept(expected, got string) bool {
+	if !hmac.Equal([]byte(expected), []byte(got)) {
+		return false
+	}
+	s.prev = expected
+	return true
+}
+
 // verify checks the request signature against the configured credential.
-// It is called at the top of every S3 handler.
+// It is called at the top of every S3 handler, and returns the signing context
+// a streaming-signed body's chunks are then checked against (nil when auth is
+// disabled, as there is no secret to check them with).
 //
+// x-amz-content-sha256 is required, as on S3: it is the payload hash the
+// signature covers, and without it there is nothing to hold the body to.
 // The request must be fresh: x-amz-date within maxClockSkew of the server's
 // clock, and the credential scope's date equal to it, so a captured request
 // stops verifying after the window and cannot be re-scoped to another day.
@@ -240,35 +292,35 @@ func signedHeaderValue(r *http.Request, name string) (string, bool) {
 // than pinned to the server's configured region: the signature covers whatever
 // region the client declared, a mismatch does nothing for replay, and pinning
 // it would reject clients signing for their own default region.
-func verify(r *http.Request, auth config.AuthConfig) error {
+func verify(r *http.Request, auth config.AuthConfig) (*chunkSigner, error) {
 	if !auth.Enabled {
-		return nil
+		return nil, nil
 	}
 
 	value := r.Header.Get("Authorization")
 	if !strings.HasPrefix(value, sigV4Algorithm) {
-		return apperr.ErrAccessDenied
+		return nil, apperr.ErrAccessDenied
 	}
 	parsed, ok := parseAuthHeader(value)
 	if !ok {
-		return apperr.ErrAccessDenied
+		return nil, apperr.ErrAccessDenied
 	}
 	if !hmac.Equal([]byte(parsed.accessKeyID), []byte(auth.AccessKeyID)) {
-		return apperr.ErrAccessDenied
+		return nil, apperr.ErrAccessDenied
 	}
 
 	amzDate := r.Header.Get("x-amz-date")
 	if err := checkFreshness(amzDate, parsed); err != nil {
-		return err
+		return nil, err
 	}
 	hashedPayload := r.Header.Get("x-amz-content-sha256")
 	if hashedPayload == "" {
-		hashedPayload = "UNSIGNED-PAYLOAD"
+		return nil, apperr.InvalidRequest("missing required header for this request: x-amz-content-sha256")
 	}
 
 	canonicalHeaders, ok := buildCanonicalHeaders(r, parsed.signedHeaders)
 	if !ok {
-		return apperr.ErrSignatureDoesNotMatch
+		return nil, apperr.ErrSignatureDoesNotMatch
 	}
 
 	expected := computeSignature(signatureInput{
@@ -286,9 +338,14 @@ func verify(r *http.Request, auth config.AuthConfig) error {
 	})
 
 	if !hmac.Equal([]byte(expected), []byte(parsed.signature)) {
-		return apperr.ErrSignatureDoesNotMatch
+		return nil, apperr.ErrSignatureDoesNotMatch
 	}
-	return nil
+	return &chunkSigner{
+		key:     signingKey(auth.SecretAccessKey, parsed.dateStamp, parsed.region, parsed.service),
+		amzDate: amzDate,
+		scope:   strings.Join([]string{parsed.dateStamp, parsed.region, parsed.service, "aws4_request"}, "/"),
+		prev:    expected,
+	}, nil
 }
 
 // checkFreshness validates x-amz-date against the clock and the credential

@@ -38,6 +38,10 @@ func TestCodesAndStatuses(t *testing.T) {
 		{"entity too large", EntityTooLarge("%d bytes", 9), "EntityTooLarge", http.StatusBadRequest},
 		{"quota exceeded", QuotaExceeded("full"), "QuotaExceeded", http.StatusForbidden},
 		{"request timeout", ErrRequestTimeout, "RequestTimeout", http.StatusBadRequest},
+		{"invalid request", InvalidRequest("missing header"), "InvalidRequest", http.StatusBadRequest},
+		{"bad digest", BadDigest("crc32 mismatch"), "BadDigest", http.StatusBadRequest},
+		{"invalid digest", InvalidDigest("not base64"), "InvalidDigest", http.StatusBadRequest},
+		{"payload hash mismatch", ErrContentSHA256Mismatch, "XAmzContentSHA256Mismatch", http.StatusBadRequest},
 		{"internal", From(errors.New("boom")), "InternalError", http.StatusInternalServerError},
 	}
 	for _, tc := range tests {
