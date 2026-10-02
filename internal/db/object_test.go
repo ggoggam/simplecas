@@ -26,8 +26,8 @@ func TestEscapeLike(t *testing.T) {
 	}
 }
 
-// ClaimBlob reports whether it created the row, which is what tells the write
-// path it must upload bytes before committing.
+// ClaimBlob reports whether the bytes need writing, which is what tells the
+// write path it must upload them before committing.
 func TestClaimBlobRefcounting(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
@@ -59,10 +59,41 @@ func TestClaimBlobRefcounting(t *testing.T) {
 		t.Fatal(err)
 	}
 	if isNew {
-		t.Error("a repeat claim must not report the blob as new — the bytes are already stored")
+		t.Error("a repeat claim must not ask for the bytes — a live reference vouches for them")
 	}
 	if n, _ := refcount(t, d, hash); n != 2 {
 		t.Errorf("refcount = %d, want 2", n)
+	}
+}
+
+// A row revived from refcount 0 may be one whose bytes GC deleted before
+// failing to commit the row's removal, so the claim has to ask for the bytes
+// again rather than trust them.
+func TestClaimBlobRevivalNeedsBytes(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	nsID := mustNamespace(t, d, "ns", nil)
+	hash := hashOf("revived")
+
+	putObject(t, d, nsID, "k", hash, 10)
+	if _, err := d.DeleteObject(ctx, nsID, "k"); err != nil {
+		t.Fatal(err)
+	}
+
+	var needsBytes bool
+	err := d.InTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		needsBytes, err = ClaimBlob(ctx, tx, hash, 10)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !needsBytes {
+		t.Error("reviving a zero-ref blob must ask for its bytes to be rewritten")
+	}
+	if n, _ := refcount(t, d, hash); n != 1 {
+		t.Errorf("refcount = %d, want 1", n)
 	}
 }
 
@@ -138,6 +169,30 @@ func TestClaimExistingBlob(t *testing.T) {
 	}
 	if n, _ := refcount(t, d, hash); n != 2 {
 		t.Errorf("refcount = %d, want 2", n)
+	}
+
+	// Zero-ref blob: its bytes may already be gone, and the link path has
+	// nothing to restore them from, so it must decline.
+	err = d.InTx(ctx, func(tx pgx.Tx) error {
+		for range 2 {
+			if err := ReleaseBlob(ctx, tx, hash); err != nil {
+				return err
+			}
+		}
+		_, ok, err := ClaimExistingBlob(ctx, tx, hash)
+		if err != nil {
+			return err
+		}
+		if ok {
+			t.Error("claiming a zero-ref blob should report ok=false")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := refcount(t, d, hash); n != 0 {
+		t.Errorf("refcount = %d, want 0 — the declined claim must not count", n)
 	}
 }
 

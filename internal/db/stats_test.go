@@ -225,16 +225,10 @@ func TestGCSweepSkipsRelinkedBlobs(t *testing.T) {
 	}
 	stale(t, d, hash, 7200)
 
-	// The dedup link path claims it back before GC runs.
+	// A re-upload of the same content claims it back before GC runs.
 	err := d.InTx(ctx, func(tx pgx.Tx) error {
-		_, ok, err := ClaimExistingBlob(ctx, tx, hash)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			t.Fatal("expected the blob to still be claimable")
-		}
-		return nil
+		_, err := ClaimBlob(ctx, tx, hash, 10)
+		return err
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -310,5 +304,115 @@ func TestGCSweepRespectsTheLimit(t *testing.T) {
 	}
 	if n != 2 {
 		t.Errorf("second pass swept %d, want the remaining 2", n)
+	}
+}
+
+// sweepAll runs a pass with no grace period, recording whose bytes it deleted.
+func sweepAll(t *testing.T, d *DB, deleteBytes func(hash string) error) (int64, []string, error) {
+	t.Helper()
+	var deleted []string
+	n, err := d.GCSweep(t.Context(), 0, 100, func(_ context.Context, hash string) error {
+		deleted = append(deleted, hash)
+		return deleteBytes(hash)
+	})
+	return n, deleted, err
+}
+
+// The refcount is a cache of how many objects point at a blob. If it drifts low,
+// the sweep must believe the objects table: deleting the bytes would lose live
+// data, and the row delete would only fail on the foreign key afterwards. The
+// drifted blob must not stall the pass either — a genuinely unreferenced blob
+// in the same pass is still reclaimed.
+func TestGCSweepIgnoresADriftedRefcount(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	nsID := mustNamespace(t, d, "ns", nil)
+
+	drifted := hashOf("drifted")
+	garbage := hashOf("garbage")
+	putObject(t, d, nsID, "live", drifted, 10)
+	putObject(t, d, nsID, "gone", garbage, 10)
+	if _, err := d.DeleteObject(ctx, nsID, "gone"); err != nil {
+		t.Fatal(err)
+	}
+	// The drift: "live" still points at the blob, but its count says nobody does.
+	if _, err := d.pool.Exec(ctx, "UPDATE blobs SET refcount = 0 WHERE hash = $1", drifted); err != nil {
+		t.Fatal(err)
+	}
+	// Make the drifted blob the oldest candidate, so a sweep that picked it
+	// would hit it first.
+	stale(t, d, drifted, 7200)
+	stale(t, d, garbage, 3600)
+
+	n, deleted, err := sweepAll(t, d, func(string) error { return nil })
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("swept %d blobs, want 1", n)
+	}
+	if len(deleted) != 1 || deleted[0] != garbage {
+		t.Errorf("deleted bytes for %v, want only [%s]", deleted, garbage)
+	}
+	if _, ok := refcount(t, d, drifted); !ok {
+		t.Error("a blob an object still references must survive, whatever its refcount says")
+	}
+	if _, ok := refcount(t, d, garbage); ok {
+		t.Error("the unreferenced blob should have been collected in the same pass")
+	}
+}
+
+// One blob that cannot be deleted must not stall the pass: it is skipped for
+// the rest of the pass and kept for the next, and the others are still swept.
+func TestGCSweepCarriesOnPastAFailingBlob(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	nsID := mustNamespace(t, d, "ns", nil)
+
+	bad := hashOf("bad")
+	good := []string{hashOf("good1"), hashOf("good2")}
+	for i, h := range append([]string{bad}, good...) {
+		putObject(t, d, nsID, h, h, 10)
+		if _, err := d.DeleteObject(ctx, nsID, h); err != nil {
+			t.Fatal(err)
+		}
+		// The bad blob is the oldest, so it is the first candidate taken.
+		stale(t, d, h, 7200-i)
+	}
+
+	boom := errors.New("backend refused")
+	var badAttempts int
+	n, deleted, err := sweepAll(t, d, func(hash string) error {
+		if hash == bad {
+			badAttempts++
+			return boom
+		}
+		return nil
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the per-blob failure reported", err)
+	}
+	if n != 2 {
+		t.Errorf("swept %d blobs, want the 2 that could be deleted", n)
+	}
+	if badAttempts != 1 {
+		t.Errorf("the failing blob was attempted %d times in one pass, want 1", badAttempts)
+	}
+	if len(deleted) != 3 {
+		t.Errorf("deleteBytes ran for %v, want each blob once", deleted)
+	}
+	if _, ok := refcount(t, d, bad); !ok {
+		t.Error("the failing blob's row must survive so it is retried next pass")
+	}
+	for _, h := range good {
+		if _, ok := refcount(t, d, h); ok {
+			t.Errorf("blob %s should have been collected despite the earlier failure", h)
+		}
+	}
+
+	// Next pass the backend recovers and the straggler goes too.
+	n, _, err = sweepAll(t, d, func(string) error { return nil })
+	if err != nil || n != 1 {
+		t.Errorf("retry pass swept %d (err %v), want 1", n, err)
 	}
 }

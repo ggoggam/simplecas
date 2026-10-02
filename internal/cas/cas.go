@@ -6,8 +6,9 @@
 //
 //  1. Stream the body to staging/<uuid> while feeding a blake3 hasher.
 //  2. In one Postgres transaction, claim a blob reference (which row-locks the
-//     blob: refcount++ or insert at 1). If the row is new, copy staging into
-//     blobs/… *before* the commit, so a committed row always has bytes behind it.
+//     blob: refcount++ or insert at 1). If no other reference existed — a new
+//     row, or one revived from refcount 0 — copy staging into blobs/… *before*
+//     the commit, so a committed reference always has bytes behind it.
 //  3. Point the object row at the blob, releasing any blob it overwrote, and commit.
 //  4. Delete the staging file. Best-effort — stale staging is swept later.
 //
@@ -113,13 +114,15 @@ func (s *Store) Stage(ctx context.Context, r io.Reader) (StagedBlob, error) {
 // which is the object's ETag.
 func (s *Store) Commit(ctx context.Context, namespaceID int64, key, contentType string, staged StagedBlob) (string, error) {
 	err := s.db.InTx(ctx, func(tx pgx.Tx) error {
-		isNew, err := db.ClaimBlob(ctx, tx, staged.Hash, staged.Size)
+		needsBytes, err := db.ClaimBlob(ctx, tx, staged.Hash, staged.Size)
 		if err != nil {
 			return err
 		}
-		if isNew {
+		if needsBytes {
 			// The bytes have to land before the commit: a committed blob row
-			// with no bytes behind it would be handed out to readers.
+			// with no bytes behind it would be handed out to readers. That
+			// holds for a row revived from refcount 0 too, whose bytes GC may
+			// already have deleted — rewriting them is idempotent.
 			if err := s.blob.Copy(ctx, storage.BlobPath(staged.Hash), staged.StagingKey, nil); err != nil {
 				return apperr.Internalf("promote staged blob: %w", err)
 			}
@@ -140,15 +143,24 @@ func (s *Store) Commit(ctx context.Context, namespaceID int64, key, contentType 
 // the destination simply claims another reference to the source blob.
 func (s *Store) CopyObject(ctx context.Context, src db.ObjectMeta, dstNamespaceID int64, dstKey string) (string, error) {
 	err := s.db.InTx(ctx, func(tx pgx.Tx) error {
-		isNew, err := db.ClaimBlob(ctx, tx, src.BlobHash, src.Size)
+		needsBytes, err := db.ClaimBlob(ctx, tx, src.BlobHash, src.Size)
 		if err != nil {
 			return err
 		}
-		if isNew {
-			// The blob row vanished between reading the source object and
-			// claiming it — GC won the race after the source was deleted.
-			// Without bytes there is nothing to copy.
-			return apperr.ErrNoSuchKey
+		if needsBytes {
+			// Nothing else held a reference: the source was deleted after it
+			// was read, and the blob row is either brand new (GC already took
+			// it) or revived from zero (GC may have taken its bytes and
+			// crashed before the row). There is no staged copy to restore
+			// from, so the copy goes ahead only if the bytes are really there.
+			// The claim's row lock keeps GC off them until the commit.
+			present, err := s.blob.Exists(ctx, storage.BlobPath(src.BlobHash))
+			if err != nil {
+				return apperr.Internalf("check source blob: %w", err)
+			}
+			if !present {
+				return apperr.ErrNoSuchKey
+			}
 		}
 		return db.UpsertObject(ctx, tx, dstNamespaceID, dstKey, src.BlobHash, src.Size, src.ContentType)
 	})
