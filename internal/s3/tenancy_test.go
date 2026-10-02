@@ -2,6 +2,7 @@ package s3
 
 import (
 	"context"
+	"encoding/xml"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -344,6 +345,25 @@ func TestCrossTenantCopyIsRefused(t *testing.T) {
 	if pushed.Code != http.StatusNotFound {
 		t.Fatalf("push into another tenant = %d, want 404", pushed.Code)
 	}
+}
+
+// UploadPartCopy resolves its source in the caller's scope, like CopyObject.
+func TestCrossTenantUploadPartCopyIsRefused(t *testing.T) {
+	f := newTenantFixture(t)
+	if w := f.asB(t, http.MethodPut, "/ns-b/secret.txt", "abc"); w.Code != http.StatusOK {
+		t.Fatalf("setup write failed: %d", w.Code)
+	}
+	w := f.asA(t, http.MethodPost, "/ns-a/stolen.txt?uploads", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("initiate: %d", w.Code)
+	}
+	var initiated initiateMultipartUploadResult
+	if err := xml.Unmarshal(w.Body.Bytes(), &initiated); err != nil {
+		t.Fatal(err)
+	}
+	stolen := f.asA(t, http.MethodPut, "/ns-a/stolen.txt?partNumber=1&uploadId="+initiated.UploadID, "",
+		"x-amz-copy-source", "/ns-b/secret.txt")
+	mustCode(t, stolen, http.StatusNotFound, "NoSuchBucket")
 }
 
 func TestSameTenantCopyStillWorks(t *testing.T) {

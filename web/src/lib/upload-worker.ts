@@ -5,6 +5,8 @@
 
 import { createBLAKE3 } from "hash-wasm";
 import {
+  HttpError,
+  isRetryable,
   MAX_PARTS,
   MULTIPART_THRESHOLD,
   PART_CONCURRENCY,
@@ -52,7 +54,7 @@ async function okJson<T>(p: Promise<{ status: number; text: string }>): Promise<
     } catch {
       // keep the status-based message
     }
-    throw new Error(msg);
+    throw new HttpError(status, msg);
   }
   return text ? (JSON.parse(text) as T) : ({} as T);
 }
@@ -81,6 +83,7 @@ async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
     try {
       return await fn();
     } catch (e) {
+      if (!isRetryable(e)) throw e;
       lastErr = e;
       await new Promise((r) => setTimeout(r, 250 * 2 ** attempt));
     }
