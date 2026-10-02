@@ -56,7 +56,7 @@ var implementedSubresources = map[level]map[string][]string{
 	},
 	levelObject: {
 		http.MethodPut:    {"partNumber", "uploadId"},
-		http.MethodGet:    {"uploadId", "versionId"},
+		http.MethodGet:    {"uploadId", "versionId", "tagging"},
 		http.MethodHead:   {"versionId"},
 		http.MethodPost:   {"uploads", "uploadId"},
 		http.MethodDelete: {"uploadId", "versionId"},

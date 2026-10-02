@@ -277,7 +277,11 @@ JSON API and PWA call the same thing a namespace. Supported:
   delimiter, pagination, `DeleteObjects` (batch)
 - Object: `PutObject`, `GetObject` (incl. **range** requests), `HeadObject`,
   `DeleteObject`, `CopyObject` (metadata-only — no bytes moved)
-- Multipart: initiate, upload part, list parts, list uploads, complete, abort
+- Multipart: initiate, upload part, upload part copy (`x-amz-copy-source`,
+  optionally with `x-amz-copy-source-range`), list parts, list uploads,
+  complete, abort
+- Tagging: `GetObjectTagging` answers an empty tag set. Tags are not stored, but
+  the AWS CLI reads them before every `aws s3 cp` between buckets.
 
 Auth is AWS **SigV4** (header-signed), toggled by `[auth] enabled`. When
 disabled, anonymous access works (`aws s3 --no-sign-request`, or put the server
@@ -298,7 +302,7 @@ themselves are not verified; the credential on the request line already is. The
 decoded body must match `x-amz-decoded-content-length` and end with the final
 zero-length chunk, so a cut-off upload is rejected rather than stored short.
 
-S3 subresources the gateway does not implement (`?tagging`, `?acl`, `?cors`,
+S3 subresources the gateway does not implement (`PUT`/`DELETE ?tagging`, `?acl`, `?cors`,
 `?lifecycle`, …) are answered **`501 NotImplemented`** instead of falling through
 to the plain object or bucket operation.
 

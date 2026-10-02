@@ -2,12 +2,13 @@
 //
 // Supported: ListBuckets, Create/Delete/HeadBucket, GetBucketLocation,
 // ListObjects V1 and V2 (prefix, delimiter, pagination), Put/Get/Head/Delete
-// Object, CopyObject, DeleteObjects (batch), range GETs, and multipart uploads
-// (initiate, upload part, list parts, list uploads, complete, abort).
+// Object, CopyObject, DeleteObjects (batch), range GETs, multipart uploads
+// (initiate, upload part, upload part copy, list parts, list uploads,
+// complete, abort), and GetObjectTagging, which always answers an empty tag set.
 //
 // Divergence from AWS: ETags are blake3 digests of the content, not MD5.
 // Deliberately unsupported: versioning, ACLs and policies, presigned URLs,
-// virtual-host addressing, and UploadPartCopy.
+// virtual-host addressing, and storing tags.
 //
 // Authorization: every request is SigV4-verified, and the credential decides
 // what it can address. The key in simplecas.toml is a superuser that reaches
@@ -603,7 +604,7 @@ func (g *Gateway) objectDispatch(w http.ResponseWriter, r *http.Request, namespa
 		switch {
 		case partNumber != "" && uploadID != "":
 			if r.Header.Get("x-amz-copy-source") != "" {
-				g.writeError(w, r, apperr.InvalidArgument("UploadPartCopy is not supported"))
+				g.uploadPartCopy(w, r, namespace, key, partNumber, uploadID)
 				return
 			}
 			g.uploadPart(w, r, namespace, key, partNumber, uploadID)
@@ -616,6 +617,10 @@ func (g *Gateway) objectDispatch(w http.ResponseWriter, r *http.Request, namespa
 	case http.MethodGet:
 		if uploadID := query.Get("uploadId"); uploadID != "" {
 			g.listParts(w, r, namespace, key, uploadID, query)
+			return
+		}
+		if query.Has("tagging") {
+			g.getObjectTagging(w, r, namespace, key)
 			return
 		}
 		g.serveObject(w, r, namespace, key, false)
@@ -670,23 +675,7 @@ func (g *Gateway) putObject(w http.ResponseWriter, r *http.Request, namespace, k
 // bucket as the source fails as NoSuchBucket — without this, copy would be a
 // way to pull any tenant's object into your own namespace by name.
 func (g *Gateway) copyObject(w http.ResponseWriter, r *http.Request, dstNamespace, dstKey string) {
-	source, err := url.PathUnescape(r.Header.Get("x-amz-copy-source"))
-	if err != nil {
-		g.writeError(w, r, apperr.InvalidArgument("bad x-amz-copy-source"))
-		return
-	}
-	srcNamespace, srcKey, ok := strings.Cut(strings.TrimPrefix(source, "/"), "/")
-	if !ok || srcKey == "" {
-		g.writeError(w, r, apperr.InvalidArgument("x-amz-copy-source must be bucket/key"))
-		return
-	}
-
-	srcNS, err := g.namespace(r, srcNamespace)
-	if err != nil {
-		g.writeError(w, r, err)
-		return
-	}
-	src, err := g.db.GetObject(r.Context(), srcNS.ID, srcKey)
+	src, err := g.copySource(r)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -707,6 +696,40 @@ func (g *Gateway) copyObject(w http.ResponseWriter, r *http.Request, dstNamespac
 		LastModified: iso8601(time.Now()),
 		ETag:         quotedETag(etag),
 	})
+}
+
+// copySource resolves the object x-amz-copy-source names, in the caller's
+// scope like any other namespace.
+func (g *Gateway) copySource(r *http.Request) (db.ObjectMeta, error) {
+	source, err := url.PathUnescape(r.Header.Get("x-amz-copy-source"))
+	if err != nil {
+		return db.ObjectMeta{}, apperr.InvalidArgument("bad x-amz-copy-source")
+	}
+	srcNamespace, srcKey, ok := strings.Cut(strings.TrimPrefix(source, "/"), "/")
+	if !ok || srcKey == "" {
+		return db.ObjectMeta{}, apperr.InvalidArgument("x-amz-copy-source must be bucket/key")
+	}
+	srcNS, err := g.namespace(r, srcNamespace)
+	if err != nil {
+		return db.ObjectMeta{}, err
+	}
+	return g.db.GetObject(r.Context(), srcNS.ID, srcKey)
+}
+
+// getObjectTagging answers an empty tag set for an existing object. Tags are
+// not stored, but the AWS CLI asks for them before every s3-to-s3 copy, and a
+// refusal there fails the copy itself.
+func (g *Gateway) getObjectTagging(w http.ResponseWriter, r *http.Request, namespace, key string) {
+	ns, err := g.namespace(r, namespace)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	if _, err := g.db.GetObject(r.Context(), ns.ID, key); err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	g.writeXML(w, r, http.StatusOK, tagging{Xmlns: xmlns})
 }
 
 func (g *Gateway) deleteObject(w http.ResponseWriter, r *http.Request, namespace, key string) {
@@ -859,6 +882,104 @@ func (g *Gateway) uploadPart(w http.ResponseWriter, r *http.Request, namespace, 
 
 	w.Header().Set("ETag", quotedETag(staged.Hash))
 	w.WriteHeader(http.StatusOK)
+}
+
+// uploadPartCopy stages a byte range of an existing object as a part. Unlike
+// CopyObject this does move bytes: a part is staged under its own digest, and
+// the whole object is hashed only at completion. The AWS CLI uses it for every
+// s3-to-s3 copy above its multipart threshold (8 MiB by default).
+//
+// The source resolves in the caller's scope, as for CopyObject, and the part
+// goes through the same size limit and quota as an uploaded one.
+func (g *Gateway) uploadPartCopy(w http.ResponseWriter, r *http.Request, namespace, key, rawPartNumber, rawUploadID string) {
+	partNumber, err := strconv.Atoi(rawPartNumber)
+	if err != nil || partNumber < 1 || partNumber > maxPartNumber {
+		g.writeError(w, r, apperr.InvalidArgument("partNumber must be 1-%d", maxPartNumber))
+		return
+	}
+	uploadID, err := parseUploadID(rawUploadID)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	ns, err := g.namespace(r, namespace)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	upload, err := g.db.GetMultipart(r.Context(), ns.ID, key, uploadID)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	src, err := g.copySource(r)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+
+	start, length := int64(0), src.Size
+	if header := r.Header.Get("x-amz-copy-source-range"); header != "" {
+		first, last, err := parseCopySourceRange(header, src.Size)
+		if err != nil {
+			g.writeError(w, r, err)
+			return
+		}
+		start, length = first, last-first+1
+	}
+
+	var body io.Reader = strings.NewReader("")
+	if length > 0 {
+		reader, err := g.blob.NewRangeReader(r.Context(), storage.BlobPath(src.BlobHash), start, length, nil)
+		if err != nil {
+			g.writeError(w, r, apperr.Internalf("open copy source: %w", err))
+			return
+		}
+		defer func() { _ = reader.Close() }()
+		body = sourceReader{reader}
+	}
+
+	staged, err := g.cas.PutPart(r.Context(), upload, int32(partNumber), body, length)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	g.writeXML(w, r, http.StatusOK, copyPartResult{
+		Xmlns:        xmlns,
+		LastModified: iso8601(time.Now()),
+		ETag:         quotedETag(staged.Hash),
+	})
+}
+
+// parseCopySourceRange parses x-amz-copy-source-range, which unlike Range
+// must name both ends ("bytes=first-last") and lie inside the source.
+func parseCopySourceRange(header string, size int64) (first, last int64, err error) {
+	spec, ok := strings.CutPrefix(strings.TrimSpace(header), "bytes=")
+	if !ok {
+		return 0, 0, apperr.InvalidArgument("x-amz-copy-source-range must be bytes=first-last")
+	}
+	rawFirst, rawLast, ok := strings.Cut(spec, "-")
+	if !ok {
+		return 0, 0, apperr.InvalidArgument("x-amz-copy-source-range must be bytes=first-last")
+	}
+	first, err1 := strconv.ParseInt(strings.TrimSpace(rawFirst), 10, 64)
+	last, err2 := strconv.ParseInt(strings.TrimSpace(rawLast), 10, 64)
+	if err1 != nil || err2 != nil || first < 0 || last < first || last >= size {
+		return 0, 0, apperr.InvalidArgument("x-amz-copy-source-range %q is not within the %d-byte source", header, size)
+	}
+	return first, last, nil
+}
+
+// sourceReader marks a failure reading a stored blob as the server's, so
+// staging reports it as an internal error rather than a bad request body.
+type sourceReader struct{ r io.Reader }
+
+func (s sourceReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if err != nil && err != io.EOF {
+		err = apperr.Internalf("read copy source: %w", err)
+	}
+	return n, err
 }
 
 func (g *Gateway) listParts(w http.ResponseWriter, r *http.Request, namespace, key, rawUploadID string, query url.Values) {

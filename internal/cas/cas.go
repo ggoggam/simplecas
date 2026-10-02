@@ -172,6 +172,11 @@ func (s *Store) stage(ctx context.Context, r io.Reader, limit int64, what string
 	closeErr := w.Close()
 
 	switch {
+	case src.err != nil && errors.As(src.err, new(*apperr.Error)):
+		// The reader classified its own failure (a stored blob that could not
+		// be read is the server's fault, not the client's).
+		s.DiscardStaging(ctx, key)
+		return StagedBlob{}, src.err
 	case src.err != nil && errors.Is(src.err, os.ErrDeadlineExceeded):
 		// The router's stall timeout fired: the client stopped sending.
 		s.DiscardStaging(ctx, key)
