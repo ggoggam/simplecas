@@ -883,3 +883,61 @@ func TestLargeObjectRoundTrip(t *testing.T) {
 		t.Errorf("round-tripped %d bytes, want %d", len(got), len(body))
 	}
 }
+
+// Each of these used to fall through to the plain operation and act on the
+// resource itself. They must now be refused and leave it untouched.
+func TestUnsupportedSubresourcesLeaveResourcesAlone(t *testing.T) {
+	g := newGateway(t)
+	createNS(t, g, "sub")
+	putObj(t, g, "sub", "doc", "abc", "text/plain")
+
+	for _, req := range []struct{ method, target, body string }{
+		{http.MethodPut, "/sub/doc?tagging", "<Tagging><TagSet/></Tagging>"},
+		{http.MethodDelete, "/sub/doc?tagging", ""},
+		{http.MethodDelete, "/sub?cors", ""},
+		{http.MethodPut, "/sub?versioning", "<VersioningConfiguration/>"},
+	} {
+		w := do(t, g, req.method, req.target, req.body)
+		mustStatus(t, w, http.StatusNotImplemented)
+		if code := errorCode(t, w); code != "NotImplemented" {
+			t.Errorf("%s %s: code = %q, want NotImplemented", req.method, req.target, code)
+		}
+	}
+
+	w := do(t, g, http.MethodGet, "/sub/doc", "")
+	mustStatus(t, w, http.StatusOK)
+	if w.Body.String() != "abc" {
+		t.Errorf("object body = %q after refused subresource calls, want abc", w.Body.String())
+	}
+	mustStatus(t, do(t, g, http.MethodHead, "/sub", ""), http.StatusOK)
+}
+
+// An uploaded HTML page must not render on the app's origin, where it could
+// act with a signed-in user's session.
+func TestObjectsAreServedDefused(t *testing.T) {
+	g := newGateway(t)
+	createNS(t, g, "web")
+	putObj(t, g, "web", "evil.html", "<script>alert(1)</script>", "text/html")
+	putObj(t, g, "web", "cat.png", "abc", "image/png")
+
+	w := do(t, g, http.MethodGet, "/web/evil.html", "")
+	mustStatus(t, w, http.StatusOK)
+	if got := w.Header().Get("Content-Disposition"); got != "attachment" {
+		t.Errorf("text/html Content-Disposition = %q, want attachment", got)
+	}
+	if got := w.Header().Get("Content-Security-Policy"); got != "sandbox" {
+		t.Errorf("Content-Security-Policy = %q, want sandbox", got)
+	}
+	if got := w.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+
+	// HEAD carries the same headers, and a previewable image stays inline.
+	w = do(t, g, http.MethodHead, "/web/cat.png", "")
+	if got := w.Header().Get("Content-Disposition"); got != "" {
+		t.Errorf("image/png Content-Disposition = %q, want inline (unset)", got)
+	}
+	if got := w.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("HEAD X-Content-Type-Options = %q, want nosniff", got)
+	}
+}

@@ -126,12 +126,6 @@ func mustCreateCredential(t *testing.T, d *db.DB, tenantID int64, label string) 
 func (f *tenantFixture) signed(t *testing.T, keyID, secret, method, target, body string, headers ...string) *httptest.ResponseRecorder {
 	t.Helper()
 
-	const (
-		amzDate   = "20130524T000000Z"
-		dateStamp = "20130524"
-		payload   = "UNSIGNED-PAYLOAD"
-	)
-
 	var r *http.Request
 	if body == "" {
 		r = httptest.NewRequest(method, target, nil)
@@ -139,35 +133,10 @@ func (f *tenantFixture) signed(t *testing.T, keyID, secret, method, target, body
 		r = httptest.NewRequest(method, target, strings.NewReader(body))
 	}
 	r.Host = "cas.example.com"
-	r.Header.Set("x-amz-date", amzDate)
-	r.Header.Set("x-amz-content-sha256", payload)
 	for i := 0; i+1 < len(headers); i += 2 {
 		r.Header.Set(headers[i], headers[i+1])
 	}
-
-	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
-	canonicalHeaders := "host:cas.example.com\n" +
-		"x-amz-content-sha256:" + payload + "\n" +
-		"x-amz-date:" + amzDate + "\n"
-
-	sig := computeSignature(signatureInput{
-		secret:           secret,
-		method:           method,
-		canonicalURI:     r.URL.EscapedPath(),
-		canonicalQuery:   canonicalQueryString(r.URL.RawQuery),
-		signedHeaders:    signedHeaders,
-		canonicalHeaders: canonicalHeaders,
-		hashedPayload:    payload,
-		amzDate:          amzDate,
-		dateStamp:        dateStamp,
-		region:           "us-east-1",
-		service:          "s3",
-	})
-	r.Header.Set("Authorization", strings.Join([]string{
-		sigV4Algorithm + " Credential=" + keyID + "/" + dateStamp + "/us-east-1/s3/aws4_request",
-		"SignedHeaders=" + signedHeaders,
-		"Signature=" + sig,
-	}, ", "))
+	signAt(r, keyID, secret, now(), "s3")
 
 	w := httptest.NewRecorder()
 	f.g.ServeHTTP(w, r)

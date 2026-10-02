@@ -39,6 +39,8 @@ const (
 	KindAccessDenied
 	KindSignatureDoesNotMatch
 	KindMalformedXML
+	KindNotImplemented
+	KindRequestTimeTooSkewed
 )
 
 // Error is a classified failure. Sentinel values below cover the kinds that
@@ -68,7 +70,17 @@ var (
 	ErrInvalidRange           = &Error{Kind: KindInvalidRange, msg: "requested range not satisfiable"}
 	ErrAccessDenied           = &Error{Kind: KindAccessDenied, msg: "access denied"}
 	ErrSignatureDoesNotMatch  = &Error{Kind: KindSignatureDoesNotMatch, msg: "signature mismatch"}
+	ErrRequestTimeTooSkewed   = &Error{Kind: KindRequestTimeTooSkewed, msg: "the difference between the request time and the server's time is too large"}
 )
+
+// RequestIDHeader carries the per-request ID the router assigns. The error
+// writers read it back off the response so a client-visible error can be
+// matched to the server log line that holds its cause.
+const RequestIDHeader = "X-Amz-Request-Id"
+
+// internalMessage is all a client learns about a 500. The cause (pgx and
+// storage error text, paths, hostnames) is logged under the request ID instead.
+const internalMessage = "We encountered an internal error. Please try again."
 
 // Forbidden denies an authorized-but-not-permitted request.
 func Forbidden(format string, a ...any) *Error {
@@ -83,6 +95,12 @@ func InvalidArgument(format string, a ...any) *Error {
 // InvalidPart rejects a multipart manifest that doesn't match what was staged.
 func InvalidPart(format string, a ...any) *Error {
 	return &Error{Kind: KindInvalidPart, msg: "invalid part: " + fmt.Sprintf(format, a...)}
+}
+
+// NotImplemented rejects a recognised S3 operation the gateway does not
+// support, so it is never mistaken for a plainer request on the same path.
+func NotImplemented(format string, a ...any) *Error {
+	return &Error{Kind: KindNotImplemented, msg: fmt.Sprintf(format, a...)}
 }
 
 // MalformedXML rejects an unparseable request body.
@@ -170,6 +188,10 @@ func (e *Error) S3Code() string {
 		return "SignatureDoesNotMatch"
 	case KindMalformedXML:
 		return "MalformedXML"
+	case KindNotImplemented:
+		return "NotImplemented"
+	case KindRequestTimeTooSkewed:
+		return "RequestTimeTooSkewed"
 	default:
 		return "InternalError"
 	}
@@ -189,8 +211,11 @@ func (e *Error) Status() int {
 		return http.StatusBadRequest
 	case KindInvalidRange:
 		return http.StatusRequestedRangeNotSatisfiable
-	case KindAccessDenied, KindSignatureDoesNotMatch, KindForbidden:
+	case KindAccessDenied, KindSignatureDoesNotMatch, KindForbidden,
+		KindRequestTimeTooSkewed:
 		return http.StatusForbidden
+	case KindNotImplemented:
+		return http.StatusNotImplemented
 	default:
 		return http.StatusInternalServerError
 	}
@@ -200,15 +225,30 @@ func (e *Error) Status() int {
 // than treated as ordinary client input.
 func (e *Error) IsInternal() bool { return e.Kind == KindInternal }
 
+// clientMessage is the message sent on the wire: the detail for client errors,
+// and a fixed string for internal ones.
+func (e *Error) clientMessage() string {
+	if e.IsInternal() {
+		return internalMessage
+	}
+	return e.msg
+}
+
 // WriteXML renders err as an S3-style XML error body. Used by the gateway.
 func WriteXML(w http.ResponseWriter, err error) {
 	e := From(err)
 	var msg bytes.Buffer
 	// Errors here are impossible for a bytes.Buffer sink.
-	_ = xml.EscapeText(&msg, []byte(e.msg))
+	_ = xml.EscapeText(&msg, []byte(e.clientMessage()))
+	var requestID bytes.Buffer
+	if id := w.Header().Get(RequestIDHeader); id != "" {
+		requestID.WriteString("<RequestId>")
+		_ = xml.EscapeText(&requestID, []byte(id))
+		requestID.WriteString("</RequestId>")
+	}
 	body := fmt.Sprintf(
-		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>%s</Code><Message>%s</Message></Error>",
-		e.S3Code(), msg.String(),
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>%s</Code><Message>%s</Message>%s</Error>",
+		e.S3Code(), msg.String(), requestID.String(),
 	)
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(e.Status())
@@ -220,8 +260,12 @@ func WriteJSON(w http.ResponseWriter, err error) {
 	e := From(err)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(e.Status())
-	_ = json.NewEncoder(w).Encode(map[string]string{
+	body := map[string]string{
 		"code":    e.S3Code(),
-		"message": e.msg,
-	})
+		"message": e.clientMessage(),
+	}
+	if id := w.Header().Get(RequestIDHeader); id != "" {
+		body["request_id"] = id
+	}
+	_ = json.NewEncoder(w).Encode(body)
 }

@@ -89,10 +89,25 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	lvl := levelObject
 	switch {
 	case namespace == "":
-		g.serviceDispatch(w, r)
+		lvl = levelService
 	case key == "":
+		lvl = levelNamespace
+	}
+	// Before dispatch: the dispatchers fall through to the plain operation on
+	// a query they don't recognise, so an unimplemented subresource would act
+	// on the object or bucket itself. See subresource.go.
+	if name := unsupportedSubresource(r.Method, lvl, r.URL.Query()); name != "" {
+		g.writeError(w, r, apperr.NotImplemented("the ?%s subresource is not supported for %s", name, r.Method))
+		return
+	}
+
+	switch lvl {
+	case levelService:
+		g.serviceDispatch(w, r)
+	case levelNamespace:
 		g.namespaceDispatch(w, r, namespace)
 	default:
 		g.objectDispatch(w, r, namespace, key)
@@ -119,7 +134,8 @@ func splitPath(escapedPath string) (namespace, key string, err error) {
 // writeError renders err as an S3 XML error, logging the internal ones.
 func (g *Gateway) writeError(w http.ResponseWriter, r *http.Request, err error) {
 	if e := apperr.From(err); e.IsInternal() {
-		g.log.Error("s3 gateway error", "method", r.Method, "path", r.URL.Path, "err", err)
+		g.log.Error("s3 gateway error", "method", r.Method, "path", r.URL.Path,
+			"requestId", w.Header().Get(apperr.RequestIDHeader), "err", err)
 	}
 	apperr.WriteXML(w, err)
 }
@@ -764,6 +780,7 @@ func (g *Gateway) serveResolvedObject(w http.ResponseWriter, r *http.Request, ns
 	}
 
 	w.Header().Set("Content-Type", meta.ContentType)
+	setContentSafetyHeaders(w.Header(), meta.ContentType)
 	w.Header().Set("ETag", quotedETag(meta.BlobHash))
 	w.Header().Set("Last-Modified", httpDate(meta.UpdatedAt))
 	w.Header().Set("Accept-Ranges", "bytes")

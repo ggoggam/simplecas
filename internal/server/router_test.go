@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/ggoggam/simplecas/internal/apperr"
 )
 
 // marker is a handler that identifies itself and echoes the path it saw, so a
@@ -205,5 +207,40 @@ func TestServerErrorsAreLoggedAtWarn(t *testing.T) {
 	logged := buf.String()
 	if !strings.Contains(logged, "level=WARN") || !strings.Contains(logged, "status=500") {
 		t.Errorf("a 500 should be logged at warn level:\n%s", logged)
+	}
+}
+
+// Every response carries a request ID, distinct per request, and the access
+// log records it, so a client quoting the ID from an error finds its log line.
+func TestRequestIDs(t *testing.T) {
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	var seenByHandler string
+	rt := Routes{
+		Gateway: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			seenByHandler = w.Header().Get(apperr.RequestIDHeader)
+		}),
+		API: marker("api"), UI: marker("ui"),
+	}
+	h := rt.Handler(log)
+
+	first := httptest.NewRecorder()
+	h.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/b/k", nil))
+	second := httptest.NewRecorder()
+	h.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/b/k", nil))
+
+	id := first.Header().Get(apperr.RequestIDHeader)
+	if len(id) != 16 {
+		t.Fatalf("request ID = %q, want 16 hex digits", id)
+	}
+	if id == second.Header().Get(apperr.RequestIDHeader) {
+		t.Error("two requests got the same ID")
+	}
+	if seenByHandler == "" {
+		t.Error("the ID must be set before the handler runs, so error writers can echo it")
+	}
+	if !strings.Contains(buf.String(), "requestId="+id) {
+		t.Errorf("access log lacks requestId=%s:\n%s", id, buf.String())
 	}
 }
