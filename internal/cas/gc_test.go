@@ -88,7 +88,7 @@ func TestSweepStagingRemovesOrphansAndSparesLiveParts(t *testing.T) {
 		t.Fatal(err)
 	}
 	part := f.stage(t, "part bytes")
-	if _, err := f.db.PutPart(ctx, uploadID, 1, part.StagingKey, part.Size, part.Hash); err != nil {
+	if _, err := f.db.PutPart(ctx, uploadID, 1, part.StagingKey, part.Size, part.Hash, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -126,7 +126,7 @@ func TestSweepMultipartReclaimsAbandonedParts(t *testing.T) {
 		t.Fatal(err)
 	}
 	part := f.stage(t, "abandoned part")
-	if _, err := f.db.PutPart(ctx, uploadID, 1, part.StagingKey, part.Size, part.Hash); err != nil {
+	if _, err := f.db.PutPart(ctx, uploadID, 1, part.StagingKey, part.Size, part.Hash, 0); err != nil {
 		t.Fatal(err)
 	}
 

@@ -38,6 +38,11 @@ type fixture struct {
 
 func newFixture(t *testing.T, gc config.GcConfig) *fixture {
 	t.Helper()
+	return newFixtureWithLimits(t, gc, config.Default().Limits)
+}
+
+func newFixtureWithLimits(t *testing.T, gc config.GcConfig, limits config.LimitsConfig) *fixture {
+	t.Helper()
 	ctx := t.Context()
 	dsn := testdb.URL(t)
 
@@ -61,7 +66,7 @@ func newFixture(t *testing.T, gc config.GcConfig) *fixture {
 	t.Cleanup(func() { _ = bucket.Close() })
 
 	return &fixture{
-		store:  New(database, bucket, gc, slog.New(slog.DiscardHandler)),
+		store:  New(database, bucket, gc, limits, slog.New(slog.DiscardHandler)),
 		db:     database,
 		bucket: bucket,
 		pool:   pool,
@@ -600,7 +605,7 @@ func TestCompleteMultipartConcatenatesInOrder(t *testing.T) {
 	var parts []db.PartMeta
 	for i, body := range []string{"a", "b", "c"} {
 		staged := f.stage(t, body)
-		replaced, err := f.db.PutPart(ctx, uploadID, int32(i+1), staged.StagingKey, staged.Size, staged.Hash)
+		replaced, err := f.db.PutPart(ctx, uploadID, int32(i+1), staged.StagingKey, staged.Size, staged.Hash, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -669,7 +674,7 @@ func TestMultipartDedupsAgainstWholeFileUpload(t *testing.T) {
 	var parts []db.PartMeta
 	for i, body := range []string{"ab", "c"} {
 		staged := f.stage(t, body)
-		if _, err := f.db.PutPart(ctx, uploadID, int32(i+1), staged.StagingKey, staged.Size, staged.Hash); err != nil {
+		if _, err := f.db.PutPart(ctx, uploadID, int32(i+1), staged.StagingKey, staged.Size, staged.Hash, 0); err != nil {
 			t.Fatal(err)
 		}
 		parts = append(parts, db.PartMeta{

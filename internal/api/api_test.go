@@ -62,7 +62,7 @@ func newFixture(t *testing.T) *fixture {
 	log := slog.New(slog.DiscardHandler)
 	store := cas.New(database, bucket, config.GcConfig{
 		IntervalSecs: 60, GraceSecs: 300, MultipartExpirySecs: 86400,
-	}, log)
+	}, cfg.Limits, log)
 	gateway := s3.New(database, bucket, store, &cfg, log)
 
 	return &fixture{

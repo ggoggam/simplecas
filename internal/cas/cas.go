@@ -20,8 +20,10 @@ package cas
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 
 	"github.com/google/uuid"
@@ -38,15 +40,16 @@ import (
 // Store performs content-addressed writes against the metadata store and the
 // blob backend together.
 type Store struct {
-	db   *db.DB
-	blob *storage.Bucket
-	gc   config.GcConfig
-	log  *slog.Logger
+	db     *db.DB
+	blob   *storage.Bucket
+	gc     config.GcConfig
+	limits config.LimitsConfig
+	log    *slog.Logger
 }
 
 // New returns a Store over the given database and blob backend.
-func New(database *db.DB, bucket *storage.Bucket, gc config.GcConfig, log *slog.Logger) *Store {
-	return &Store{db: database, blob: bucket, gc: gc, log: log}
+func New(database *db.DB, bucket *storage.Bucket, gc config.GcConfig, limits config.LimitsConfig, log *slog.Logger) *Store {
+	return &Store{db: database, blob: bucket, gc: gc, limits: limits, log: log}
 }
 
 // StagedBlob is an upload buffered in staging, with the hash and size measured
@@ -73,9 +76,84 @@ func (t *taggedReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// Put stages body and commits it as namespace/key, returning the ETag and the
+// stored size. declared is the size the client announced, or -1 when it
+// announced none: a body declared over the size limit or the team's quota is
+// refused before a byte of it is read.
+func (s *Store) Put(ctx context.Context, namespaceID int64, key, contentType string, body io.Reader, declared int64) (etag string, size int64, err error) {
+	if err := checkDeclared(declared, s.limits.MaxObjectBytes, "object"); err != nil {
+		return "", 0, err
+	}
+	if declared > 0 {
+		if err := s.checkQuota(ctx, db.QuotaCheck{NamespaceID: namespaceID, Bytes: declared, Key: key}); err != nil {
+			return "", 0, err
+		}
+	}
+	staged, err := s.Stage(ctx, body)
+	if err != nil {
+		return "", 0, err
+	}
+	etag, err = s.Commit(ctx, namespaceID, key, contentType, staged)
+	if err != nil {
+		return "", 0, err
+	}
+	return etag, staged.Size, nil
+}
+
+// PutPart stages body as one part of upload, replacing any earlier upload of
+// the same part number. declared works as in Put, against the part size limit.
+func (s *Store) PutPart(ctx context.Context, upload db.MultipartUpload, partNumber int32, body io.Reader, declared int64) (StagedBlob, error) {
+	if err := checkDeclared(declared, s.limits.MaxPartBytes, "part"); err != nil {
+		return StagedBlob{}, err
+	}
+	if declared > 0 {
+		check := db.QuotaCheck{NamespaceID: upload.NamespaceID, Bytes: declared, Upload: upload.ID, PartNumber: partNumber}
+		if err := s.checkQuota(ctx, check); err != nil {
+			return StagedBlob{}, err
+		}
+	}
+	staged, err := s.stage(ctx, body, s.limits.MaxPartBytes, "part")
+	if err != nil {
+		return StagedBlob{}, err
+	}
+	replaced, err := s.db.PutPart(ctx, upload.ID, partNumber,
+		staged.StagingKey, staged.Size, staged.Hash, s.limits.TenantQuotaBytes)
+	if err != nil {
+		s.DiscardStaging(ctx, staged.StagingKey)
+		return StagedBlob{}, err
+	}
+	if replaced != "" {
+		s.DiscardStaging(ctx, replaced)
+	}
+	return staged, nil
+}
+
+// checkDeclared refuses a body whose announced size is already over limit.
+func checkDeclared(declared, limit int64, what string) error {
+	if declared > limit {
+		return apperr.EntityTooLarge("%s of %d bytes exceeds the %d-byte limit", what, declared, limit)
+	}
+	return nil
+}
+
+// checkQuota is the unlocked early quota check (see db.CheckQuota).
+func (s *Store) checkQuota(ctx context.Context, c db.QuotaCheck) error {
+	if s.limits.TenantQuotaBytes <= 0 {
+		return nil
+	}
+	return s.db.InTx(ctx, func(tx pgx.Tx) error {
+		return db.CheckQuota(ctx, tx, s.limits.TenantQuotaBytes, c)
+	})
+}
+
 // Stage streams r into a fresh staging file, hashing as it goes. The staging
 // file is removed if anything fails, so a failed upload leaves nothing behind.
+// A body longer than the object size limit fails with EntityTooLarge.
 func (s *Store) Stage(ctx context.Context, r io.Reader) (StagedBlob, error) {
+	return s.stage(ctx, r, s.limits.MaxObjectBytes, "object")
+}
+
+func (s *Store) stage(ctx context.Context, r io.Reader, limit int64, what string) (StagedBlob, error) {
 	key := storage.StagingPath(uuid.NewString())
 
 	w, err := s.blob.NewWriter(ctx, key, nil)
@@ -83,7 +161,9 @@ func (s *Store) Stage(ctx context.Context, r io.Reader) (StagedBlob, error) {
 		return StagedBlob{}, apperr.Internal(err)
 	}
 
-	src := &taggedReader{r: r}
+	// One byte past the limit is enough to know the body is too long, and
+	// stops the copy there rather than staging the rest.
+	src := &taggedReader{r: io.LimitReader(r, limit+1)}
 	hasher := blake3.New()
 	size, copyErr := io.Copy(io.MultiWriter(w, hasher), src)
 
@@ -92,9 +172,16 @@ func (s *Store) Stage(ctx context.Context, r io.Reader) (StagedBlob, error) {
 	closeErr := w.Close()
 
 	switch {
+	case src.err != nil && errors.Is(src.err, os.ErrDeadlineExceeded):
+		// The router's stall timeout fired: the client stopped sending.
+		s.DiscardStaging(ctx, key)
+		return StagedBlob{}, apperr.ErrRequestTimeout
 	case src.err != nil:
 		s.DiscardStaging(ctx, key)
 		return StagedBlob{}, apperr.InvalidArgument("body read: %v", src.err)
+	case size > limit:
+		s.DiscardStaging(ctx, key)
+		return StagedBlob{}, apperr.EntityTooLarge("%s exceeds the %d-byte limit", what, limit)
 	case copyErr != nil:
 		s.DiscardStaging(ctx, key)
 		return StagedBlob{}, apperr.Internalf("stage upload: %w", copyErr)
@@ -113,7 +200,25 @@ func (s *Store) Stage(ctx context.Context, r io.Reader) (StagedBlob, error) {
 // Commit publishes a staged blob as namespace/key and returns the blob hash,
 // which is the object's ETag.
 func (s *Store) Commit(ctx context.Context, namespaceID int64, key, contentType string, staged StagedBlob) (string, error) {
+	return s.commit(ctx, namespaceID, key, contentType, staged, uuid.Nil)
+}
+
+// commit is Commit, with the parts of a multipart upload being completed left
+// out of the quota check: they are dropped once the object is committed.
+//
+// The quota is checked twice. The first check, before the claim, refuses an
+// upload that is plainly over quota before its bytes are promoted; a refusal
+// after the copy would roll back the blob row and strand the bytes with no row
+// for GC to find. The second, after the object row is written, is the
+// authoritative one under the team lock, and only loses bytes that way when
+// two writers race past the first check together.
+func (s *Store) commit(ctx context.Context, namespaceID int64, key, contentType string, staged StagedBlob, upload uuid.UUID) (string, error) {
+	quota := s.limits.TenantQuotaBytes
 	err := s.db.InTx(ctx, func(tx pgx.Tx) error {
+		check := db.QuotaCheck{NamespaceID: namespaceID, Bytes: staged.Size, Key: key, Upload: upload}
+		if err := db.CheckQuota(ctx, tx, quota, check); err != nil {
+			return err
+		}
 		needsBytes, err := db.ClaimBlob(ctx, tx, staged.Hash, staged.Size)
 		if err != nil {
 			return err
@@ -127,7 +232,10 @@ func (s *Store) Commit(ctx context.Context, namespaceID int64, key, contentType 
 				return apperr.Internalf("promote staged blob: %w", err)
 			}
 		}
-		return db.UpsertObject(ctx, tx, namespaceID, key, staged.Hash, staged.Size, contentType)
+		if err := db.UpsertObject(ctx, tx, namespaceID, key, staged.Hash, staged.Size, contentType); err != nil {
+			return err
+		}
+		return db.EnforceQuota(ctx, tx, quota, namespaceID, upload)
 	})
 	if err != nil {
 		// Leave the staging file for the sweeper: on a lost race it may be the
@@ -162,7 +270,12 @@ func (s *Store) CopyObject(ctx context.Context, src db.ObjectMeta, dstNamespaceI
 				return apperr.ErrNoSuchKey
 			}
 		}
-		return db.UpsertObject(ctx, tx, dstNamespaceID, dstKey, src.BlobHash, src.Size, src.ContentType)
+		if err := db.UpsertObject(ctx, tx, dstNamespaceID, dstKey, src.BlobHash, src.Size, src.ContentType); err != nil {
+			return err
+		}
+		// A copy moves no bytes, but the destination team is charged for it
+		// all the same.
+		return db.EnforceQuota(ctx, tx, s.limits.TenantQuotaBytes, dstNamespaceID, uuid.Nil)
 	})
 	if err != nil {
 		return "", err
@@ -201,7 +314,10 @@ func (s *Store) LinkBlob(ctx context.Context, namespaceID int64, key, hash, cont
 		}
 
 		size, linked = stored, true
-		return db.UpsertObject(ctx, tx, namespaceID, key, hash, stored, contentType)
+		if err := db.UpsertObject(ctx, tx, namespaceID, key, hash, stored, contentType); err != nil {
+			return err
+		}
+		return db.EnforceQuota(ctx, tx, s.limits.TenantQuotaBytes, namespaceID, uuid.Nil)
 	})
 	if err != nil {
 		return 0, false, err
@@ -212,13 +328,29 @@ func (s *Store) LinkBlob(ctx context.Context, namespaceID int64, key, hash, cont
 // CompleteMultipart concatenates the parts into one staged blob, hashing the
 // whole so the finished object dedups like any other upload, commits it, and
 // then drops the parts.
+//
+// The assembled size is checked against the object size limit and the quota
+// before any part is read, so a refused completion costs no copying.
 func (s *Store) CompleteMultipart(ctx context.Context, upload db.MultipartUpload, parts []db.PartMeta) (string, error) {
+	var total int64
+	for _, p := range parts {
+		total += p.Size
+	}
+	if total > s.limits.MaxObjectBytes {
+		return "", apperr.EntityTooLarge("assembled object of %d bytes exceeds the %d-byte limit",
+			total, s.limits.MaxObjectBytes)
+	}
+	check := db.QuotaCheck{NamespaceID: upload.NamespaceID, Bytes: total, Key: upload.Key, Upload: upload.ID}
+	if err := s.checkQuota(ctx, check); err != nil {
+		return "", err
+	}
+
 	staged, err := s.stageParts(ctx, parts)
 	if err != nil {
 		return "", err
 	}
 
-	etag, err := s.Commit(ctx, upload.NamespaceID, upload.Key, upload.ContentType, staged)
+	etag, err := s.commit(ctx, upload.NamespaceID, upload.Key, upload.ContentType, staged, upload.ID)
 	if err != nil {
 		return "", err
 	}

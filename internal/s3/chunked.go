@@ -80,6 +80,20 @@ func bodyReader(r *http.Request) io.Reader {
 	return &lengthCheckedReader{r: decoded, remaining: want}
 }
 
+// declaredLength is the object size the client announced, or -1 if it did not:
+// x-amz-decoded-content-length for an aws-chunked body, whose Content-Length
+// counts the chunk framing too, and Content-Length otherwise.
+func declaredLength(r *http.Request) int64 {
+	if !isChunkedPayload(r) {
+		return r.ContentLength
+	}
+	n, err := strconv.ParseInt(r.Header.Get("x-amz-decoded-content-length"), 10, 64)
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
+}
+
 // lengthCheckedReader fails unless its source yields exactly the declared
 // number of bytes.
 type lengthCheckedReader struct {

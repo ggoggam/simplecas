@@ -25,6 +25,10 @@ func TestDefaultsAreServiceable(t *testing.T) {
 	if c.OIDC.SessionTTLSecs != 86400 {
 		t.Errorf("session_ttl_secs = %d, want 86400", c.OIDC.SessionTTLSecs)
 	}
+	want := LimitsConfig{MaxObjectBytes: 5 << 40, MaxPartBytes: 5 << 30, StallTimeoutSecs: 60}
+	if c.Limits != want {
+		t.Errorf("limits defaults = %+v, want %+v", c.Limits, want)
+	}
 }
 
 func TestApplyEnvSetsNestedScalars(t *testing.T) {
@@ -267,6 +271,10 @@ func TestValidate(t *testing.T) {
 		{"gcs without a bucket", func(c *Config) { c.Storage.Backend = "gcs" }},
 		{"azblob without a container", func(c *Config) { c.Storage.Backend = "azblob" }},
 		{"zero gc interval", func(c *Config) { c.GC.IntervalSecs = 0 }},
+		{"zero object size limit", func(c *Config) { c.Limits.MaxObjectBytes = 0 }},
+		{"zero part size limit", func(c *Config) { c.Limits.MaxPartBytes = 0 }},
+		{"negative quota", func(c *Config) { c.Limits.TenantQuotaBytes = -1 }},
+		{"zero stall timeout", func(c *Config) { c.Limits.StallTimeoutSecs = 0 }},
 		{"oidc with an unauthenticated gateway", func(c *Config) {
 			c.OIDC.Enabled = true
 		}},
