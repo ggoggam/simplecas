@@ -38,7 +38,7 @@ func TestSignRoundTripAndTamper(t *testing.T) {
 	}
 }
 
-func TestSessionTenantEmail(t *testing.T) {
+func TestSessionVerifiedEmail(t *testing.T) {
 	tests := []struct {
 		name    string
 		session *Session
@@ -50,12 +50,12 @@ func TestSessionTenantEmail(t *testing.T) {
 			want:    "dev@example.com",
 		},
 		{
-			name:    "unverified email yields no tenant identity",
+			name:    "unverified email yields nothing",
 			session: &Session{Email: "dev@example.com", EmailVerified: false},
 			want:    "",
 		},
 		{
-			name:    "absent email yields no tenant identity",
+			name:    "absent email yields nothing",
 			session: &Session{EmailVerified: true},
 			want:    "",
 		},
@@ -67,8 +67,8 @@ func TestSessionTenantEmail(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.session.TenantEmail(); got != tc.want {
-				t.Errorf("TenantEmail() = %q, want %q", got, tc.want)
+			if got := tc.session.VerifiedEmail(); got != tc.want {
+				t.Errorf("VerifiedEmail() = %q, want %q", got, tc.want)
 			}
 		})
 	}
@@ -156,7 +156,7 @@ func issueSession(t *testing.T, secret string, s Session) *http.Cookie {
 func TestCurrentSession(t *testing.T) {
 	cfg := &config.OidcConfig{SessionSecret: testSecret, SessionTTLSecs: 3600}
 	valid := Session{
-		Subject: "sub-1", Email: "dev@example.com", EmailVerified: true,
+		Issuer: "https://idp.test", Subject: "sub-1", Email: "dev@example.com", EmailVerified: true,
 		Provider: "google", Expires: time.Now().Add(time.Hour).Unix(),
 	}
 
@@ -165,7 +165,7 @@ func TestCurrentSession(t *testing.T) {
 		r.AddCookie(issueSession(t, testSecret, valid))
 
 		got := mustSession(t, r, cfg)
-		if got.Subject != "sub-1" || got.TenantEmail() != "dev@example.com" {
+		if got.Subject != "sub-1" || got.VerifiedEmail() != "dev@example.com" {
 			t.Errorf("session = %+v", got)
 		}
 	})
@@ -200,6 +200,36 @@ func TestCurrentSession(t *testing.T) {
 		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: "nonsense"})
 		if CurrentSession(r, cfg) != nil {
 			t.Error("a malformed cookie must be rejected")
+		}
+	})
+
+	// Sessions minted before they carried the issuer have no identity to
+	// authorize, so they sign the holder out instead.
+	t.Run("no issuer", func(t *testing.T) {
+		legacy := valid
+		legacy.Issuer = ""
+		r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
+		r.AddCookie(issueSession(t, testSecret, legacy))
+		if CurrentSession(r, cfg) != nil {
+			t.Error("a session without an issuer must be rejected")
+		}
+	})
+
+	// The login flow's state is signed with the same key. Moved into the
+	// session cookie it parses as a session with an expiry and no identity,
+	// which must not count as signed in.
+	t.Run("flow state presented as a session", func(t *testing.T) {
+		payload, err := json.Marshal(flowState{
+			Provider: "google", CSRF: "c", Nonce: "n", PKCEVerifier: "v",
+			RedirectAfter: "/ui/", Expires: time.Now().Add(time.Hour).Unix(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
+		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: sign(testSecret, payload)})
+		if CurrentSession(r, cfg) != nil {
+			t.Error("a flow-state token must not be accepted as a session")
 		}
 	})
 

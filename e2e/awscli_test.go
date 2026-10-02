@@ -654,7 +654,11 @@ func TestTeamCredential(t *testing.T) {
 	admin := s.admin(t)
 	ctx := context.Background()
 
-	tenantID, err := s.db.CreateTenant(ctx, "team-a", "owner@example.com")
+	owner, err := s.db.ResolveUser(ctx, "https://idp.test", "owner", "owner@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantID, err := s.db.CreateTenant(ctx, "team-a", owner.ID)
 	if err != nil {
 		t.Fatal(err)
 	}

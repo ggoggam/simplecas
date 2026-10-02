@@ -38,9 +38,29 @@ export interface Tenant {
 }
 
 export interface Member {
+  /** Addresses the member in the role-change and removal calls. */
+  id: number;
+  /** Display only; empty when the member's provider verified no address. */
   email: string;
+  name: string;
   role: Role;
   created_at: string;
+  /** The signed-in caller's own row — the one they may remove to leave. */
+  you: boolean;
+}
+
+/**
+ * A pending offer of team membership, addressed to an email. It grants nothing
+ * until the signed-in holder of that verified address accepts it.
+ */
+export interface Invitation {
+  tenant: string;
+  email: string;
+  role: Role;
+  invited_by: string | null;
+  created_at: string;
+  /** null only for a membership carried over from before invitations. */
+  expires_at: string | null;
 }
 
 /** An S3 access key belonging to a team. Never carries the secret. */
@@ -117,8 +137,8 @@ export const api = {
   },
 
   // Probe multi-tenancy. `/api/tenants` succeeds only when OIDC is enabled and
-  // the caller has a verified email; otherwise it rejects (401/403) and we fall
-  // back to the untenanted admin view. Never throws — the result always tells
+  // the caller is signed in; otherwise it rejects (401/403) and we fall back to
+  // the untenanted admin view. Never throws — the result always tells
   // the UI which mode to render.
   async tenancy(): Promise<
     { mode: "teams"; teams: Tenant[] } | { mode: "untenanted"; teams: [] }
@@ -137,8 +157,8 @@ export const api = {
   },
 
   // Teams (multi-tenancy). These succeed only when OIDC is enabled and the
-  // caller has a verified email; otherwise they reject (e.g. 403) and the UI
-  // falls back to the untenanted admin view. See README "Teams".
+  // caller is signed in; otherwise they reject (e.g. 403) and the UI falls
+  // back to the untenanted admin view. See README "Teams".
   async listTenants(): Promise<Tenant[]> {
     return (await req("/api/tenants")).json();
   },
@@ -161,19 +181,60 @@ export const api = {
     ).json();
   },
 
-  async addMember(tenant: string, email: string, role: Role): Promise<void> {
-    await req(`/api/tenants/${encodeURIComponent(tenant)}/members`, {
+  // Owner-only. A team keeps at least one owner, so demoting the last one is
+  // refused.
+  async setMemberRole(tenant: string, id: number, role: Role): Promise<void> {
+    await req(`/api/tenants/${encodeURIComponent(tenant)}/members/${id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ role }),
+    });
+  },
+
+  // Owners remove anyone; a member may remove only themselves (leaving).
+  async removeMember(tenant: string, id: number): Promise<void> {
+    await req(`/api/tenants/${encodeURIComponent(tenant)}/members/${id}`, {
+      method: "DELETE",
+    });
+  },
+
+  // Invitations, from the team's side. All three are owner-only.
+  async listInvitations(tenant: string): Promise<Invitation[]> {
+    return (
+      await req(`/api/tenants/${encodeURIComponent(tenant)}/invitations`)
+    ).json();
+  },
+
+  async invite(tenant: string, email: string, role: Role): Promise<void> {
+    await req(`/api/tenants/${encodeURIComponent(tenant)}/invitations`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ email, role }),
     });
   },
 
-  async removeMember(tenant: string, email: string): Promise<void> {
+  async revokeInvitation(tenant: string, email: string): Promise<void> {
     await req(
-      `/api/tenants/${encodeURIComponent(tenant)}/members/${encodeURIComponent(email)}`,
+      `/api/tenants/${encodeURIComponent(tenant)}/invitations/${encodeURIComponent(email)}`,
       { method: "DELETE" },
     );
+  },
+
+  // Invitations addressed to the caller's verified email.
+  async myInvitations(): Promise<Invitation[]> {
+    return (await req("/api/invitations")).json();
+  },
+
+  async acceptInvitation(tenant: string): Promise<void> {
+    await req(`/api/invitations/${encodeURIComponent(tenant)}/accept`, {
+      method: "POST",
+    });
+  },
+
+  async declineInvitation(tenant: string): Promise<void> {
+    await req(`/api/invitations/${encodeURIComponent(tenant)}/decline`, {
+      method: "POST",
+    });
   },
 
   // S3 access keys. All three are owner-only server-side; a member gets 403.

@@ -9,6 +9,7 @@ import {
   formatBytes,
   type CreatedCredential,
   type Credential,
+  type Invitation,
   type Member,
   type Role,
 } from "@/lib/api";
@@ -37,6 +38,7 @@ import {
 } from "@/components/ui/sheet";
 import { FilePreview, canPreview, previewKind } from "@/components/file-preview";
 import {
+  Check,
   ChevronRight,
   Crown,
   Database,
@@ -50,6 +52,7 @@ import {
   Eye,
   Loader2,
   LogOut,
+  Mail,
   Menu,
   Moon,
   Plus,
@@ -69,6 +72,11 @@ import {
 function normalizeDest(p: string): string {
   const t = p.trim().replace(/^\/+/, "");
   return t === "" || t.endsWith("/") ? t : `${t}/`;
+}
+
+/** How a member is named in the UI: their address, else their name. */
+function memberLabel(m: Member): string {
+  return m.email || m.name || `user ${m.id}`;
 }
 
 /** Track a CSS media query, re-rendering on change. */
@@ -122,7 +130,7 @@ export function BrowserPage() {
   // route's loader — always freshly resolved before render, so the chrome
   // (logout button, team switcher, stats) reflects real state, and a load
   // failure surfaces in the route's errorComponent instead of a half-empty UI.
-  const { me, teamsMode, teams } = rootApi.useLoaderData();
+  const { me, teamsMode, teams, invitations } = rootApi.useLoaderData();
   const { stats, namespaces } = browseRoute.useLoaderData();
   // Browse state lives in the URL query so the view is deep-linkable and
   // back/forward works: ?team=<t>&ns=<n>&prefix=<p>.
@@ -157,6 +165,10 @@ export function BrowserPage() {
   const [membersLoading, setMembersLoading] = useState(false);
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<Role>("member");
+  // Invitations the active team has sent and nobody has answered (owners only).
+  const [sentInvitations, setSentInvitations] = useState<Invitation[]>([]);
+  // Invitations addressed to the caller, answered from their own dialog.
+  const [inboxOpen, setInboxOpen] = useState(false);
   // S3 access keys for the active team, managed from the same dialog.
   const [credentials, setCredentials] = useState<Credential[]>([]);
   const [credentialsLoading, setCredentialsLoading] = useState(false);
@@ -379,6 +391,15 @@ export function BrowserPage() {
     }
   }, [activeTeam]);
 
+  const loadSentInvitations = useCallback(async () => {
+    if (!activeTeam) return;
+    try {
+      setSentInvitations(await api.listInvitations(activeTeam));
+    } catch (e) {
+      toast.error(`invitations: ${(e as Error).message}`);
+    }
+  }, [activeTeam]);
+
   const loadCredentials = useCallback(async () => {
     if (!activeTeam) return;
     setCredentialsLoading(true);
@@ -399,9 +420,13 @@ export function BrowserPage() {
     setInviteRole("member");
     setKeyLabel("");
     setFreshKey(null);
+    setSentInvitations([]);
     setTeamDialogOpen(true);
     loadMembers();
-    if (activeRole === "owner") loadCredentials();
+    if (activeRole === "owner") {
+      loadSentInvitations();
+      loadCredentials();
+    }
   };
 
   const doCreateCredential = async () => {
@@ -435,29 +460,89 @@ export function BrowserPage() {
     }
   };
 
-  const doAddMember = async () => {
+  const doInvite = async () => {
     if (!activeTeam) return;
     const email = inviteEmail.trim().toLowerCase();
     if (!email) return;
     try {
-      await api.addMember(activeTeam, email, inviteRole);
+      await api.invite(activeTeam, email, inviteRole);
       toast.success(`invited ${email}`);
       setInviteEmail("");
-      loadMembers();
+      loadSentInvitations();
     } catch (e) {
       toast.error((e as Error).message);
     }
   };
 
-  const doRemoveMember = async (email: string) => {
+  const doRevokeInvitation = async (email: string) => {
     if (!activeTeam) return;
-    if (!confirm(`Remove ${email} from "${activeTeam}"?`)) return;
     try {
-      await api.removeMember(activeTeam, email);
-      toast.success(`removed ${email}`);
-      loadMembers();
+      await api.revokeInvitation(activeTeam, email);
+      toast.success(`invitation to ${email} withdrawn`);
+      loadSentInvitations();
     } catch (e) {
       toast.error((e as Error).message);
+    }
+  };
+
+  const doSetRole = async (m: Member, role: Role) => {
+    if (!activeTeam || role === m.role) return;
+    try {
+      await api.setMemberRole(activeTeam, m.id, role);
+      toast.success(`${memberLabel(m)} is now ${role === "owner" ? "an owner" : "a member"}`);
+      loadMembers();
+      // Changing your own role changes what the team bar offers you.
+      if (m.you) await reload();
+    } catch (e) {
+      toast.error((e as Error).message);
+    }
+  };
+
+  // Owners remove anyone; removing yourself is leaving the team.
+  const doRemoveMember = async (m: Member) => {
+    if (!activeTeam) return;
+    const team = activeTeam;
+    const question = m.you
+      ? `Leave "${team}"? You will need a new invitation to rejoin.`
+      : `Remove ${memberLabel(m)} from "${team}"?`;
+    if (!confirm(question)) return;
+    try {
+      await api.removeMember(team, m.id);
+      if (m.you) {
+        toast.success(`left "${team}"`);
+        setTeamDialogOpen(false);
+        setActiveTeam(null);
+        await reload();
+      } else {
+        toast.success(`removed ${memberLabel(m)}`);
+        loadMembers();
+      }
+    } catch (e) {
+      toast.error((e as Error).message);
+    }
+  };
+
+  const doAcceptInvitation = async (tenant: string) => {
+    try {
+      await api.acceptInvitation(tenant);
+      toast.success(`joined "${tenant}"`);
+      setInboxOpen(false);
+      await reload();
+      setActiveTeam(tenant);
+    } catch (e) {
+      toast.error((e as Error).message);
+      await reload();
+    }
+  };
+
+  const doDeclineInvitation = async (tenant: string) => {
+    try {
+      await api.declineInvitation(tenant);
+      toast.success(`declined "${tenant}"`);
+      await reload();
+    } catch (e) {
+      toast.error((e as Error).message);
+      await reload();
     }
   };
 
@@ -648,6 +733,19 @@ export function BrowserPage() {
           </Button>
         )}
       </div>
+      {invitations.length > 0 && (
+        <Button
+          variant="secondary"
+          size="sm"
+          className="w-full justify-start"
+          onClick={() => setInboxOpen(true)}
+        >
+          <Mail className="size-4" />
+          {invitations.length === 1
+            ? "1 team invitation"
+            : `${invitations.length} team invitations`}
+        </Button>
+      )}
       <Button
         variant="outline"
         size="sm"
@@ -1220,6 +1318,53 @@ export function BrowserPage() {
         </DialogContent>
       </Dialog>
 
+      {/* Invitations addressed to the signed-in user */}
+      <Dialog open={inboxOpen} onOpenChange={setInboxOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Mail className="size-4" /> Team invitations
+            </DialogTitle>
+            <DialogDescription>
+              Accepting adds this account to the team. Nothing is shared until
+              you do.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-72 overflow-y-auto rounded-md border">
+            {invitations.length === 0 ? (
+              <p className="py-6 text-center text-sm text-muted-foreground">
+                No pending invitations
+              </p>
+            ) : (
+              invitations.map((inv) => (
+                <div
+                  key={inv.tenant}
+                  className="flex items-center gap-2 border-b px-3 py-2 text-sm last:border-b-0"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate font-medium">{inv.tenant}</div>
+                    <div className="truncate text-xs text-muted-foreground">
+                      as {inv.role}
+                      {inv.invited_by && ` · from ${inv.invited_by}`}
+                    </div>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => doDeclineInvitation(inv.tenant)}
+                  >
+                    Decline
+                  </Button>
+                  <Button size="sm" onClick={() => doAcceptInvitation(inv.tenant)}>
+                    <Check className="size-4" /> Accept
+                  </Button>
+                </div>
+              ))
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {/* Team members management */}
       <Dialog open={teamDialogOpen} onOpenChange={setTeamDialogOpen}>
         <DialogContent>
@@ -1229,7 +1374,7 @@ export function BrowserPage() {
             </DialogTitle>
             <DialogDescription>
               {activeRole === "owner"
-                ? "Invite teammates by email. They gain access on their next sign-in (a verified email is required)."
+                ? "Invite teammates by email. They join once they sign in with that verified address and accept; an invitation lapses after 7 days."
                 : "Members of this team. Only owners can manage membership."}
             </DialogDescription>
           </DialogHeader>
@@ -1246,7 +1391,7 @@ export function BrowserPage() {
               ) : (
                 members.map((m) => (
                   <div
-                    key={m.email}
+                    key={m.id}
                     className="flex items-center gap-2 border-b px-3 py-2 text-sm last:border-b-0"
                   >
                     {m.role === "owner" ? (
@@ -1254,22 +1399,72 @@ export function BrowserPage() {
                     ) : (
                       <Users className="size-3.5 shrink-0 text-muted-foreground" />
                     )}
-                    <span className="min-w-0 flex-1 truncate">{m.email}</span>
-                    <span className="shrink-0 text-xs text-muted-foreground">
-                      {m.role}
+                    <span className="min-w-0 flex-1 truncate" title={m.email || undefined}>
+                      {memberLabel(m)}
+                      {m.you && (
+                        <span className="text-muted-foreground"> (you)</span>
+                      )}
                     </span>
-                    {activeRole === "owner" && (
-                      <button
-                        onClick={() => doRemoveMember(m.email)}
-                        title="Remove member"
+                    {activeRole === "owner" ? (
+                      <select
+                        className="h-7 shrink-0 rounded-md border bg-background px-1.5 text-xs"
+                        value={m.role}
+                        onChange={(e) => doSetRole(m, e.target.value as Role)}
+                        aria-label={`Role of ${memberLabel(m)}`}
                       >
-                        <Trash2 className="size-3.5 text-muted-foreground hover:text-destructive" />
+                        <option value="member">member</option>
+                        <option value="owner">owner</option>
+                      </select>
+                    ) : (
+                      <span className="shrink-0 text-xs text-muted-foreground">
+                        {m.role}
+                      </span>
+                    )}
+                    {(activeRole === "owner" || m.you) && (
+                      <button
+                        onClick={() => doRemoveMember(m)}
+                        title={m.you ? "Leave team" : "Remove member"}
+                      >
+                        {m.you ? (
+                          <LogOut className="size-3.5 text-muted-foreground hover:text-destructive" />
+                        ) : (
+                          <Trash2 className="size-3.5 text-muted-foreground hover:text-destructive" />
+                        )}
                       </button>
                     )}
                   </div>
                 ))
               )}
             </div>
+            {activeRole === "owner" && sentInvitations.length > 0 && (
+              <div className="space-y-1">
+                <h4 className="text-xs text-muted-foreground">
+                  Invited, not yet accepted
+                </h4>
+                <div className="max-h-32 overflow-y-auto rounded-md border">
+                  {sentInvitations.map((inv) => (
+                    <div
+                      key={inv.email}
+                      className="flex items-center gap-2 border-b px-3 py-2 text-sm last:border-b-0"
+                    >
+                      <Mail className="size-3.5 shrink-0 text-muted-foreground" />
+                      <span className="min-w-0 flex-1 truncate">{inv.email}</span>
+                      <span className="shrink-0 text-xs text-muted-foreground">
+                        {inv.role}
+                        {inv.expires_at &&
+                          ` · until ${new Date(inv.expires_at).toLocaleDateString()}`}
+                      </span>
+                      <button
+                        onClick={() => doRevokeInvitation(inv.email)}
+                        title="Withdraw invitation"
+                      >
+                        <X className="size-3.5 text-muted-foreground hover:text-destructive" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             {activeRole === "owner" && (
               <div className="flex items-end gap-2">
                 <div className="min-w-0 flex-1">
@@ -1281,7 +1476,7 @@ export function BrowserPage() {
                     value={inviteEmail}
                     onChange={(e) => setInviteEmail(e.target.value)}
                     onKeyDown={(e) => {
-                      if (e.key === "Enter") doAddMember();
+                      if (e.key === "Enter") doInvite();
                     }}
                     placeholder="teammate@example.com"
                   />
@@ -1295,8 +1490,8 @@ export function BrowserPage() {
                   <option value="member">member</option>
                   <option value="owner">owner</option>
                 </select>
-                <Button onClick={doAddMember} disabled={!inviteEmail.trim()}>
-                  <UserPlus className="size-4" /> Add
+                <Button onClick={doInvite} disabled={!inviteEmail.trim()}>
+                  <UserPlus className="size-4" /> Invite
                 </Button>
               </div>
             )}

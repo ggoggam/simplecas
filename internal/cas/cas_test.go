@@ -543,14 +543,8 @@ func TestLinkBlobIsTenantScoped(t *testing.T) {
 	f := newFixture(t, defaultGC())
 	ctx := t.Context()
 
-	mine, err := f.db.CreateTenant(ctx, "mine", "me@example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	theirs, err := f.db.CreateTenant(ctx, "theirs", "them@example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
+	mine := f.tenant(t, "mine")
+	theirs := f.tenant(t, "theirs")
 	theirNS := f.namespace(t, "theirs-ns", &theirs)
 	myNS := f.namespace(t, "mine-ns", &mine)
 

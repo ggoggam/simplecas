@@ -40,7 +40,11 @@ func (f *fixture) usage(t *testing.T, tenantID int64) int64 {
 
 func (f *fixture) tenant(t *testing.T, name string) int64 {
 	t.Helper()
-	id, err := f.db.CreateTenant(t.Context(), name, name+"@example.com")
+	owner, err := f.db.ResolveUser(t.Context(), "https://issuer.test", name, name+"@example.com", "")
+	if err != nil {
+		t.Fatalf("resolve owner: %v", err)
+	}
+	id, err := f.db.CreateTenant(t.Context(), name, owner.ID)
 	if err != nil {
 		t.Fatalf("create tenant: %v", err)
 	}

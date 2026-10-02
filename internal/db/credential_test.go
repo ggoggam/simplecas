@@ -11,7 +11,7 @@ func TestS3CredentialRoundTrip(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
 
-	tenantID, err := d.CreateTenant(ctx, "team-a", "owner@example.com")
+	tenantID, err := d.CreateTenant(ctx, "team-a", mustUser(t, d, "owner@example.com"))
 	if err != nil {
 		t.Fatalf("create tenant: %v", err)
 	}
@@ -41,11 +41,11 @@ func TestListS3CredentialsIsScopedToItsTenant(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
 
-	a, err := d.CreateTenant(ctx, "team-a", "a@example.com")
+	a, err := d.CreateTenant(ctx, "team-a", mustUser(t, d, "a@example.com"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := d.CreateTenant(ctx, "team-b", "b@example.com")
+	b, err := d.CreateTenant(ctx, "team-b", mustUser(t, d, "b@example.com"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,11 +76,11 @@ func TestDeleteS3CredentialRequiresTheOwningTenant(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
 
-	a, err := d.CreateTenant(ctx, "team-a", "a@example.com")
+	a, err := d.CreateTenant(ctx, "team-a", mustUser(t, d, "a@example.com"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := d.CreateTenant(ctx, "team-b", "b@example.com")
+	b, err := d.CreateTenant(ctx, "team-b", mustUser(t, d, "b@example.com"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestDeletingATenantCascadesToItsCredentials(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
 
-	tenantID, err := d.CreateTenant(ctx, "team-a", "a@example.com")
+	tenantID, err := d.CreateTenant(ctx, "team-a", mustUser(t, d, "a@example.com"))
 	if err != nil {
 		t.Fatal(err)
 	}

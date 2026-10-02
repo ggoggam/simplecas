@@ -472,11 +472,15 @@ func tenantClients(t *testing.T) (gateway *Gateway, clientA, clientB *awss3.Clie
 
 	ctx := t.Context()
 	var err error
-	tenantA, err = gateway.db.CreateTenant(ctx, "team-a", "a@example.com")
+	owner, err := gateway.db.ResolveUser(ctx, "https://issuer.test", "owner", "owner@example.com", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	tenantB, err := gateway.db.CreateTenant(ctx, "team-b", "b@example.com")
+	tenantA, err = gateway.db.CreateTenant(ctx, "team-a", owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantB, err := gateway.db.CreateTenant(ctx, "team-b", owner.ID)
 	if err != nil {
 		t.Fatal(err)
 	}

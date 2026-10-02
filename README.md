@@ -153,10 +153,11 @@ There are two independent auth mechanisms for the two kinds of client:
 
 *Authentication* is deliberately lean and stateless: **any identity that
 authenticates at a configured provider is admitted** (optionally narrowed by an
-email allowlist), and the session is a stateless **HMAC-signed cookie** — no
-session table, no server-side revocation. Every instance behind a load balancer
-only needs the same `session_secret`. *Authorization* (who may see which
-namespaces) is layered on top via **teams** — see below.
+email allowlist), and the session is a stateless **HMAC-signed cookie** carrying
+the ID token's issuer and subject — no session table, no server-side revocation.
+Every instance behind a load balancer only needs the same `session_secret`.
+*Authorization* (who may see which namespaces) is layered on top via **teams** —
+see below.
 
 ```toml
 [oidc]
@@ -205,11 +206,21 @@ namespaces of teams they belong to. Isolation is enforced per request; a
 namespace a caller can't access is reported as *not found*, so existence never
 leaks across teams.
 
-- **Membership** is keyed by **verified email** — you invite by email, and the
-  invitee gains access on their next sign-in. Two roles: `owner` (manage
-  membership, delete the team) and `member` (read/write the team's namespaces).
-  A team always keeps at least one owner. Tenancy requires a verified email; an
-  identity whose provider doesn't assert `email_verified` gets no team access.
+- **Users** are keyed by the provider's **(issuer, subject)** — the ID token's
+  `iss` and `sub`, which a provider never reassigns. A `users` row is created
+  the first time an identity calls `/api`. Email and name are stored for
+  display only; nothing authorizes on them.
+- **Membership** belongs to a user. Owners **invite by email**; an invitation
+  grants nothing until a signed-in user whose provider has **verified** that
+  address accepts it, and the membership then belongs to that user's account,
+  not to the address. An invitation lapses after **7 days**; inviting the same
+  address again replaces it with a fresh one. So another provider that vouches
+  for the same address, or whoever holds a recycled mailbox later, inherits
+  nothing that has already been accepted.
+- Two roles: `owner` (manage membership and invitations, mint S3 keys, delete
+  the team) and `member` (read/write the team's namespaces). A team always keeps
+  at least one owner: demoting or removing the last one is refused, including
+  when two owners try it on each other at the same moment. Any member may leave.
 - **Self-serve**: any signed-in user can create a team and becomes its owner.
 - **Dedup stays global** across all content, but the client-side dedup "link"
   fast path is scoped to your own team, so it can't be used to probe whether
@@ -223,10 +234,28 @@ No config is required — tenancy is automatic whenever OIDC is on. There is no
 users/teams state when OIDC is off; then `/api` is the unauthenticated
 full-access plane it has always been.
 
-API (JSON, cookie-authenticated): `GET/POST /api/tenants`,
-`DELETE /api/tenants/{team}`, `GET/POST /api/tenants/{team}/members`,
-`DELETE /api/tenants/{team}/members/{email}`. Creating a namespace
-(`POST /api/namespaces`) takes a `tenant` field naming the owning team.
+API (JSON, cookie-authenticated):
+
+| Endpoint | Who | |
+| --- | --- | --- |
+| `GET/POST /api/tenants`, `DELETE /api/tenants/{team}` | any user; delete is owner-only | list, create, delete teams |
+| `GET /api/tenants/{team}/members` | members | roster; `id` addresses a member, `you` marks the caller |
+| `PATCH /api/tenants/{team}/members/{id}` | owners | change a role: `{"role":"owner"}` |
+| `DELETE /api/tenants/{team}/members/{id}` | owners, or the member themselves | remove, or leave |
+| `GET/POST /api/tenants/{team}/invitations` | owners | list pending, or invite `{"email","role"}` |
+| `DELETE /api/tenants/{team}/invitations/{email}` | owners | withdraw |
+| `GET /api/invitations` | any user | invitations addressed to your verified email |
+| `POST /api/invitations/{team}/accept`, `…/decline` | the invitee | answer one |
+
+Creating a namespace (`POST /api/namespaces`) takes a `tenant` field naming the
+owning team.
+
+> **Upgrading from email-keyed membership:** migration `0004_users` cannot
+> attach existing memberships to users that do not exist yet, so it turns each
+> into a pending invitation with the same role and no expiry. After upgrading,
+> every existing member, owners included, signs in and accepts once from the
+> **team invitations** button in the PWA. Sessions issued before the upgrade
+> lack the issuer and are signed out once.
 
 ### Per-team S3 credentials
 
@@ -381,7 +410,7 @@ internal/
   apperr/            error type carrying an S3 code + HTTP status; XML and JSON rendering
   config/            layered TOML + SIMPLECAS__ env config; backend selection
   storage/           blob backend construction + the blobs/ and staging/ layout
-  db/                all SQL: namespaces, tenants, blobs/refcounts, objects, multipart, GC
+  db/                all SQL: namespaces, users, tenants + invitations, blobs/refcounts, objects, multipart, GC
   db/migrations/     embedded SQL migrations (run automatically on boot)
   cas/               content-addressed write path (stage → claim → commit) and the GC loop
   s3/                S3 gateway: handlers, XML wire types, SigV4 verification

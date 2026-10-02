@@ -47,11 +47,13 @@ const rootRoute = createRootRoute({
   // `errorComponent`; `api.tenancy()` never throws (it just picks the mode).
   loader: async () => {
     const [me, tenancy] = await Promise.all([api.me(), api.tenancy()]);
-    return {
-      me,
-      teamsMode: tenancy.mode === "teams",
-      teams: tenancy.teams,
-    };
+    const teamsMode = tenancy.mode === "teams";
+    // Invitations waiting on the caller. Secondary to the page, so a failure
+    // here shows none rather than failing the whole load.
+    const invitations = teamsMode
+      ? await api.myInvitations().catch(() => [])
+      : [];
+    return { me, teamsMode, teams: tenancy.teams, invitations };
   },
   pendingComponent: FullScreen,
   errorComponent: LoadError,

@@ -297,11 +297,11 @@ func TestBlobReferencedInTenant(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
 
-	mine, err := d.CreateTenant(ctx, "mine", "me@example.com")
+	mine, err := d.CreateTenant(ctx, "mine", mustUser(t, d, "me@example.com"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	theirs, err := d.CreateTenant(ctx, "theirs", "them@example.com")
+	theirs, err := d.CreateTenant(ctx, "theirs", mustUser(t, d, "them@example.com"))
 	if err != nil {
 		t.Fatal(err)
 	}
