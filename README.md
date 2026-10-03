@@ -53,6 +53,12 @@ mise run down        # tear down (add down:clean to wipe volumes)
 
 No mise? `docker compose -f docker/docker-compose.yml up --build` works the same.
 
+The stack is for one machine. Sign-in is off, so `/api` is open; the compose
+file sets `server.insecure_open_api` to allow that and publishes port 9000 on
+the host's loopback only. Postgres is not published at all: simplecas reaches
+it on the compose network (`docker compose -f docker/docker-compose.yml exec
+postgres psql -U postgres simplecas` for a shell).
+
 ## Development
 
 Install [mise](https://mise.jdx.dev) — it provisions the toolchain (Go, Bun,
@@ -111,6 +117,26 @@ endpoint = "https://s3.amazonaws.com"   # or MinIO / R2
 access_key_id = "…"
 secret_access_key = "…"
 ```
+
+### Binding without sign-in
+
+With OIDC off nothing authenticates `/api`, which can create and delete every
+namespace and object. So the server **refuses to start** with OIDC off unless
+`server.bind` is a loopback address (`127.0.0.1`, `[::1]`, `localhost`) or the
+open admin plane is accepted explicitly:
+
+```toml
+[server]
+bind = "0.0.0.0:9000"
+insecure_open_api = true    # SIMPLECAS__SERVER__INSECURE_OPEN_API=true
+```
+
+Set it only when something in front (ingress auth, a private network) decides
+who reaches the port; the server logs a warning at startup while it is in
+effect. The shipped `simplecas.toml` binds `0.0.0.0:9000` without it, so a bare
+`go run ./cmd/simplecas` needs `SIMPLECAS__SERVER__BIND=127.0.0.1:9000`, the
+opt-in, or `[oidc]`. `mise run dev` and the compose stack set the opt-in. With
+OIDC on the setting has no effect.
 
 ### Limits and quotas
 
@@ -196,15 +222,39 @@ redirect to `/auth/login`.
 > **Note:** OIDC gates the bundled PWA and admin API only, so with OIDC on the
 > server **refuses to start** unless `[auth] enabled = true` with a secret other
 > than the sample `simplecas-secret` — an unauthenticated gateway would serve
-> every team's namespaces to anyone who can reach the port.
+> every team's namespaces to anyone who can reach the port. With OIDC off, it
+> refuses a non-loopback bind instead; see
+> [Binding without sign-in](#binding-without-sign-in).
+
+### Browser security headers
+
+Every response from `/ui`, `/api` and `/auth` carries
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin` (URLs here
+name namespaces and keys, and nothing cross-origin needs a `Referer`),
+`X-Frame-Options: DENY`, and a `Content-Security-Policy` with
+`frame-ancestors 'none'`. The PWA's policy allows only same-origin scripts,
+workers and fetches, plus `'wasm-unsafe-eval'` for the BLAKE3 hasher and inline
+styles that its UI libraries inject; `/api` and `/auth` get `default-src
+'none'`, and the sign-in page admits its one inline stylesheet by hash.
+`Strict-Transport-Security` is added when the request came over TLS or
+`oidc.public_url` is `https://`. Object bytes, at `/` or through `/api`, keep
+the gateway's own headers instead (see [S3 gateway](#s3-gateway)).
 
 ### Teams (multi-tenancy)
 
 When OIDC is enabled the human plane (`/ui` + `/api`) is **multi-tenant**: each
 namespace is owned by a **team**, and a signed-in user sees and touches only the
 namespaces of teams they belong to. Isolation is enforced per request; a
-namespace a caller can't access is reported as *not found*, so existence never
-leaks across teams.
+namespace a caller can't access is reported as *not found*, so reads, writes and
+listings never reveal another team's namespaces.
+
+The one exception is creation. Namespace names are **global** (they are S3
+bucket names), so creating one whose name is taken fails `409` even when another
+team holds it, and that answer necessarily confirms the name is in use. It says
+nothing more: another team's namespace and an unowned one get the same
+`BucketAlreadyExists`, and only a namespace the caller can already reach comes
+back `BucketAlreadyOwnedByYou`. Real S3 behaves the same way. Don't put anything
+secret in a namespace name.
 
 - **Users** are keyed by the provider's **(issuer, subject)** — the ID token's
   `iss` and `sub`, which a provider never reassigns. A `users` row is created
@@ -232,7 +282,8 @@ leaks across teams.
 
 No config is required — tenancy is automatic whenever OIDC is on. There is no
 users/teams state when OIDC is off; then `/api` is the unauthenticated
-full-access plane it has always been.
+full-access plane it has always been, which is why it only listens beyond
+loopback when told to ([Binding without sign-in](#binding-without-sign-in)).
 
 API (JSON, cookie-authenticated):
 
@@ -263,8 +314,10 @@ The S3 gateway is tenant-scoped too, via access keys minted per team. A request
 signed with one of them can address **only that team's namespaces**; every other
 name — another team's, an unowned one, or one that doesn't exist — comes back
 `NoSuchBucket`, so the gateway never confirms that a namespace it won't serve
-is there. `CopyObject` resolves *both* source and destination in that scope, so
-it can't be used to pull another team's object into your own namespace.
+is there, except that `CreateBucket` on a taken name answers
+`BucketAlreadyExists` (see [Teams](#teams-multi-tenancy)). `CopyObject` resolves
+*both* source and destination in that scope, so it can't be used to pull another
+team's object into your own namespace.
 
 | Endpoint | |
 | --- | --- |
@@ -283,7 +336,8 @@ team key.
 
 The credential in `simplecas.toml` remains a **superuser**: it is matched before
 the per-team lookup (so a database row can never shadow or impersonate it) and
-it addresses every namespace, owned or not. Treat it as a root key.
+it addresses every namespace, owned or not, so a `CreateBucket` clash is always
+`BucketAlreadyOwnedByYou` for it. Treat it as a root key.
 
 > Secrets in `tenant_credentials` are stored **recoverably, not hashed**. SigV4
 > is symmetric HMAC — the server has to re-derive the signing key from the
@@ -434,6 +488,7 @@ internal/
   auth/              OIDC sign-in: discovery, signed-cookie sessions, guard middleware
   ui/                serves the embedded PWA
   server/            route precedence across the four surfaces + request logging
+  reserved/          namespace names kept back from creation (routed segments, health probes)
   testdb/            per-test Postgres schemas (test-only)
 e2e/                 AWS CLI end-to-end tests against the assembled server
 web/                 Vite + React + Tailwind PWA (shadcn/ui, ggoggam/shadcn-treeview)
@@ -446,9 +501,12 @@ mise.toml            toolchain pins + dev/build/test tasks (`mise tasks`)
 Requests are dispatched on their first path segment rather than by
 `http.ServeMux`, because `ServeMux` cleans request paths — collapsing `//` and
 resolving `.` and `..` segments with a redirect — and S3 object keys may
-legitimately contain those sequences. The reserved first segments are therefore
-`api` and `ui`, plus `auth` whenever sign-in is enabled; those namespace names
-are unavailable.
+legitimately contain those sequences. The routed first segments are therefore
+`api` and `ui`, plus `auth` whenever sign-in is enabled. Creating a namespace
+named `api`, `ui`, `auth`, `healthz` or `readyz` is refused with
+`InvalidBucketName` whether or not sign-in is on (the last two are held for
+health endpoints); the list lives in `internal/reserved`. A namespace created
+with one of these names before it was reserved is left as it is.
 
 ### Tests
 

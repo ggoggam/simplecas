@@ -12,7 +12,8 @@
 //
 // When OIDC is disabled there is no caller and this is the unauthenticated
 // full-access plane it has always been: put it behind ingress auth or bind it
-// privately.
+// privately. config.Validate refuses a non-loopback bind in that mode unless
+// server.insecure_open_api says something in front has been arranged.
 //
 // The JSON field names below are the contract with the PWA (see
 // web/src/lib/api.ts). Renaming one breaks the UI silently, and list responses
@@ -22,6 +23,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"mime"
@@ -36,6 +38,7 @@ import (
 	"github.com/ggoggam/simplecas/internal/auth"
 	"github.com/ggoggam/simplecas/internal/cas"
 	"github.com/ggoggam/simplecas/internal/db"
+	"github.com/ggoggam/simplecas/internal/reserved"
 	"github.com/ggoggam/simplecas/internal/s3"
 )
 
@@ -449,6 +452,10 @@ func (h *Handler) createNamespace(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, apperr.ErrInvalidNamespaceName)
 		return
 	}
+	if reserved.Name(req.Name) {
+		h.writeError(w, r, apperr.ErrReservedNamespaceName)
+		return
+	}
 
 	var tenantID *int64
 	if auth.FromContext(r.Context()) != nil {
@@ -465,10 +472,31 @@ func (h *Handler) createNamespace(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.db.CreateNamespace(r.Context(), req.Name, tenantID); err != nil {
+		if errors.Is(err, apperr.ErrNamespaceAlreadyExists) {
+			err = h.nameTaken(r, req.Name)
+		}
 		h.writeError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusCreated)
+}
+
+// nameTaken answers a create whose name already exists, the way the gateway's
+// CreateBucket does: names are global, so the clash only says the name is in
+// use, and BucketAlreadyOwnedByYou is reserved for a namespace that resolves
+// through authorizeNamespace. That is any namespace with OIDC off, and with a
+// caller, one owned by any team they belong to, not only the team they asked
+// to create it in.
+func (h *Handler) nameTaken(r *http.Request, name string) error {
+	_, err := h.authorizeNamespace(r, name)
+	switch {
+	case err == nil:
+		return apperr.ErrNamespaceAlreadyOwned
+	case errors.Is(err, apperr.ErrNoSuchNamespace):
+		return apperr.ErrNamespaceAlreadyExists
+	default:
+		return err
+	}
 }
 
 func (h *Handler) deleteNamespace(w http.ResponseWriter, r *http.Request) {
@@ -629,6 +657,12 @@ func (h *Handler) getObject(w http.ResponseWriter, r *http.Request) {
 	// The gateway supplies the read path for both planes; it takes the row
 	// this handler already authorized rather than resolving the name again,
 	// so /api's membership check is the only authorization that applies.
+	//
+	// The bytes are user content, so they carry the gateway's content-safety
+	// headers rather than the API's (see internal/server/headers.go). The
+	// API's policy would also refuse the frame the PWA previews a PDF in.
+	w.Header().Del("Content-Security-Policy")
+	w.Header().Del("X-Frame-Options")
 	h.gateway.ServeObject(w, r, ns, key)
 }
 

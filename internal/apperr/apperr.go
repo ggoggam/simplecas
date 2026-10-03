@@ -24,7 +24,12 @@ const (
 	KindNoSuchNamespace
 	KindNoSuchKey
 	KindNoSuchUpload
+	// Namespace names are global, so a create can clash with a namespace the
+	// caller cannot address. KindNamespaceAlreadyExists is that clash, and the
+	// one the store reports; a plane narrows it to KindNamespaceAlreadyOwned
+	// only once the name resolves in the caller's own scope.
 	KindNamespaceAlreadyExists
+	KindNamespaceAlreadyOwned
 	KindNamespaceNotEmpty
 	KindInvalidNamespaceName
 	KindNoSuchTenant
@@ -68,9 +73,11 @@ var (
 	ErrNoSuchNamespace        = &Error{Kind: KindNoSuchNamespace, msg: "namespace not found"}
 	ErrNoSuchKey              = &Error{Kind: KindNoSuchKey, msg: "object not found"}
 	ErrNoSuchUpload           = &Error{Kind: KindNoSuchUpload, msg: "multipart upload not found"}
-	ErrNamespaceAlreadyExists = &Error{Kind: KindNamespaceAlreadyExists, msg: "namespace already exists"}
+	ErrNamespaceAlreadyExists = &Error{Kind: KindNamespaceAlreadyExists, msg: "namespace name is already taken"}
+	ErrNamespaceAlreadyOwned  = &Error{Kind: KindNamespaceAlreadyOwned, msg: "namespace already exists and is yours"}
 	ErrNamespaceNotEmpty      = &Error{Kind: KindNamespaceNotEmpty, msg: "namespace is not empty"}
 	ErrInvalidNamespaceName   = &Error{Kind: KindInvalidNamespaceName, msg: "invalid namespace name"}
+	ErrReservedNamespaceName  = &Error{Kind: KindInvalidNamespaceName, msg: "namespace name is reserved"}
 	ErrNoSuchTenant           = &Error{Kind: KindNoSuchTenant, msg: "tenant not found"}
 	ErrTenantAlreadyExists    = &Error{Kind: KindTenantAlreadyExists, msg: "tenant already exists"}
 	ErrTenantNotEmpty         = &Error{Kind: KindTenantNotEmpty, msg: "tenant still has namespaces"}
@@ -202,6 +209,8 @@ func (e *Error) S3Code() string {
 	case KindNoSuchUpload:
 		return "NoSuchUpload"
 	case KindNamespaceAlreadyExists:
+		return "BucketAlreadyExists"
+	case KindNamespaceAlreadyOwned:
 		return "BucketAlreadyOwnedByYou"
 	case KindNamespaceNotEmpty:
 		return "BucketNotEmpty"
@@ -262,7 +271,7 @@ func (e *Error) Status() int {
 	case KindNoSuchNamespace, KindNoSuchKey, KindNoSuchUpload, KindNoSuchTenant,
 		KindNoSuchCredential, KindNoSuchMember, KindNoSuchInvitation:
 		return http.StatusNotFound
-	case KindNamespaceAlreadyExists, KindNamespaceNotEmpty,
+	case KindNamespaceAlreadyExists, KindNamespaceAlreadyOwned, KindNamespaceNotEmpty,
 		KindTenantAlreadyExists, KindTenantNotEmpty:
 		return http.StatusConflict
 	case KindInvalidNamespaceName, KindInvalidTenantName,
