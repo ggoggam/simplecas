@@ -57,9 +57,18 @@ const (
 // trailerSignatureHeader closes a signed trailer.
 const trailerSignatureHeader = "x-amz-trailer-signature"
 
-// maxChunkHeaderLine bounds a chunk header, so a malformed body cannot make the
-// reader buffer without limit.
+// maxChunkHeaderLine bounds every line of the framing (a chunk header, the
+// CRLF after chunk data, a trailer), terminator included, so a malformed body
+// cannot make the reader buffer without limit. It is enforced as the line is
+// read, not after: see readLine.
 const maxChunkHeaderLine = 8 << 10
+
+// errLineTooLong refuses a framing line longer than maxChunkHeaderLine.
+var errLineTooLong = errors.New("aws-chunked: chunk header too long")
+
+// maxChunkSizeDigits bounds the hex size field of a chunk header. Sixteen
+// digits spell any int64; more can only be padding.
+const maxChunkSizeDigits = 16
 
 // maxChunkSize bounds a single declared chunk. The SDKs use 64KiB by default;
 // this leaves generous headroom while rejecting an absurd length.
@@ -68,6 +77,14 @@ const maxChunkSize = 1 << 30
 // maxTrailers bounds how many trailing headers a body may carry. S3 accepts a
 // single checksum; the headroom is for whatever else a client adds.
 const maxTrailers = 16
+
+// maxTrailerLines and maxTrailerBytes bound the trailer section as it is read,
+// before any of it is checked. Every line counts, a repeated name or a repeated
+// x-amz-trailer-signature included, and so does every byte of them.
+const (
+	maxTrailerLines = maxTrailers + 1 // and the trailer signature
+	maxTrailerBytes = 8 << 10
+)
 
 // isChunkedPayload reports whether the request body carries AWS chunk framing.
 //
@@ -145,7 +162,9 @@ type chunkedReader struct {
 
 // newChunkedReader decodes an unsigned body (STREAMING-UNSIGNED-PAYLOAD-TRAILER).
 func newChunkedReader(r io.Reader) *chunkedReader {
-	return &chunkedReader{br: bufio.NewReader(r), allowTrailers: true, trailers: map[string]string{}}
+	// The buffer is the line limit: readLine refuses a line that fills it.
+	br := bufio.NewReaderSize(r, maxChunkHeaderLine)
+	return &chunkedReader{br: br, allowTrailers: true, trailers: map[string]string{}}
 }
 
 // newSignedChunkedReader decodes a STREAMING-AWS4-HMAC-SHA256-PAYLOAD body,
@@ -260,6 +279,9 @@ func (c *chunkedReader) readChunkHeader() (int64, error) {
 	if sizeField == "" {
 		return 0, errors.New("aws-chunked: empty chunk size")
 	}
+	if len(sizeField) > maxChunkSizeDigits {
+		return 0, errors.New("aws-chunked: chunk size field too long")
+	}
 
 	size, err := strconv.ParseInt(sizeField, 16, 64)
 	if err != nil {
@@ -290,6 +312,7 @@ func (c *chunkedReader) readChunkHeader() (int64, error) {
 func (c *chunkedReader) consumeTrailers() error {
 	var canonical strings.Builder
 	var signature string
+	lines, size := 0, 0
 	for {
 		line, err := c.readLine()
 		if errors.Is(err, io.EOF) {
@@ -303,6 +326,13 @@ func (c *chunkedReader) consumeTrailers() error {
 		}
 		if !c.allowTrailers {
 			return errors.New("aws-chunked: trailers on a body signed without them")
+		}
+		lines, size = lines+1, size+len(line)
+		if lines > maxTrailerLines {
+			return errors.New("aws-chunked: too many trailers")
+		}
+		if size > maxTrailerBytes {
+			return errors.New("aws-chunked: trailers too long")
 		}
 		name, value, ok := strings.Cut(line, ":")
 		if !ok {
@@ -342,17 +372,22 @@ func (c *chunkedReader) expectCRLF() error {
 }
 
 // readLine reads one CRLF-terminated line, returning it without the terminator.
+//
+// The line is read in place in the reader's buffer, which is maxChunkHeaderLine
+// long: a line that has not ended by the time the buffer is full is refused
+// there, so no more than the limit is ever read or held for one line. This runs
+// before any chunk signature is checked, so it cannot trust the sender.
 func (c *chunkedReader) readLine() (string, error) {
-	line, err := c.br.ReadString('\n')
+	line, err := c.br.ReadSlice('\n')
+	if errors.Is(err, bufio.ErrBufferFull) || len(line) > maxChunkHeaderLine {
+		return "", errLineTooLong
+	}
 	if err != nil {
 		// A final line without a terminator is still usable.
-		if errors.Is(err, io.EOF) && line != "" {
-			return strings.TrimRight(line, "\r\n"), nil
+		if errors.Is(err, io.EOF) && len(line) > 0 {
+			return strings.TrimRight(string(line), "\r\n"), nil
 		}
 		return "", err
 	}
-	if len(line) > maxChunkHeaderLine {
-		return "", errors.New("aws-chunked: chunk header too long")
-	}
-	return strings.TrimRight(line, "\r\n"), nil
+	return strings.TrimRight(string(line), "\r\n"), nil
 }
