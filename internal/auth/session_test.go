@@ -76,13 +76,46 @@ func TestSessionVerifiedEmail(t *testing.T) {
 
 func TestSanitizeRedirect(t *testing.T) {
 	tests := []struct{ name, in, want string }{
-		{"same-site path", "/ui/x", "/ui/x"},
+		{"the PWA root", "/ui/", "/ui/"},
+		{"the PWA root without its slash", "/ui", "/ui"},
+		{"a path in the PWA", "/ui/x", "/ui/x"},
 		{"path with query", "/ui/x?a=1", "/ui/x?a=1"},
+		{"path with fragment", "/ui/x#top", "/ui/x#top"},
+		{"a dot inside a name is fine", "/ui/file..txt", "/ui/file..txt"},
+
 		{"protocol-relative is an open redirect", "//evil.example", "/ui/"},
 		{"absolute URL", "https://evil.example", "/ui/"},
+		{"absolute URL to this site's PWA", "https://evil.example/ui/", "/ui/"},
 		{"scheme-relative with path", "//evil.example/ui/", "/ui/"},
+		{"javascript URL", "javascript:alert(1)", "/ui/"},
 		{"empty", "", "/ui/"},
 		{"relative without a leading slash", "ui/x", "/ui/"},
+
+		// A browser reads a backslash as a slash, so each of these is
+		// "//evil.example" by the time it is followed.
+		{"backslash after the slash", `/\evil.example`, "/ui/"},
+		{"two backslashes", `/\\evil.example`, "/ui/"},
+		{"backslash first", `\\evil.example`, "/ui/"},
+		{"backslash inside the PWA", `/ui/\evil.example`, "/ui/"},
+		{"percent-encoded backslash", "/%5Cevil.example", "/ui/"},
+		{"percent-encoded backslash inside the PWA", "/ui/%5Cevil.example", "/ui/"},
+
+		// A browser strips tabs and newlines from a URL, closing up the
+		// slashes around them.
+		{"tab between the slashes", "/\t/evil.example", "/ui/"},
+		{"newline between the slashes", "/\n/evil.example", "/ui/"},
+		{"carriage return between the slashes", "/\r/evil.example", "/ui/"},
+		{"control character inside the PWA", "/ui/\x00x", "/ui/"},
+		{"percent-encoded newline inside the PWA", "/ui/%0Ax", "/ui/"},
+
+		// Same-origin, but not the PWA.
+		{"the API", "/api/tenants", "/ui/"},
+		{"the logout endpoint", "/auth/logout", "/ui/"},
+		{"a gateway namespace", "/photos/cat.jpg", "/ui/"},
+		{"a lookalike prefix", "/uix", "/ui/"},
+		{"a dot segment out of the PWA", "/ui/../api/tenants", "/ui/"},
+		{"an encoded dot segment out of the PWA", "/ui/%2e%2e/api/tenants", "/ui/"},
+		{"a single dot segment", "/ui/./x", "/ui/"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -146,11 +179,21 @@ func mustSession(t *testing.T, r *http.Request, cfg *config.OidcConfig) *Session
 // issueSession mints a signed session cookie the way a completed login does.
 func issueSession(t *testing.T, secret string, s Session) *http.Cookie {
 	t.Helper()
-	payload, err := json.Marshal(s)
+	token, err := signSession(secret, s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return setCookie(sessionCookie, sign(secret, payload), 3600, false)
+	return setCookie(sessionCookie, token, 3600, false)
+}
+
+// signedJSON signs v as it marshals, for payloads a real login never mints.
+func signedJSON(t *testing.T, v any) string {
+	t.Helper()
+	payload, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sign(testSecret, payload)
 }
 
 func TestCurrentSession(t *testing.T) {
@@ -215,21 +258,36 @@ func TestCurrentSession(t *testing.T) {
 		}
 	})
 
-	// The login flow's state is signed with the same key. Moved into the
-	// session cookie it parses as a session with an expiry and no identity,
-	// which must not count as signed in.
+	// The login flow's state is signed with the same key, so it must not be
+	// accepted when moved into the session cookie.
 	t.Run("flow state presented as a session", func(t *testing.T) {
-		payload, err := json.Marshal(flowState{
-			Provider: "google", CSRF: "c", Nonce: "n", PKCEVerifier: "v",
-			RedirectAfter: "/ui/", Expires: time.Now().Add(time.Hour).Unix(),
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
 		r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
-		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: sign(testSecret, payload)})
+		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: signedJSON(t, flowState{
+			Type: typeFlow, Provider: "google", CSRF: "c", Nonce: "n", PKCEVerifier: "v",
+			RedirectAfter: "/ui/", Expires: time.Now().Add(time.Hour).Unix(),
+		})})
 		if CurrentSession(r, cfg) != nil {
 			t.Error("a flow-state token must not be accepted as a session")
+		}
+	})
+
+	// The type tag decides, not the fields: a token tagged as flow state is
+	// refused even when it carries everything a session needs.
+	t.Run("a complete session tagged as flow state", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
+		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: signedJSON(t,
+			sessionToken{Type: typeFlow, Session: valid})})
+		if CurrentSession(r, cfg) != nil {
+			t.Error("a token of another type must not be accepted as a session")
+		}
+	})
+
+	// A session minted before tokens were tagged signs its holder out.
+	t.Run("untagged session", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
+		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: signedJSON(t, valid)})
+		if CurrentSession(r, cfg) != nil {
+			t.Error("an untagged token must not be accepted as a session")
 		}
 	})
 
@@ -261,6 +319,53 @@ func TestCookieAttributes(t *testing.T) {
 	cleared := clearCookie("n", true)
 	if cleared.MaxAge >= 0 || cleared.Value != "" {
 		t.Errorf("cleared cookie = %+v, want an immediate expiry", cleared)
+	}
+}
+
+// Over HTTPS both cookies carry the __Host- prefix, which a browser accepts
+// only with Secure, Path=/ and no Domain; over plain HTTP, where a Secure
+// cookie cannot be set, they keep their bare names.
+func TestCookiesTakeTheHostPrefixOverHTTPS(t *testing.T) {
+	for _, base := range []string{sessionCookie, flowCookie} {
+		c := setCookie(base, "v", 3600, true)
+		if c.Name != "__Host-"+base {
+			t.Errorf("HTTPS cookie name = %q, want the __Host- prefix", c.Name)
+		}
+		if !c.Secure || c.Path != "/" || c.Domain != "" {
+			t.Errorf("a __Host- cookie must be Secure, Path=/, with no Domain: %+v", c)
+		}
+		if cleared := clearCookie(base, true); cleared.Name != c.Name {
+			t.Errorf("clearing %q names %q", c.Name, cleared.Name)
+		}
+
+		if plain := setCookie(base, "v", 3600, false); plain.Name != base || plain.Secure {
+			t.Errorf("plain-HTTP cookie = %+v, want the bare name and no Secure", plain)
+		}
+	}
+}
+
+// Over HTTPS only the prefixed cookie is a session; a bare-named one, which a
+// sibling subdomain or a plain-HTTP response could have planted, is ignored.
+func TestCurrentSessionReadsTheHostPrefixedCookieOverHTTPS(t *testing.T) {
+	cfg := &config.OidcConfig{PublicURL: "https://cas.example.com", SessionSecret: testSecret}
+	token, err := signSession(testSecret, Session{
+		Issuer: "https://idp.test", Subject: "sub-1", Provider: "google",
+		Expires: time.Now().Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
+	r.AddCookie(setCookie(sessionCookie, token, 3600, true))
+	if s := mustSession(t, r, cfg); s.Subject != "sub-1" {
+		t.Errorf("session = %+v", s)
+	}
+
+	r = httptest.NewRequest(http.MethodGet, "/ui/", nil)
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: token})
+	if CurrentSession(r, cfg) != nil {
+		t.Error("over HTTPS a cookie without the __Host- prefix must be ignored")
 	}
 }
 

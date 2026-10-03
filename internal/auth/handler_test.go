@@ -237,11 +237,54 @@ func TestLoginPageRedirectsWhenAlreadySignedIn(t *testing.T) {
 	}
 }
 
+// A signed-in user who follows a crafted login link must not be bounced off
+// the PWA.
+func TestLoginPageRedirectStaysInThePWA(t *testing.T) {
+	reg := testRegistry(t, &Provider{ID: "google", Name: "Google"})
+	target := "/auth/login?" + url.Values{"redirect": {`/\evil.example`}}.Encode()
+
+	t.Run("signed in", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodGet, target, nil)
+		r.AddCookie(issueSession(t, testSecret, Session{
+			Issuer: "https://idp.test", Subject: "s", Provider: "google", Expires: time.Now().Add(time.Hour).Unix(),
+		}))
+		w := httptest.NewRecorder()
+		reg.Handler().ServeHTTP(w, r)
+		if got := w.Header().Get("Location"); got != "/ui/" {
+			t.Errorf("Location = %q, want /ui/", got)
+		}
+	})
+
+	t.Run("signed out", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		reg.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
+		body := w.Body.String()
+		if !strings.Contains(body, "/auth/oidc/google/start?redirect=%2Fui%2F") {
+			t.Errorf("the provider button must carry the default landing:\n%s", body)
+		}
+		if strings.Contains(body, "evil.example") {
+			t.Errorf("the rejected destination leaked into the page:\n%s", body)
+		}
+	})
+}
+
+// sessionCleared reports whether the response expires the named cookie.
+func sessionCleared(w *httptest.ResponseRecorder, name string) bool {
+	for _, c := range w.Result().Cookies() {
+		if c.Name == name && c.MaxAge < 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func TestLogoutClearsTheSession(t *testing.T) {
 	reg := testRegistry(t)
 
+	r := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	r.Header.Set("Sec-Fetch-Site", "same-origin")
 	w := httptest.NewRecorder()
-	reg.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/auth/logout", nil))
+	reg.Handler().ServeHTTP(w, r)
 
 	if w.Code != http.StatusSeeOther {
 		t.Fatalf("status = %d, want 303", w.Code)
@@ -249,14 +292,131 @@ func TestLogoutClearsTheSession(t *testing.T) {
 	if got := w.Header().Get("Location"); got != "/auth/login" {
 		t.Errorf("Location = %q", got)
 	}
-	var cleared bool
-	for _, c := range w.Result().Cookies() {
-		if c.Name == sessionCookie && c.MaxAge < 0 {
-			cleared = true
-		}
-	}
-	if !cleared {
+	if !sessionCleared(w, sessionCookie) {
 		t.Errorf("the session cookie was not cleared: %v", w.Result().Cookies())
+	}
+}
+
+// Over HTTPS the cookie to clear is the __Host- one the login set.
+func TestLogoutClearsTheHostPrefixedSessionOverHTTPS(t *testing.T) {
+	reg := testRegistry(t)
+	reg.cfg.PublicURL = "https://cas.example.com"
+
+	w := httptest.NewRecorder()
+	reg.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/auth/logout", nil))
+
+	if !sessionCleared(w, "__Host-"+sessionCookie) {
+		t.Errorf("the __Host- session cookie was not cleared: %v", w.Result().Cookies())
+	}
+}
+
+// Logging out is a state change, so a link or an image tag must not do it.
+func TestLogoutRefusesGET(t *testing.T) {
+	reg := testRegistry(t)
+
+	w := httptest.NewRecorder()
+	reg.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/auth/logout", nil))
+
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", w.Code)
+	}
+	if sessionCleared(w, sessionCookie) {
+		t.Error("a GET must not clear the session")
+	}
+}
+
+// Nor may a form on another site.
+func TestLogoutRefusesCrossSitePOST(t *testing.T) {
+	reg := testRegistry(t)
+
+	r := httptest.NewRequest(http.MethodPost, "/auth/logout", nil)
+	r.Header.Set("Sec-Fetch-Site", "cross-site")
+	r.Header.Set("Origin", "https://evil.example")
+	w := httptest.NewRecorder()
+	reg.Handler().ServeHTTP(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", w.Code)
+	}
+	if sessionCleared(w, sessionCookie) {
+		t.Error("a cross-site POST must not clear the session")
+	}
+}
+
+func TestRejectCrossSite(t *testing.T) {
+	var reached bool
+	handler := RejectCrossSite(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		reached = true
+	}))
+
+	tests := []struct {
+		name          string
+		method        string
+		secFetchSite  string
+		origin        string
+		wantForbidden bool
+	}{
+		{name: "same-origin POST", method: http.MethodPost, secFetchSite: "same-origin"},
+		{name: "same-origin DELETE", method: http.MethodDelete, secFetchSite: "same-origin"},
+		{name: "cross-site POST", method: http.MethodPost, secFetchSite: "cross-site", wantForbidden: true},
+		{name: "cross-site PUT", method: http.MethodPut, secFetchSite: "cross-site", wantForbidden: true},
+		{name: "cross-site PATCH", method: http.MethodPatch, secFetchSite: "cross-site", wantForbidden: true},
+		{name: "cross-site DELETE", method: http.MethodDelete, secFetchSite: "cross-site", wantForbidden: true},
+		// A sibling subdomain is the same site, so SameSite=Lax alone would
+		// still send it the cookie.
+		{name: "same-site POST from a sibling subdomain", method: http.MethodPost, secFetchSite: "same-site", wantForbidden: true},
+		{name: "user-initiated POST", method: http.MethodPost, secFetchSite: "none", wantForbidden: true},
+		// Sec-Fetch-Site decides when present, whatever Origin says.
+		{
+			name: "cross-site despite a matching origin", method: http.MethodPost,
+			secFetchSite: "cross-site", origin: "http://cas.test", wantForbidden: true,
+		},
+
+		// An older browser sends Origin but not Sec-Fetch-Site.
+		{name: "matching origin", method: http.MethodPost, origin: "http://cas.test"},
+		{name: "matching origin over https", method: http.MethodPost, origin: "https://cas.test"},
+		{name: "matching origin, different case", method: http.MethodPost, origin: "http://CAS.test"},
+		{name: "foreign origin", method: http.MethodPost, origin: "https://evil.example", wantForbidden: true},
+		{name: "origin on another port", method: http.MethodPost, origin: "http://cas.test:8080", wantForbidden: true},
+		{name: "lookalike origin", method: http.MethodPost, origin: "http://cas.test.evil.example", wantForbidden: true},
+		{name: "opaque origin", method: http.MethodPost, origin: "null", wantForbidden: true},
+		{name: "unparseable origin", method: http.MethodPost, origin: "http://%zz", wantForbidden: true},
+
+		// A client that is not a browser sends neither.
+		{name: "no browser headers", method: http.MethodPost},
+
+		// Reads are never refused.
+		{name: "cross-site GET", method: http.MethodGet, secFetchSite: "cross-site", origin: "https://evil.example"},
+		{name: "cross-site HEAD", method: http.MethodHead, secFetchSite: "cross-site"},
+		{name: "cross-site OPTIONS", method: http.MethodOptions, secFetchSite: "cross-site"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reached = false
+			r := httptest.NewRequest(tc.method, "http://cas.test/api/namespaces", nil)
+			if tc.secFetchSite != "" {
+				r.Header.Set("Sec-Fetch-Site", tc.secFetchSite)
+			}
+			if tc.origin != "" {
+				r.Header.Set("Origin", tc.origin)
+			}
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, r)
+
+			if tc.wantForbidden {
+				if reached || w.Code != http.StatusForbidden {
+					t.Errorf("reached=%v status=%d, want a 403", reached, w.Code)
+				}
+				var body map[string]string
+				if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || body["code"] != "AccessDenied" {
+					t.Errorf("body = %s, want a JSON AccessDenied", w.Body.String())
+				}
+				return
+			}
+			if !reached {
+				t.Errorf("status = %d; the request should have been let through", w.Code)
+			}
+		})
 	}
 }
 
@@ -471,7 +631,7 @@ func start(t *testing.T, reg *Registry, redirect string) (*url.URL, *http.Cookie
 	}
 	var flow *http.Cookie
 	for _, c := range w.Result().Cookies() {
-		if c.Name == flowCookie {
+		if c.Name == cookieName(flowCookie, secureCookies(reg.cfg)) {
 			flow = c
 		}
 	}
@@ -479,6 +639,40 @@ func start(t *testing.T, reg *Registry, redirect string) (*url.URL, *http.Cookie
 		t.Fatal("start did not set the flow cookie")
 	}
 	return authURL, flow
+}
+
+// Served over HTTPS, the whole flow runs on __Host- cookies.
+func TestFullLoginFlowOverHTTPS(t *testing.T) {
+	idp := newFakeIdP(t)
+	reg := flowRegistry(t, idp, &config.OidcConfig{PublicURL: "https://cas.example.com"})
+
+	authURL, flow := start(t, reg, "/ui/files")
+	if flow.Name != "__Host-"+flowCookie || !flow.Secure {
+		t.Errorf("flow cookie = %+v, want a Secure __Host- cookie", flow)
+	}
+	idp.nonce = authURL.Query().Get("nonce")
+	idp.claims = map[string]any{"email": "dev@example.com", "email_verified": true}
+
+	w := callback(t, reg, flow, url.Values{
+		"code": {"c"}, "state": {authURL.Query().Get("state")},
+	})
+	if got := w.Header().Get("Location"); got != "/ui/files" {
+		t.Fatalf("Location = %q, want the stashed destination", got)
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == "__Host-"+sessionCookie && c.MaxAge > 0 {
+			if !c.Secure || c.Path != "/" || c.Domain != "" {
+				t.Errorf("session cookie = %+v, want Secure, Path=/, no Domain", c)
+			}
+			r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
+			r.AddCookie(c)
+			if got := mustSession(t, r, reg.cfg); got.Subject != "sub-abc" {
+				t.Errorf("session = %+v", got)
+			}
+			return
+		}
+	}
+	t.Fatalf("no __Host- session cookie was issued: %v", w.Result().Cookies())
 }
 
 func TestStartRedirectsWithPKCEAndNonce(t *testing.T) {
@@ -522,6 +716,9 @@ func TestStartRedirectsWithPKCEAndNonce(t *testing.T) {
 	}
 	if flow.CSRF != q.Get("state") || flow.Nonce != q.Get("nonce") {
 		t.Error("the flow cookie must carry the same state and nonce that were sent")
+	}
+	if flow.Type != typeFlow {
+		t.Errorf("flow cookie typ = %q, want %q", flow.Type, typeFlow)
 	}
 	if flow.PKCEVerifier == "" {
 		t.Error("the PKCE verifier must be stashed for the exchange")
@@ -743,29 +940,43 @@ func TestCallbackFailureModes(t *testing.T) {
 	})
 
 	t.Run("expired flow", func(t *testing.T) {
-		payload, err := json.Marshal(flowState{
-			Provider: "fake", CSRF: "s", Nonce: "n", PKCEVerifier: "v",
+		stale := &http.Cookie{Name: flowCookie, Value: signedJSON(t, flowState{
+			Type: typeFlow, Provider: "fake", CSRF: "s", Nonce: "n", PKCEVerifier: "v",
 			RedirectAfter: "/ui/", Expires: time.Now().Add(-time.Minute).Unix(),
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		stale := &http.Cookie{Name: flowCookie, Value: sign(testSecret, payload)}
+		})}
 		w := callback(t, reg, stale, url.Values{"code": {"c"}, "state": {"s"}})
 		assertLoginError(t, w, "state_expired")
 	})
 
 	t.Run("flow belongs to another provider", func(t *testing.T) {
-		payload, err := json.Marshal(flowState{
-			Provider: "other", CSRF: "s", Nonce: "n", PKCEVerifier: "v",
+		mismatched := &http.Cookie{Name: flowCookie, Value: signedJSON(t, flowState{
+			Type: typeFlow, Provider: "other", CSRF: "s", Nonce: "n", PKCEVerifier: "v",
 			RedirectAfter: "/ui/", Expires: time.Now().Add(time.Hour).Unix(),
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		mismatched := &http.Cookie{Name: flowCookie, Value: sign(testSecret, payload)}
+		})}
 		w := callback(t, reg, mismatched, url.Values{"code": {"c"}, "state": {"s"}})
 		assertLoginError(t, w, "state_expired")
+	})
+
+	// Flow state without its type tag is refused even when every field would
+	// otherwise check out.
+	t.Run("untagged flow state", func(t *testing.T) {
+		untagged := &http.Cookie{Name: flowCookie, Value: signedJSON(t, flowState{
+			Provider: "fake", CSRF: "s", Nonce: "n", PKCEVerifier: "v",
+			RedirectAfter: "/ui/", Expires: time.Now().Add(time.Hour).Unix(),
+		})}
+		w := callback(t, reg, untagged, url.Values{"code": {"c"}, "state": {"s"}})
+		assertLoginError(t, w, "state_missing")
+	})
+
+	// A session cookie is signed with the same key, and is not flow state.
+	t.Run("session presented as flow state", func(t *testing.T) {
+		session := issueSession(t, testSecret, Session{
+			Issuer: "https://idp.test", Subject: "s", Provider: "fake",
+			Expires: time.Now().Add(time.Hour).Unix(),
+		})
+		moved := &http.Cookie{Name: flowCookie, Value: session.Value}
+		w := callback(t, reg, moved, url.Values{"code": {"c"}, "state": {"s"}})
+		assertLoginError(t, w, "state_missing")
 	})
 
 	t.Run("missing code", func(t *testing.T) {

@@ -109,6 +109,17 @@ async function req(input: string, init?: RequestInit): Promise<Response> {
   return res;
 }
 
+// Send the browser to the sign-in page, coming back here afterwards. Never
+// resolves: the page is going away, and a loader awaiting this must not go on
+// to render as though signed out in the meantime.
+function redirectToLogin(): Promise<never> {
+  const here = window.location.pathname + window.location.search;
+  window.location.assign(
+    `/auth/login?${new URLSearchParams({ redirect: here })}`,
+  );
+  return new Promise<never>(() => {});
+}
+
 export const api = {
   async stats(): Promise<Stats> {
     return (await req("/api/stats")).json();
@@ -136,29 +147,53 @@ export const api = {
     return res.json();
   },
 
-  // Probe multi-tenancy. `/api/tenants` succeeds only when OIDC is enabled and
-  // the caller is signed in; otherwise it rejects (401/403) and we fall back to
-  // the untenanted admin view. Never throws — the result always tells
-  // the UI which mode to render.
+  // Probe multi-tenancy from `/api/tenants`:
+  //   * 200 — OIDC is enabled and the caller is signed in: teams mode.
+  //   * 403 — OIDC is disabled, so there is nobody for a team to belong to:
+  //     the untenanted admin view.
+  //   * 401 — OIDC is enabled but the session is gone (expired, or signed out
+  //     in another tab): off to the login page, never the untenanted view.
+  // Anything else (network failure, 5xx, a non-JSON body) is a load failure
+  // and is thrown, like `me()`, rather than passed off as "untenanted".
   async tenancy(): Promise<
     { mode: "teams"; teams: Tenant[] } | { mode: "untenanted"; teams: [] }
   > {
+    let res: Response;
     try {
-      return { mode: "teams", teams: await this.listTenants() };
-    } catch {
-      return { mode: "untenanted", teams: [] };
+      res = await fetch("/api/tenants", {
+        headers: { accept: "application/json" },
+      });
+    } catch (e) {
+      throw new Error(`team request failed: ${(e as Error).message}`);
     }
+    if (res.status === 401) return redirectToLogin();
+    if (res.status === 403) return { mode: "untenanted", teams: [] };
+    if (!res.ok) throw new Error(`team request failed: ${res.status}`);
+    if (!res.headers.get("content-type")?.includes("application/json")) {
+      throw new Error("team request returned a non-JSON response");
+    }
+    return { mode: "teams", teams: await res.json() };
   },
 
-  // Sign out by hitting the server logout endpoint, which clears the session
-  // cookie and redirects to the login page.
-  logout(): void {
-    window.location.href = "/auth/logout";
+  // Sign out: POST to the logout endpoint, which clears the session cookie,
+  // then go to the login page. Logout is POST-only so that another site can't
+  // sign the user out with a link. A failure is thrown for the caller to
+  // report: navigating anyway would land on a login page that, with the
+  // session still valid, bounces straight back.
+  async logout(): Promise<void> {
+    let res: Response;
+    try {
+      res = await fetch("/auth/logout", { method: "POST" });
+    } catch (e) {
+      throw new Error(`sign-out failed: ${(e as Error).message}`);
+    }
+    if (!res.ok) throw new Error(`sign-out failed: ${res.status}`);
+    window.location.assign("/auth/login");
   },
 
   // Teams (multi-tenancy). These succeed only when OIDC is enabled and the
-  // caller is signed in; otherwise they reject (e.g. 403) and the UI falls
-  // back to the untenanted admin view. See README "Teams".
+  // caller is signed in; otherwise they reject (e.g. 403). `tenancy()` decides
+  // which view to show. See README "Teams".
   async listTenants(): Promise<Tenant[]> {
     return (await req("/api/tenants")).json();
   },
