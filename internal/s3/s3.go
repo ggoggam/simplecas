@@ -79,19 +79,26 @@ func New(database *db.DB, bucket *storage.Bucket, store *cas.Store, cfg *config.
 }
 
 // ServeHTTP verifies the request signature and resolves the tenant scope its
-// credential grants, then dispatches on the addressed level: service,
-// namespace, or object.
+// credential grants, holds the body to the digests its headers claim (see
+// payload.go), then dispatches on the addressed level: service, namespace, or
+// object.
 //
 // The resolved principal rides on the request context from here on, and
 // g.namespace is the only way a handler turns a namespace name into a row — so
 // every level below this point is tenant-scoped by construction.
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	p, err := g.authenticate(r)
+	p, signer, err := g.authenticate(r)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	body, err := newPayload(r, signer)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
 	}
 	r = r.WithContext(withPrincipal(r.Context(), p))
+	r.Body = body
 
 	namespace, key, err := splitPath(r.URL.EscapedPath())
 	if err != nil {
@@ -211,11 +218,19 @@ func contentTypeOf(r *http.Request) string {
 	return "application/octet-stream"
 }
 
-// readXMLBody reads a bounded request body for XML parsing.
+// readXMLBody reads a bounded request body for XML parsing. It reads to the
+// end, so the body's digests are checked before any of it is acted on, and a
+// failed check comes back as itself rather than as malformed XML.
 func readXMLBody(r *http.Request) ([]byte, error) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxXMLBody))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxXMLBody+1))
 	if err != nil {
+		if errors.As(err, new(*apperr.Error)) {
+			return nil, err
+		}
 		return nil, apperr.MalformedXML("%v", err)
+	}
+	if len(body) > maxXMLBody {
+		return nil, apperr.MalformedXML("body exceeds %d bytes", maxXMLBody)
 	}
 	return body, nil
 }
@@ -698,12 +713,13 @@ func (g *Gateway) putObject(w http.ResponseWriter, r *http.Request, namespace, k
 		g.writeError(w, r, err)
 		return
 	}
-	etag, _, err := g.cas.Put(r.Context(), ns.ID, key, contentTypeOf(r), bodyReader(r), declaredLength(r))
+	etag, _, err := g.cas.Put(r.Context(), ns.ID, key, contentTypeOf(r), r.Body, declaredLength(r))
 	if err != nil {
 		g.writeError(w, r, err)
 		return
 	}
 	w.Header().Set("ETag", quotedETag(etag))
+	setChecksumHeaders(w, r)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -931,13 +947,14 @@ func (g *Gateway) uploadPart(w http.ResponseWriter, r *http.Request, namespace, 
 
 	// Parts stay in staging under their own part-level digest; dedup happens
 	// once at completion, when the hash of the whole object is known.
-	staged, err := g.cas.PutPart(r.Context(), upload, int32(partNumber), bodyReader(r), declaredLength(r))
+	staged, err := g.cas.PutPart(r.Context(), upload, int32(partNumber), r.Body, declaredLength(r))
 	if err != nil {
 		g.writeError(w, r, err)
 		return
 	}
 
 	w.Header().Set("ETag", quotedETag(staged.Hash))
+	setChecksumHeaders(w, r)
 	w.WriteHeader(http.StatusOK)
 }
 

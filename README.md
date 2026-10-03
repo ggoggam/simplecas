@@ -380,13 +380,29 @@ A signed request is good for **15 minutes** either side of the server's clock
 date as `x-amz-date` and the `s3` service, so a captured request cannot be
 replayed later. Keep server clocks synced.
 
+A signature covers the headers, so the body is held to what they claim about it,
+in the same pass that stages it: nothing is committed, and the staged bytes are
+discarded, unless every claim holds.
+
+- `x-amz-content-sha256` is required on a signed request (`InvalidRequest`
+  without it). A hex digest must match the body (`XAmzContentSHA256Mismatch`);
+  `UNSIGNED-PAYLOAD` leaves the body unsigned, as on S3.
+- `Content-MD5` (`InvalidDigest` if malformed) and `x-amz-checksum-crc32`,
+  `-crc32c`, `-crc64nvme`, `-sha1` and `-sha256`, as headers or as an
+  `aws-chunked` trailer announced in `x-amz-trailer`, must match the body
+  (`BadDigest`). A matching checksum is echoed on the `PutObject` and
+  `UploadPart` response. The AWS CLI sends CRC64NVME by default.
+
 Request bodies framed as **`aws-chunked`** are decoded before hashing. The AWS
 SDKs use that framing whenever they cannot hash a payload up front — an
 unseekable stream, or a request carrying a trailing checksum — so a server that
-ignored it would store the chunk headers as part of the object. Chunk signatures
-themselves are not verified; the credential on the request line already is. The
-decoded body must match `x-amz-decoded-content-length` and end with the final
-zero-length chunk, so a cut-off upload is rejected rather than stored short.
+ignored it would store the chunk headers as part of the object. Under
+`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]` every chunk signature, and the
+trailer signature, is verified in a chain from the request's
+(`SignatureDoesNotMatch`); `STREAMING-UNSIGNED-PAYLOAD-TRAILER`, which the CLI
+sends over TLS, is held to its trailing checksum instead. The decoded body must
+match `x-amz-decoded-content-length` and end with the final zero-length chunk,
+so a cut-off upload is rejected rather than stored short.
 
 S3 subresources the gateway does not implement (`PUT`/`DELETE ?tagging`, `?acl`, `?cors`,
 `?lifecycle`, …) are answered **`501 NotImplemented`** instead of falling through
