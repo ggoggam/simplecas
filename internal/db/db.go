@@ -1,6 +1,6 @@
-// Package db is the Postgres metadata store: namespaces, tenants, the global
-// blob table with its refcounts, objects, multipart uploads, and the queries
-// the garbage collector runs.
+// Package db is the Postgres metadata store: namespaces, users, sign-in
+// sessions, tenants, the global blob table with its refcounts, objects,
+// multipart uploads, and the queries the garbage collector runs.
 //
 // Every server instance is stateless and shares this database, so the
 // concurrency-sensitive operations (claiming and releasing blob references,
@@ -158,6 +158,17 @@ type Invitation struct {
 	InvitedBy string
 	CreatedAt time.Time
 	ExpiresAt *time.Time
+}
+
+// Session is one of a user's sign-ins, as their sessions list shows it. The
+// user agent and IP are what the signing-in request sent, kept for display.
+type Session struct {
+	ID         uuid.UUID
+	CreatedAt  time.Time
+	LastSeenAt time.Time
+	ExpiresAt  time.Time
+	UserAgent  string
+	IP         string
 }
 
 // Stats is the dedup accounting the admin API reports. The JSON names are part

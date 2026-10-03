@@ -20,10 +20,10 @@ const gcBatch = 1000
 const minGCInterval = 5 * time.Second
 
 // RunGC reclaims space until ctx is cancelled: unreferenced blobs, orphaned
-// staging files, and abandoned multipart uploads. Every pass is best-effort —
-// a failure is logged and retried on the next tick rather than ending the loop,
-// because a transient database or backend blip must not silently stop
-// reclamation for the lifetime of the process.
+// staging files, abandoned multipart uploads, and expired sign-in sessions.
+// Every pass is best-effort — a failure is logged and retried on the next tick
+// rather than ending the loop, because a transient database or backend blip
+// must not silently stop reclamation for the lifetime of the process.
 func (s *Store) RunGC(ctx context.Context) {
 	interval := time.Duration(s.gc.IntervalSecs) * time.Second
 	if interval < minGCInterval {
@@ -45,6 +45,7 @@ func (s *Store) RunGC(ctx context.Context) {
 		s.sweepBlobs(ctx)
 		s.sweepStaging(ctx)
 		s.sweepMultipart(ctx)
+		s.sweepSessions(ctx)
 	}
 }
 
@@ -145,4 +146,20 @@ func (s *Store) sweepMultipart(ctx context.Context) {
 	}
 	s.log.Info("gc: removed abandoned multipart uploads",
 		"uploads", swept.Uploads, "parts", len(swept.StagingKeys))
+}
+
+// sweepSessions deletes expired sign-in sessions. Revoking a session deletes
+// its row there and then, so expired ones are all that is left to clear. With
+// OIDC off there are none, and this is one empty index scan.
+func (s *Store) sweepSessions(ctx context.Context) {
+	swept, err := s.db.SweepSessions(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			s.log.Warn("session sweep failed", "err", err)
+		}
+		return
+	}
+	if swept > 0 {
+		s.log.Info("gc: removed expired sessions", "swept", swept)
+	}
 }

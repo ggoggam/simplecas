@@ -37,8 +37,8 @@ secret_access_key = "simplecas-secret"
 
 # OIDC single sign-on for the human surface (the /ui PWA and /api admin API).
 # Disabled by default; the S3 gateway at / keeps its own SigV4 auth regardless.
-# Sessions are stateless signed cookies, so no session table and no shared
-# state — every instance behind the load balancer just needs the same
+# Sessions are rows in Postgres referred to by a signed cookie, so they can be
+# listed and revoked; every instance behind the load balancer needs the same
 # session_secret. Uncomment and fill in to require sign-in:
 #
 # [oidc]

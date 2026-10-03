@@ -63,6 +63,25 @@ export interface Invitation {
   expires_at: string | null;
 }
 
+/**
+ * One of the signed-in user's sessions: a browser they signed in from. It
+ * stays live until it expires, signs out, or is revoked from here.
+ */
+export interface Session {
+  /** Addresses the session in the revoke call. */
+  id: string;
+  created_at: string;
+  /** Moved forward at most every few minutes, so "now" means "recently". */
+  last_seen_at: string;
+  expires_at: string;
+  /** What the browser sent when it signed in; display only. */
+  user_agent: string;
+  /** The connection's address; behind a reverse proxy, the proxy's. */
+  ip: string;
+  /** The session making this request. */
+  current: boolean;
+}
+
 /** An S3 access key belonging to a team. Never carries the secret. */
 export interface Credential {
   access_key_id: string;
@@ -189,6 +208,32 @@ export const api = {
     }
     if (!res.ok) throw new Error(`sign-out failed: ${res.status}`);
     window.location.assign("/auth/login");
+  },
+
+  // The caller's own sessions. Like the team calls, these need sign-in, and
+  // reject with 403 when OIDC is off.
+  async listSessions(): Promise<Session[]> {
+    return (await req("/api/me/sessions")).json();
+  },
+
+  // Revoking a session signs that browser out on its next request.
+  async revokeSession(id: string): Promise<void> {
+    await req(`/api/me/sessions/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
+  },
+
+  // Sign out everywhere but here. Resolves to how many sessions ended.
+  async revokeOtherSessions(): Promise<number> {
+    const res = await req("/api/me/sessions/revoke-others", { method: "POST" });
+    return (await res.json()).revoked;
+  },
+
+  // Sign out everywhere, here included: end every session, then log out so
+  // this browser drops its now-dead cookie and lands on the login page.
+  async signOutEverywhere(): Promise<void> {
+    await req("/api/me/sessions/revoke-all", { method: "POST" });
+    await this.logout();
   },
 
   // Teams (multi-tenancy). These succeed only when OIDC is enabled and the

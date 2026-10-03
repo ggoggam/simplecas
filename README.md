@@ -177,11 +177,12 @@ There are two independent auth mechanisms for the two kinds of client:
 
 ### OIDC single sign-on
 
-*Authentication* is deliberately lean and stateless: **any identity that
-authenticates at a configured provider is admitted** (optionally narrowed by an
-email allowlist), and the session is a stateless **HMAC-signed cookie** carrying
-the ID token's issuer and subject — no session table, no server-side revocation.
-Every instance behind a load balancer only needs the same `session_secret`.
+*Authentication* is deliberately lean: **any identity that authenticates at a
+configured provider is admitted** (optionally narrowed by an email allowlist),
+and each sign-in opens a **server-side session** — a row in the `sessions` table
+plus an **HMAC-signed cookie** carrying the ID token's issuer and subject and a
+random token naming the row. Sessions live in Postgres, so every instance behind
+a load balancer sees the same ones and only needs the same `session_secret`.
 *Authorization* (who may see which namespaces) is layered on top via **teams** —
 see below.
 
@@ -227,6 +228,40 @@ When `public_url` is `https://…` the session and login-flow cookies are named
 `Domain`, so no other subdomain can set or overwrite them. Over plain HTTP
 (local development) they keep the bare names `scas_session` and
 `scas_oidc_flow`. Changing `public_url` between the two signs everyone out.
+
+**Sessions.** The table stores only the SHA-256 of each cookie's token, so
+reading it gives nobody a usable session. Every request to `/ui`, `/api` or
+`/auth/me` checks the cookie's signature and then that its row still exists and
+has not expired; that check is one indexed query, which also yields the user id
+the admin API authorizes on, so it costs no more round trips than before.
+`last_seen_at` is moved forward by the same query at most once every five
+minutes, so a busy session is not a write per request. A session lasts
+`session_ttl_secs` and is never extended.
+
+Revoking a session deletes its row, and the browser holding it is signed out on
+its next request. `POST /auth/logout` deletes the current session's row as well
+as clearing the cookie, so a copy of the cookie kept elsewhere is dead too; if
+the row cannot be deleted, logout fails and keeps the cookie, so it can be
+retried. Users list and revoke their own sessions from the PWA (**Sessions** in
+the header) or the API:
+
+| Endpoint | |
+| --- | --- |
+| `GET /api/me/sessions` | your unexpired sessions, most recently used first: `id`, `user_agent`, `ip`, `created_at`, `last_seen_at`, `expires_at`, and `current` on the one making the request |
+| `DELETE /api/me/sessions/{id}` | revoke one; another user's session id is `404 NoSuchSession`, like one that doesn't exist |
+| `POST /api/me/sessions/revoke-others` | sign out everywhere else; returns `{"revoked": n}` |
+| `POST /api/me/sessions/revoke-all` | sign out everywhere, this session included (the PWA then calls logout to clear the cookie) |
+
+The user agent and IP are what the signing-in browser sent, truncated, and are
+display only. The IP is the connection's peer address: behind a reverse proxy
+that is the proxy's, since a forwarded header is the client's own word. With
+OIDC off there are no sessions, and these endpoints answer `403` like the other
+endpoints that need a signed-in user. Expired rows are deleted by the
+background GC loop.
+
+> **Upgrading to server-side sessions:** cookies issued before migration
+> `0005_sessions` carry no session token and have no row, so they are refused
+> and everyone signs in once.
 
 **Cross-site requests.** Every `POST`, `PUT`, `PATCH` or `DELETE` (any method
 but `GET`, `HEAD` and `OPTIONS`) to `/api` or `/auth` is refused with `403
@@ -277,8 +312,8 @@ secret in a namespace name.
 
 - **Users** are keyed by the provider's **(issuer, subject)** — the ID token's
   `iss` and `sub`, which a provider never reassigns. A `users` row is created
-  the first time an identity calls `/api`. Email and name are stored for
-  display only; nothing authorizes on them.
+  the first time an identity signs in, and its email and name are refreshed at
+  each sign-in. They are stored for display only; nothing authorizes on them.
 - **Membership** belongs to a user. Owners **invite by email**; an invitation
   grants nothing until a signed-in user whose provider has **verified** that
   address accepts it, and the membership then belongs to that user's account,
@@ -499,12 +534,12 @@ internal/
   apperr/            error type carrying an S3 code + HTTP status; XML and JSON rendering
   config/            layered TOML + SIMPLECAS__ env config; backend selection
   storage/           blob backend construction + the blobs/ and staging/ layout
-  db/                all SQL: namespaces, users, tenants + invitations, blobs/refcounts, objects, multipart, GC
+  db/                all SQL: namespaces, users, sessions, tenants + invitations, blobs/refcounts, objects, multipart, GC
   db/migrations/     embedded SQL migrations (run automatically on boot)
   cas/               content-addressed write path (stage → claim → commit) and the GC loop
   s3/                S3 gateway: handlers, XML wire types, SigV4 verification
   api/               JSON admin API for the PWA
-  auth/              OIDC sign-in: discovery, signed-cookie sessions, guard middleware
+  auth/              OIDC sign-in: discovery, database-backed sessions behind signed cookies, guard middleware
   ui/                serves the embedded PWA
   server/            route precedence across the four surfaces + request logging
   reserved/          namespace names kept back from creation (routed segments, health probes)
