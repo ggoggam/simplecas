@@ -94,9 +94,9 @@ type AuthConfig struct {
 // /ui and the JSON admin API at /api). The S3 gateway keeps its own SigV4 auth —
 // OIDC is a browser flow and does not apply to machine clients.
 //
-// Sessions are stateless: a successful login sets an HMAC-signed cookie carrying
-// the identity and expiry, so there is no session table and no shared state
-// across instances (they only need the same SessionSecret).
+// A successful login records a row in the sessions table and sets an
+// HMAC-signed cookie that refers to it, so a session can be revoked. Instances
+// share sessions through the database and need the same SessionSecret.
 type OidcConfig struct {
 	Enabled bool `toml:"enabled"`
 	// PublicURL is this instance's public base URL (e.g. https://cas.example.com),

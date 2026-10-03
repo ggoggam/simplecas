@@ -29,9 +29,11 @@ func FromContext(ctx context.Context) *Session {
 	return s
 }
 
-// WithSession attaches a caller to ctx. The guard uses this after verifying a
-// session cookie; it is exported so an alternative authentication front-end —
-// or a test — can establish a caller the same way.
+// WithSession attaches a caller to ctx. The guard uses this after checking a
+// session cookie against its row; it is exported so an alternative
+// authentication front-end — or a test — can establish a caller the same way.
+// A Session without an ID or UserID has not been checked against the sessions
+// table, and the admin API resolves its user by identity instead.
 func WithSession(ctx context.Context, s *Session) context.Context {
 	return context.WithValue(ctx, sessionContextKey{}, s)
 }
@@ -103,10 +105,21 @@ func sameOrigin(req *http.Request) bool {
 
 // Guard protects the /ui and /api surfaces. An unauthenticated API call gets a
 // 401 with a JSON body; an unauthenticated page load is redirected to the login
-// page with its intended destination preserved.
+// page with its intended destination preserved. A revoked or lapsed session is
+// unauthenticated from its next request on.
 func (r *Registry) Guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if session := CurrentSession(req, r.cfg); session != nil {
+		session, err := r.authenticate(req)
+		if err != nil {
+			r.log.Error("session check failed", "path", req.URL.Path, "err", err)
+			if strings.HasPrefix(req.URL.Path, "/api") {
+				apperr.WriteJSON(w, err)
+			} else {
+				http.Error(w, "could not check the session", http.StatusInternalServerError)
+			}
+			return
+		}
+		if session != nil {
 			next.ServeHTTP(w, req.WithContext(WithSession(req.Context(), session)))
 			return
 		}
@@ -142,8 +155,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func (r *Registry) handleLogin(w http.ResponseWriter, req *http.Request) {
 	dest := sanitizeRedirect(req.URL.Query().Get("redirect"))
-	// Already signed in: nothing to do here.
-	if CurrentSession(req, r.cfg) != nil {
+	// Already signed in: nothing to do here. It has to be the live session
+	// and not just a genuine cookie: the PWA sends a revoked session here,
+	// and bouncing it back would loop. If the check fails, the page is shown.
+	if session, err := r.authenticate(req); err == nil && session != nil {
 		http.Redirect(w, req, dest, http.StatusSeeOther)
 		return
 	}
@@ -192,15 +207,30 @@ const loginPageTemplate = `<!doctype html><html lang="en"><head><meta charset="u
 	`<style>` + loginPageStyle + `</style></head>` +
 	`<body><div class="card"><h1>simplecas</h1>%s%s</div></body></html>`
 
-// handleLogout clears the session. The redirect suits a plain form post; the
-// PWA posts with fetch and then navigates to the login page itself.
+// handleLogout ends the session: it deletes the row, so the cookie is dead
+// wherever a copy of it is, and clears the cookie. The redirect suits a plain
+// form post; the PWA posts with fetch and then navigates to the login page
+// itself.
+//
+// If the row cannot be deleted the cookie is kept and the failure reported, so
+// a retry can still end the session rather than leave it live but forgotten.
 func (r *Registry) handleLogout(w http.ResponseWriter, req *http.Request) {
+	if err := r.closeSession(req); err != nil {
+		r.log.Error("could not end session", "err", err)
+		apperr.WriteJSON(w, err)
+		return
+	}
 	http.SetCookie(w, clearCookie(sessionCookie, secureCookies(r.cfg)))
 	http.Redirect(w, req, "/auth/login", http.StatusSeeOther)
 }
 
 func (r *Registry) handleMe(w http.ResponseWriter, req *http.Request) {
-	session := CurrentSession(req, r.cfg)
+	session, err := r.authenticate(req)
+	if err != nil {
+		r.log.Error("session check failed", "path", req.URL.Path, "err", err)
+		apperr.WriteJSON(w, err)
+		return
+	}
 	if session == nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{
 			"code":    "Unauthorized",
@@ -271,7 +301,8 @@ func (r *Registry) handleStart(w http.ResponseWriter, req *http.Request) {
 
 // handleCallback completes a login: it validates the flow state and CSRF token,
 // exchanges the code, verifies the ID token's signature and nonce, applies the
-// allowlist, and opens a session.
+// allowlist, and opens a session: a sessions row, and the cookie that refers
+// to it.
 func (r *Registry) handleCallback(w http.ResponseWriter, req *http.Request) {
 	query := req.URL.Query()
 	if providerErr := query.Get("error"); providerErr != "" {
@@ -312,8 +343,9 @@ func (r *Registry) handleCallback(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	token, err := signSession(r.cfg.SessionSecret, *session)
+	token, err := r.openSession(req, session)
 	if err != nil {
+		r.log.Error("could not open session", "provider", providerID, "err", err)
 		r.loginError(w, req, "server_error")
 		return
 	}
