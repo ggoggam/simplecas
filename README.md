@@ -245,8 +245,16 @@ the gateway's own headers instead (see [S3 gateway](#s3-gateway)).
 When OIDC is enabled the human plane (`/ui` + `/api`) is **multi-tenant**: each
 namespace is owned by a **team**, and a signed-in user sees and touches only the
 namespaces of teams they belong to. Isolation is enforced per request; a
-namespace a caller can't access is reported as *not found*, so existence never
-leaks across teams.
+namespace a caller can't access is reported as *not found*, so reads, writes and
+listings never reveal another team's namespaces.
+
+The one exception is creation. Namespace names are **global** (they are S3
+bucket names), so creating one whose name is taken fails `409` even when another
+team holds it, and that answer necessarily confirms the name is in use. It says
+nothing more: another team's namespace and an unowned one get the same
+`BucketAlreadyExists`, and only a namespace the caller can already reach comes
+back `BucketAlreadyOwnedByYou`. Real S3 behaves the same way. Don't put anything
+secret in a namespace name.
 
 - **Users** are keyed by the provider's **(issuer, subject)** — the ID token's
   `iss` and `sub`, which a provider never reassigns. A `users` row is created
@@ -306,8 +314,10 @@ The S3 gateway is tenant-scoped too, via access keys minted per team. A request
 signed with one of them can address **only that team's namespaces**; every other
 name — another team's, an unowned one, or one that doesn't exist — comes back
 `NoSuchBucket`, so the gateway never confirms that a namespace it won't serve
-is there. `CopyObject` resolves *both* source and destination in that scope, so
-it can't be used to pull another team's object into your own namespace.
+is there, except that `CreateBucket` on a taken name answers
+`BucketAlreadyExists` (see [Teams](#teams-multi-tenancy)). `CopyObject` resolves
+*both* source and destination in that scope, so it can't be used to pull another
+team's object into your own namespace.
 
 | Endpoint | |
 | --- | --- |
@@ -326,7 +336,8 @@ team key.
 
 The credential in `simplecas.toml` remains a **superuser**: it is matched before
 the per-team lookup (so a database row can never shadow or impersonate it) and
-it addresses every namespace, owned or not. Treat it as a root key.
+it addresses every namespace, owned or not, so a `CreateBucket` clash is always
+`BucketAlreadyOwnedByYou` for it. Treat it as a root key.
 
 > Secrets in `tenant_credentials` are stored **recoverably, not hashed**. SigV4
 > is symmetric HMAC — the server has to re-derive the signing key from the
@@ -461,6 +472,7 @@ internal/
   auth/              OIDC sign-in: discovery, signed-cookie sessions, guard middleware
   ui/                serves the embedded PWA
   server/            route precedence across the four surfaces + request logging
+  reserved/          namespace names kept back from creation (routed segments, health probes)
   testdb/            per-test Postgres schemas (test-only)
 e2e/                 AWS CLI end-to-end tests against the assembled server
 web/                 Vite + React + Tailwind PWA (shadcn/ui, ggoggam/shadcn-treeview)
@@ -473,9 +485,12 @@ mise.toml            toolchain pins + dev/build/test tasks (`mise tasks`)
 Requests are dispatched on their first path segment rather than by
 `http.ServeMux`, because `ServeMux` cleans request paths — collapsing `//` and
 resolving `.` and `..` segments with a redirect — and S3 object keys may
-legitimately contain those sequences. The reserved first segments are therefore
-`api` and `ui`, plus `auth` whenever sign-in is enabled; those namespace names
-are unavailable.
+legitimately contain those sequences. The routed first segments are therefore
+`api` and `ui`, plus `auth` whenever sign-in is enabled. Creating a namespace
+named `api`, `ui`, `auth`, `healthz` or `readyz` is refused with
+`InvalidBucketName` whether or not sign-in is on (the last two are held for
+health endpoints); the list lives in `internal/reserved`. A namespace created
+with one of these names before it was reserved is left as it is.
 
 ### Tests
 

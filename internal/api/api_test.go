@@ -294,7 +294,8 @@ func TestNamespaceEndpointsUntenanted(t *testing.T) {
 		"Content-Type", "application/json")
 	mustStatus(t, w, http.StatusCreated)
 
-	// Duplicate.
+	// Duplicate. The untenanted plane reaches every namespace, so it owns any
+	// name it clashes with.
 	w = f.do(t, http.MethodPost, "/api/namespaces", `{"name":"photos"}`)
 	mustStatus(t, w, http.StatusConflict)
 	if code, _ := errorBody(t, w); code != "BucketAlreadyOwnedByYou" {
@@ -306,6 +307,15 @@ func TestNamespaceEndpointsUntenanted(t *testing.T) {
 	mustStatus(t, w, http.StatusBadRequest)
 	if code, _ := errorBody(t, w); code != "InvalidBucketName" {
 		t.Errorf("code = %q", code)
+	}
+
+	// Reserved names: the router would never let S3 reach them.
+	for _, name := range []string{"api", "auth", "healthz", "readyz"} {
+		w = f.do(t, http.MethodPost, "/api/namespaces", `{"name":"`+name+`"}`)
+		mustStatus(t, w, http.StatusBadRequest)
+		if code, message := errorBody(t, w); code != "InvalidBucketName" || !strings.Contains(message, "reserved") {
+			t.Errorf("create %s: code = %q, message = %q", name, code, message)
+		}
 	}
 
 	// Malformed JSON.

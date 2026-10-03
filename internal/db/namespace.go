@@ -94,6 +94,11 @@ func (d *DB) GetNamespaceForTenant(ctx context.Context, name string, tenantID in
 
 // CreateNamespace inserts a namespace owned by tenantID, or unowned when
 // tenantID is nil.
+//
+// Names are unique across every tenant, so a clash may be with a namespace the
+// caller cannot see. It is reported as ErrNamespaceAlreadyExists whoever owns
+// the name; the caller decides, through its own scoping, whether to tell its
+// principal the namespace is theirs.
 func (d *DB) CreateNamespace(ctx context.Context, name string, tenantID *int64) error {
 	tag, err := d.pool.Exec(ctx,
 		"INSERT INTO namespaces (name, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",

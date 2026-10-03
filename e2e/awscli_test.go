@@ -34,6 +34,7 @@ func TestBucketCommands(t *testing.T) {
 	aws.fails("BucketAlreadyOwnedByYou", "s3api", "create-bucket", "--bucket", "alpha")
 	aws.fails("404", "s3api", "head-bucket", "--bucket", "missing")
 	aws.fails("InvalidBucketName", "s3", "mb", "s3://Not_Valid")
+	aws.fails("InvalidBucketName", "s3api", "create-bucket", "--bucket", "healthz")
 
 	file := writeFile(t, t.TempDir(), "k.txt", []byte("keep me"))
 	aws.run("s3", "cp", file, "s3://alpha/k.txt")
@@ -646,8 +647,9 @@ func TestAnonymousAccessWhenAuthIsOff(t *testing.T) {
 	sameBytes(t, "anonymous download", []byte(aws.run("s3", "cp", "s3://open/f", "-", anon)), content)
 }
 
-// A team key sees only its team's buckets, owns the buckets it creates, and
-// cannot copy out of a bucket it cannot see.
+// A team key sees only its team's buckets, owns the buckets it creates,
+// cannot copy out of a bucket it cannot see, and is told a taken name is its
+// own only when it is.
 func TestTeamCredential(t *testing.T) {
 	t.Parallel()
 	s := newStack(t)
@@ -680,6 +682,11 @@ func TestTeamCredential(t *testing.T) {
 	team.fails("NoSuchBucket", "s3", "ls", "s3://admin-only/")
 	team.fails("NoSuchBucket", "s3api", "copy-object", "--bucket", "team-bucket", "--key", "stolen",
 		"--copy-source", "admin-only/secret")
+
+	// Names are global: the team learns admin-only is taken, and nothing more.
+	team.fails("BucketAlreadyExists", "s3api", "create-bucket", "--bucket", "admin-only")
+	team.fails("BucketAlreadyOwnedByYou", "s3api", "create-bucket", "--bucket", "team-bucket")
+	admin.fails("BucketAlreadyOwnedByYou", "s3api", "create-bucket", "--bucket", "team-bucket")
 
 	if got := lsNames(admin.run("s3", "ls")); !slices.Equal(got, []string{"admin-only", "team-bucket"}) {
 		t.Errorf("admin s3 ls = %v, want both buckets", got)

@@ -16,6 +16,8 @@
 // namespaces, with everything else reported as NoSuchBucket. See principal.go —
 // g.namespace is the single chokepoint that turns a name from a request into a
 // row, so no handler here can resolve a namespace outside the caller's scope.
+// CreateBucket is the one place a name outside it shows: names are global, so a
+// taken one answers BucketAlreadyExists (see nameTaken).
 //
 // The gateway parses the request path itself rather than going through
 // http.ServeMux. ServeMux cleans paths — collapsing "//" and resolving "."
@@ -25,6 +27,7 @@
 package s3
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -40,6 +43,7 @@ import (
 	"github.com/ggoggam/simplecas/internal/cas"
 	"github.com/ggoggam/simplecas/internal/config"
 	"github.com/ggoggam/simplecas/internal/db"
+	"github.com/ggoggam/simplecas/internal/reserved"
 	"github.com/ggoggam/simplecas/internal/storage"
 )
 
@@ -438,6 +442,10 @@ func (g *Gateway) createNamespace(w http.ResponseWriter, r *http.Request, namesp
 		g.writeError(w, r, apperr.ErrInvalidNamespaceName)
 		return
 	}
+	if reserved.Name(namespace) {
+		g.writeError(w, r, apperr.ErrReservedNamespaceName)
+		return
+	}
 	// A tenanted credential owns what it creates, so the namespace is visible
 	// to that team in /ui and /api too. The admin credential has no tenant
 	// identity to attribute, so its namespaces stay unowned.
@@ -447,11 +455,38 @@ func (g *Gateway) createNamespace(w http.ResponseWriter, r *http.Request, namesp
 		return
 	}
 	if err := g.db.CreateNamespace(r.Context(), namespace, p.tenantID); err != nil {
+		if errors.Is(err, apperr.ErrNamespaceAlreadyExists) {
+			err = g.nameTaken(r, namespace)
+		}
 		g.writeError(w, r, err)
 		return
 	}
 	w.Header().Set("Location", "/"+namespace)
 	w.WriteHeader(http.StatusOK)
+}
+
+// nameTaken answers a CreateBucket whose name already exists. As on S3, names
+// are global, so the clash itself reveals that the name is in use; the answer
+// says no more than that unless the namespace is the caller's.
+//
+// "The caller's" means the name resolves through g.namespace, the same scope
+// every other request is held to: a team key owns its team's namespaces, and
+// the admin credential, which addresses every namespace, owns them all.
+// BucketAlreadyOwnedByYou tells a create-if-missing client it can go ahead and
+// use the bucket, which is true exactly when g.namespace would serve it.
+func (g *Gateway) nameTaken(r *http.Request, name string) error {
+	_, err := g.namespace(r, name)
+	switch {
+	case err == nil:
+		return apperr.ErrNamespaceAlreadyOwned
+	case errors.Is(err, apperr.ErrNoSuchNamespace):
+		// A team key clashing with another team's namespace or an unowned
+		// one. Also a namespace deleted since the insert clashed, which is
+		// gone either way.
+		return apperr.ErrNamespaceAlreadyExists
+	default:
+		return err
+	}
 }
 
 func (g *Gateway) listObjects(w http.ResponseWriter, r *http.Request, namespace string, query url.Values) {

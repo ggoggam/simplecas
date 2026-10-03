@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -482,6 +483,64 @@ func TestCreateNamespaceRequiresATenantWhenSignedIn(t *testing.T) {
 	mustStatus(t, w, http.StatusNotFound)
 	if code, _ := errorBody(t, w); code != "NoSuchTenant" {
 		t.Errorf("code = %q", code)
+	}
+}
+
+// Namespace names are global, so a clash is a 409 whoever holds the name. It is
+// reported as the caller's own only for a namespace they can reach; another
+// team's and an unowned one get the same BucketAlreadyExists.
+func TestCreateNamespaceClash(t *testing.T) {
+	f := newFixture(t)
+	mustStatus(t, f.do(t, http.MethodPost, "/api/namespaces", `{"name":"unowned"}`),
+		http.StatusCreated)
+
+	f.signIn("bob@example.com")
+	createTenant(t, f, "team-b")
+	createNamespaceIn(t, f, "bob-ns", "team-b")
+
+	f.signIn("alice@example.com")
+	createTenant(t, f, "team-a")
+	createNamespaceIn(t, f, "alice-ns", "team-a")
+
+	create := func(name string) *httptest.ResponseRecorder {
+		return f.do(t, http.MethodPost, "/api/namespaces",
+			`{"name":"`+name+`","tenant":"team-a"}`, "Content-Type", "application/json")
+	}
+
+	w := create("alice-ns")
+	mustStatus(t, w, http.StatusConflict)
+	if code, _ := errorBody(t, w); code != "BucketAlreadyOwnedByYou" {
+		t.Errorf("own clash code = %q", code)
+	}
+
+	other := create("bob-ns")
+	mustStatus(t, other, http.StatusConflict)
+	if code, _ := errorBody(t, other); code != "BucketAlreadyExists" {
+		t.Errorf("another team's clash code = %q", code)
+	}
+	unowned := create("unowned")
+	mustStatus(t, unowned, http.StatusConflict)
+	if other.Body.String() != unowned.Body.String() {
+		t.Errorf("clash bodies differ:\nanother team's: %s\nunowned:        %s",
+			other.Body.String(), unowned.Body.String())
+	}
+
+	// Once Alice is in team-b too, bob-ns is within her reach and so hers,
+	// though she asked to create it in team-a.
+	f.signIn("bob@example.com")
+	join(t, f, "team-b", "alice@example.com", "member")
+	f.signIn("alice@example.com")
+	w = create("bob-ns")
+	mustStatus(t, w, http.StatusConflict)
+	if code, _ := errorBody(t, w); code != "BucketAlreadyOwnedByYou" {
+		t.Errorf("clash in a second team code = %q", code)
+	}
+
+	// Reserved names are refused before any of that.
+	w = create("healthz")
+	mustStatus(t, w, http.StatusBadRequest)
+	if code, _ := errorBody(t, w); code != "InvalidBucketName" {
+		t.Errorf("reserved name code = %q", code)
 	}
 }
 
