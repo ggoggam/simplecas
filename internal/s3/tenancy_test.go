@@ -471,6 +471,51 @@ func TestBucketCreatedByTheAdminCredentialStaysUnowned(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Name clashes
+// ---------------------------------------------------------------------------
+
+// Bucket names are global, so creating one that exists is a 409 whoever owns
+// it. Only a namespace the caller can address is reported as theirs; any other
+// clash gets S3's BucketAlreadyExists, identical whether the name belongs to
+// another team or to nobody.
+func TestCreateBucketClashIsOwnedOnlyWithinTheCallersScope(t *testing.T) {
+	f := newTenantFixture(t)
+	mustCreateNamespace(t, f.g.db, "ns-unowned", nil)
+
+	mustCode(t, f.asA(t, http.MethodPut, "/ns-a/", ""), http.StatusConflict, "BucketAlreadyOwnedByYou")
+
+	other := f.asA(t, http.MethodPut, "/ns-b/", "")
+	mustCode(t, other, http.StatusConflict, "BucketAlreadyExists")
+	unowned := f.asA(t, http.MethodPut, "/ns-unowned/", "")
+	mustCode(t, unowned, http.StatusConflict, "BucketAlreadyExists")
+	if other.Body.String() != unowned.Body.String() {
+		t.Errorf("clash bodies differ:\nanother team's: %s\nunowned:        %s",
+			other.Body.String(), unowned.Body.String())
+	}
+
+	// The admin credential addresses every namespace, so every clash is its own.
+	mustCode(t, f.asAdmin(t, http.MethodPut, "/ns-a/", ""), http.StatusConflict, "BucketAlreadyOwnedByYou")
+	mustCode(t, f.asAdmin(t, http.MethodPut, "/ns-unowned/", ""), http.StatusConflict, "BucketAlreadyOwnedByYou")
+
+	// None of that moved ownership.
+	ns, err := f.g.db.GetNamespace(t.Context(), "ns-b")
+	if err != nil {
+		t.Fatalf("get namespace: %v", err)
+	}
+	if ns.TenantID == nil || *ns.TenantID != f.tenantB {
+		t.Fatalf("ns-b tenant_id = %v, want %d", ns.TenantID, f.tenantB)
+	}
+}
+
+func TestReservedBucketNamesAreRefusedForEveryCredential(t *testing.T) {
+	f := newTenantFixture(t)
+	for _, name := range []string{"api", "auth", "healthz", "readyz"} {
+		mustCode(t, f.asA(t, http.MethodPut, "/"+name+"/", ""), http.StatusBadRequest, "InvalidBucketName")
+		mustCode(t, f.asAdmin(t, http.MethodPut, "/"+name+"/", ""), http.StatusBadRequest, "InvalidBucketName")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Multipart
 // ---------------------------------------------------------------------------
 
