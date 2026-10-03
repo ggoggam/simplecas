@@ -17,6 +17,7 @@ import (
 	"github.com/ggoggam/simplecas/internal/config"
 	"github.com/ggoggam/simplecas/internal/db"
 	"github.com/ggoggam/simplecas/internal/s3"
+	"github.com/ggoggam/simplecas/internal/server"
 	"github.com/ggoggam/simplecas/internal/storage"
 	"github.com/ggoggam/simplecas/internal/testdb"
 )
@@ -402,6 +403,48 @@ func TestObjectUploadDownloadDelete(t *testing.T) {
 		http.StatusNoContent)
 	mustStatus(t, f.do(t, http.MethodGet, "/api/namespaces/photos/objects/cat.txt", ""),
 		http.StatusNotFound)
+}
+
+// Behind the router, /api answers with the surface's locked-down policy, but
+// object bytes keep the gateway's content-safety headers alone: a PDF must stay
+// frameable for the PWA's preview, and anything that renders stays sandboxed.
+func TestObjectBytesCarryTheGatewayHeaders(t *testing.T) {
+	f := newFixture(t)
+	f.handler = server.Routes{
+		Gateway: http.NotFoundHandler(),
+		API:     f.handler,
+		UI:      http.NotFoundHandler(),
+	}.Handler(slog.New(slog.DiscardHandler))
+
+	mustStatus(t, f.do(t, http.MethodPost, "/api/namespaces", `{"name":"docs"}`), http.StatusCreated)
+	mustStatus(t, f.do(t, http.MethodPut, "/api/namespaces/docs/objects/a.pdf", "%PDF-1.4",
+		"Content-Type", "application/pdf"), http.StatusOK)
+	mustStatus(t, f.do(t, http.MethodPut, "/api/namespaces/docs/objects/a.html", "<script>1</script>",
+		"Content-Type", "text/html"), http.StatusOK)
+
+	tests := []struct {
+		name, target, wantPolicy, wantFrame string
+	}{
+		{"json", "/api/stats", "default-src 'none'", "DENY"},
+		{"a pdf", "/api/namespaces/docs/objects/a.pdf", "", ""},
+		{"an html page", "/api/namespaces/docs/objects/a.html", "sandbox", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := f.do(t, http.MethodGet, tc.target, "")
+			mustStatus(t, w, http.StatusOK)
+			policy := w.Header().Get("Content-Security-Policy")
+			if !strings.HasPrefix(policy, tc.wantPolicy) || (tc.wantPolicy == "") != (policy == "") {
+				t.Errorf("Content-Security-Policy = %q, want %q", policy, tc.wantPolicy)
+			}
+			if got := w.Header().Get("X-Frame-Options"); got != tc.wantFrame {
+				t.Errorf("X-Frame-Options = %q, want %q", got, tc.wantFrame)
+			}
+			if got := w.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+				t.Errorf("X-Content-Type-Options = %q", got)
+			}
+		})
+	}
 }
 
 func TestObjectContentTypeGuessedFromKey(t *testing.T) {

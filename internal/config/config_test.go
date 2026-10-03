@@ -160,6 +160,8 @@ client_id = "cid"
 	t.Setenv("SIMPLECAS_CONFIG", path)
 	t.Setenv("SIMPLECAS__DATABASE__URL", "postgres://from-env/db")
 	t.Setenv("SIMPLECAS__SERVER__REGION", "us-west-2")
+	// The file binds every interface with OIDC off, which needs the opt-in.
+	t.Setenv("SIMPLECAS__SERVER__INSECURE_OPEN_API", "true")
 
 	c, err := Load()
 	if err != nil {
@@ -170,6 +172,9 @@ client_id = "cid"
 	}
 	if c.Server.Region != "us-west-2" {
 		t.Errorf("env should win: region = %q", c.Server.Region)
+	}
+	if !c.Server.InsecureOpenAPI {
+		t.Error("env should set server.insecure_open_api")
 	}
 	// File values with no env override survive.
 	if c.Server.Bind != "0.0.0.0:8080" {
@@ -189,6 +194,7 @@ client_id = "cid"
 func TestLoadMissingConfigFile(t *testing.T) {
 	t.Setenv("SIMPLECAS_CONFIG", "")
 	t.Setenv("SIMPLECAS__DATABASE__URL", "postgres://x/y")
+	t.Setenv("SIMPLECAS__SERVER__BIND", "127.0.0.1:9000")
 	dir := t.TempDir()
 	t.Chdir(dir)
 
@@ -206,6 +212,8 @@ func TestValidate(t *testing.T) {
 	base := func() Config {
 		c := Default()
 		c.Database.URL = "postgres://x/y"
+		// OIDC is off, so only a loopback bind starts without the opt-in.
+		c.Server.Bind = "127.0.0.1:9000"
 		return c
 	}
 
@@ -234,6 +242,25 @@ func TestValidate(t *testing.T) {
 		c := base()
 		c.OIDC.Enabled = true
 		c.Auth = AuthConfig{Enabled: true, AccessKeyID: "admin", SecretAccessKey: "a-private-secret"}
+		if err := c.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("oidc on every interface", func(t *testing.T) {
+		c := base()
+		c.Server.Bind = "0.0.0.0:9000"
+		c.OIDC.Enabled = true
+		c.Auth = AuthConfig{Enabled: true, AccessKeyID: "admin", SecretAccessKey: "a-private-secret"}
+		if err := c.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("an open api on every interface when asked for", func(t *testing.T) {
+		c := base()
+		c.Server.Bind = "0.0.0.0:9000"
+		c.Server.InsecureOpenAPI = true
 		if err := c.Validate(); err != nil {
 			t.Fatal(err)
 		}
@@ -275,6 +302,11 @@ func TestValidate(t *testing.T) {
 		{"zero part size limit", func(c *Config) { c.Limits.MaxPartBytes = 0 }},
 		{"negative quota", func(c *Config) { c.Limits.TenantQuotaBytes = -1 }},
 		{"zero stall timeout", func(c *Config) { c.Limits.StallTimeoutSecs = 0 }},
+		// The shipped default: every interface, no sign-in.
+		{"open api on the default bind", func(c *Config) { c.Server.Bind = Default().Server.Bind }},
+		{"open api on every IPv6 interface", func(c *Config) { c.Server.Bind = "[::]:9000" }},
+		{"open api with an empty host", func(c *Config) { c.Server.Bind = ":9000" }},
+		{"open api on a LAN address", func(c *Config) { c.Server.Bind = "192.168.1.10:9000" }},
 		{"oidc with an unauthenticated gateway", func(c *Config) {
 			c.OIDC.Enabled = true
 		}},
@@ -291,5 +323,30 @@ func TestValidate(t *testing.T) {
 				t.Fatal("expected a validation error")
 			}
 		})
+	}
+}
+
+func TestIsLoopbackBind(t *testing.T) {
+	tests := []struct {
+		bind string
+		want bool
+	}{
+		{"127.0.0.1:9000", true},
+		{"127.0.0.2:9000", true},
+		{"[::1]:9000", true},
+		{"localhost:9000", true},
+		{"LOCALHOST:9000", true},
+		{"0.0.0.0:9000", false},
+		{"[::]:9000", false},
+		{":9000", false},
+		{"10.0.0.5:9000", false},
+		{"cas.internal:9000", false},
+		// Not a listen address at all; the listener would refuse it anyway.
+		{"127.0.0.1", false},
+	}
+	for _, tc := range tests {
+		if got := IsLoopbackBind(tc.bind); got != tc.want {
+			t.Errorf("IsLoopbackBind(%q) = %v, want %v", tc.bind, got, tc.want)
+		}
 	}
 }

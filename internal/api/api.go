@@ -12,7 +12,8 @@
 //
 // When OIDC is disabled there is no caller and this is the unauthenticated
 // full-access plane it has always been: put it behind ingress auth or bind it
-// privately.
+// privately. config.Validate refuses a non-loopback bind in that mode unless
+// server.insecure_open_api says something in front has been arranged.
 //
 // The JSON field names below are the contract with the PWA (see
 // web/src/lib/api.ts). Renaming one breaks the UI silently, and list responses
@@ -656,6 +657,12 @@ func (h *Handler) getObject(w http.ResponseWriter, r *http.Request) {
 	// The gateway supplies the read path for both planes; it takes the row
 	// this handler already authorized rather than resolving the name again,
 	// so /api's membership check is the only authorization that applies.
+	//
+	// The bytes are user content, so they carry the gateway's content-safety
+	// headers rather than the API's (see internal/server/headers.go). The
+	// API's policy would also refuse the frame the PWA previews a PDF in.
+	w.Header().Del("Content-Security-Policy")
+	w.Header().Del("X-Frame-Options")
 	h.gateway.ServeObject(w, r, ns, key)
 }
 

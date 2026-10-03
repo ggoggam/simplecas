@@ -37,6 +37,11 @@ type Routes struct {
 	// StallTimeout drops a connection whose request or response body goes
 	// this long without moving a byte. Zero disables it.
 	StallTimeout time.Duration
+	// HTTPS says browsers reach this instance over HTTPS even though requests
+	// arrive as plain HTTP from a TLS-terminating proxy, so /ui, /api and
+	// /auth send Strict-Transport-Security. A request made over TLS gets it
+	// either way.
+	HTTPS bool
 }
 
 // Handler returns the composed handler.
@@ -50,11 +55,14 @@ func (rt Routes) Handler(log *slog.Logger) http.Handler {
 		// prefixes; it addresses a namespace named "api" instead.
 		switch firstSegment(r.URL.EscapedPath()) {
 		case "api":
+			setSurfaceHeaders(w, r, lockedPolicy, rt.HTTPS)
 			rt.API.ServeHTTP(w, r)
 		case "ui":
+			setSurfaceHeaders(w, r, uiPolicy, rt.HTTPS)
 			rt.UI.ServeHTTP(w, r)
 		case "auth":
 			if rt.Auth != nil {
+				setSurfaceHeaders(w, r, lockedPolicy, rt.HTTPS)
 				rt.Auth.ServeHTTP(w, r)
 				return
 			}

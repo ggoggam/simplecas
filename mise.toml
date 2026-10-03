@@ -56,6 +56,10 @@ run = "go run ./cmd/simplecas"
 
 [tasks."dev:server".env]
 SIMPLECAS__SERVER__BIND = "0.0.0.0:9100"
+# Watch-dev runs with OIDC off, so /api has no sign-in, and the server refuses
+# that on every interface unless acknowledged. Acknowledged for a dev machine
+# with throwaway data; anyone on the same network can use its /api.
+SIMPLECAS__SERVER__INSECURE_OPEN_API = "true"
 # Point the blob store at the local RustFS instead of the fs default in
 # simplecas.toml. ROOT="/" neutralises the toml's fs `root = "./data"` so blobs
 # land at bucket-root keys (blobs/… , staging/…).

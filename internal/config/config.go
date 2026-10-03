@@ -6,6 +6,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"reflect"
 	"strconv"
@@ -33,6 +34,11 @@ type ServerConfig struct {
 	Bind string `toml:"bind"`
 	// Region is reported in SigV4 scope validation and S3 responses.
 	Region string `toml:"region"`
+	// InsecureOpenAPI accepts an unauthenticated /api on a non-loopback bind,
+	// which is otherwise refused while OIDC is off. Set it only when something
+	// in front (ingress auth, a private network) decides who reaches the port.
+	// It has no effect with OIDC on.
+	InsecureOpenAPI bool `toml:"insecure_open_api"`
 }
 
 // DatabaseConfig points at the shared Postgres metadata store.
@@ -373,6 +379,17 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Without OIDC nothing authenticates /api, which creates and deletes every
+	// namespace and object and mints gateway credentials. That is a sensible
+	// default only where nobody else can reach it, so listening beyond loopback
+	// has to be asked for rather than be what a fresh install does.
+	if !c.OIDC.Enabled && !c.Server.InsecureOpenAPI && !IsLoopbackBind(c.Server.Bind) {
+		return fmt.Errorf("oidc.enabled must be true when server.bind (%s) is not a loopback address: "+
+			"without sign-in /api gives anyone who can reach the port full control of every namespace; "+
+			"bind to 127.0.0.1, or set server.insecure_open_api = true if ingress in front authenticates it",
+			c.Server.Bind)
+	}
+
 	// Tenancy is only as strong as its weakest plane. OIDC scopes /ui and /api
 	// to the caller's team, but an unauthenticated gateway serves every team's
 	// buckets to anyone who can reach the port, and the sample admin secret is
@@ -389,6 +406,28 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// IsLoopbackBind reports whether a listen address accepts connections from
+// this host only. An empty host listens on every interface, and a host name
+// other than localhost is not resolved here, so both count as reachable.
+func IsLoopbackBind(bind string) bool {
+	host, _, err := net.SplitHostPort(bind)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// PublicHTTPS reports whether browsers reach this instance over HTTPS, judged
+// by public_url's scheme. TLS usually terminates at a proxy in front, so the
+// requests themselves arrive as plain HTTP and cannot say.
+func (c *OidcConfig) PublicHTTPS() bool {
+	return strings.HasPrefix(c.PublicURL, "https")
 }
 
 // SampleSecretAccessKey is the admin secret shipped in simplecas.toml. It is

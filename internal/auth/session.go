@@ -125,7 +125,7 @@ func unsign(secret, token string) []byte {
 // secureCookies reports whether cookies should carry the Secure attribute,
 // inferred from whether this instance is served over TLS.
 func secureCookies(cfg *config.OidcConfig) bool {
-	return strings.HasPrefix(cfg.PublicURL, "https")
+	return cfg.PublicHTTPS()
 }
 
 // setCookie builds a session-style cookie. HttpOnly keeps it away from page
