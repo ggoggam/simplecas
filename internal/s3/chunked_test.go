@@ -122,6 +122,21 @@ func TestChunkedReader(t *testing.T) {
 			input: "4\r\na\r\nb\r\n0\r\n\r\n",
 			want:  "a\r\nb",
 		},
+		{
+			name:  "a line at the length limit",
+			input: "3;" + strings.Repeat("x", maxChunkHeaderLine-4) + "\r\nabc\r\n0\r\n\r\n",
+			want:  "abc",
+		},
+		{
+			name:  "a sixteen-digit size field",
+			input: "0000000000000003\r\nabc\r\n0\r\n\r\n",
+			want:  "abc",
+		},
+		{
+			name:  "the most trailers allowed, and a signature",
+			input: "3\r\nabc\r\n0\r\n" + manyTrailers(maxTrailers) + "x-amz-trailer-signature:abc\r\n\r\n",
+			want:  "abc",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -181,11 +196,88 @@ func TestChunkedReaderRejectsMalformedFraming(t *testing.T) {
 		{"absurd chunk size", "ffffffffffff\r\nabc\r\n"},
 		{"ends at a chunk boundary without the final chunk", "3\r\nabc\r\n"},
 		{"empty body", ""},
+		{"a line past the length limit", "3;" + strings.Repeat("x", maxChunkHeaderLine-3) + "\r\nabc\r\n0\r\n\r\n"},
+		{"a multi-megabyte final line", "3\r\nabc\r\n0\r\nx-amz-meta-a:" + strings.Repeat("a", 4<<20)},
+		{"a size field past sixteen digits", "00000000000000003\r\nabc\r\n0\r\n\r\n"},
+		{"a size field past int64", "8000000000000000\r\nabc\r\n0\r\n\r\n"},
+		{"too many trailers", "3\r\nabc\r\n0\r\n" + manyTrailers(maxTrailers+1) + "\r\n"},
+		{"a trailer repeated", "3\r\nabc\r\n0\r\n" + strings.Repeat("x-amz-checksum-crc32:NSRBwg==\r\n", maxTrailerLines+1) + "\r\n"},
+		{"a trailer signature repeated", "3\r\nabc\r\n0\r\n" + strings.Repeat("x-amz-trailer-signature:abc\r\n", maxTrailerLines+1) + "\r\n"},
+		{"trailers too long together", "3\r\nabc\r\n0\r\n" + manyTrailersOf(2, strings.Repeat("a", maxTrailerBytes/2)) + "\r\n"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := io.ReadAll(newChunkedReader(strings.NewReader(tc.input))); err == nil {
 				t.Errorf("malformed framing %q was accepted", tc.input)
+			}
+		})
+	}
+}
+
+// manyTrailers renders n distinct trailers.
+func manyTrailers(n int) string { return manyTrailersOf(n, "v") }
+
+// manyTrailersOf renders n distinct trailers, each with the given value.
+func manyTrailersOf(n int, value string) string {
+	var b strings.Builder
+	for i := range n {
+		b.WriteString("x-amz-meta-" + strconv.Itoa(i) + ":" + value + "\r\n")
+	}
+	return b.String()
+}
+
+// errReadPastBound marks an endlessReader read further than any bound allows.
+var errReadPastBound = errors.New("read past any framing bound")
+
+// endlessReader yields prefix and then fill, repeated without end, as a client
+// that never stops sending would. It fails a read once it has handed out far
+// more than the framing limits allow, so a reader that does not enforce them
+// fails the test rather than hanging it.
+type endlessReader struct {
+	prefix string
+	fill   string
+	off    int
+	read   int
+}
+
+func (e *endlessReader) Read(p []byte) (int, error) {
+	if e.read > 1<<20 {
+		return 0, errReadPastBound
+	}
+	n := copy(p, e.prefix)
+	e.prefix = e.prefix[n:]
+	for n < len(p) {
+		c := copy(p[n:], e.fill[e.off:])
+		e.off = (e.off + c) % len(e.fill)
+		n += c
+	}
+	e.read += n
+	return n, nil
+}
+
+// A line that never ends, or trailers that never do, must be refused once
+// past their bound, having read no more than the bound from the client. This
+// is all before any chunk signature is checked.
+func TestChunkedReaderBoundsUnendingFraming(t *testing.T) {
+	const lastChunk = "3\r\nabc\r\n0\r\n"
+	tests := []struct{ name, prefix, fill string }{
+		{"chunk size", "", "1"},
+		{"chunk extension", "3;chunk-signature=", "0"},
+		{"line after chunk data", "3\r\nabc", "x"},
+		{"trailer", lastChunk + "x-amz-checksum-crc32:", "A"},
+		{"trailers", lastChunk, "x-amz-checksum-crc32:NSRBwg==\r\n"},
+		{"trailer signatures", lastChunk, "x-amz-trailer-signature:abc\r\n"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &endlessReader{prefix: tc.prefix, fill: tc.fill}
+			_, err := io.Copy(io.Discard, newChunkedReader(src))
+			if err == nil || errors.Is(err, errReadPastBound) {
+				t.Fatalf("unending framing gave %v, want it refused at its bound", err)
+			}
+			// What a line or the trailers may hold, plus one buffer refill.
+			if bound := len(tc.prefix) + 2*maxChunkHeaderLine; src.read > bound {
+				t.Errorf("read %d bytes from the client before refusing, want at most %d", src.read, bound)
 			}
 		})
 	}
