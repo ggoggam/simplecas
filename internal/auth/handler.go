@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -161,19 +163,33 @@ func (r *Registry) handleLogin(w http.ResponseWriter, req *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", loginPagePolicy)
 	_, _ = fmt.Fprintf(w, loginPageTemplate, errorHTML, buttons.String())
 }
+
+// loginPageStyle is the sign-in page's only stylesheet, inline because the
+// page has to render before the PWA's assets are reachable.
+const loginPageStyle = `body{font:16px system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#0b0d10;color:#e7e9ea}` +
+	`.card{display:flex;flex-direction:column;gap:12px;padding:32px;min-width:280px}` +
+	`h1{font-size:20px;margin:0 0 8px;text-align:center}` +
+	`.btn{display:block;padding:12px 16px;border-radius:8px;background:#1f6feb;color:#fff;text-decoration:none;text-align:center;font-weight:600}` +
+	`.btn:hover{background:#388bfd}.err{color:#f85149;text-align:center;margin:0}`
+
+// loginPagePolicy replaces the router's locked-down policy for /auth on the
+// one page that renders: it admits exactly the stylesheet above, by hash, and
+// nothing else. The provider buttons are plain links, which need no source.
+var loginPagePolicy = func() string {
+	sum := sha256.Sum256([]byte(loginPageStyle))
+	return "default-src 'none'; style-src 'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'; " +
+		"base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+}()
 
 // loginPageTemplate is the standalone sign-in page. It is deliberately
 // self-contained: it has to render before the PWA's assets are reachable.
 const loginPageTemplate = `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
 	`<meta name="viewport" content="width=device-width,initial-scale=1">` +
 	`<title>Sign in · simplecas</title>` +
-	`<style>body{font:16px system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#0b0d10;color:#e7e9ea}` +
-	`.card{display:flex;flex-direction:column;gap:12px;padding:32px;min-width:280px}` +
-	`h1{font-size:20px;margin:0 0 8px;text-align:center}` +
-	`.btn{display:block;padding:12px 16px;border-radius:8px;background:#1f6feb;color:#fff;text-decoration:none;text-align:center;font-weight:600}` +
-	`.btn:hover{background:#388bfd}.err{color:#f85149;text-align:center;margin:0}</style></head>` +
+	`<style>` + loginPageStyle + `</style></head>` +
 	`<body><div class="card"><h1>simplecas</h1>%s%s</div></body></html>`
 
 // handleLogout clears the session. The redirect suits a plain form post; the

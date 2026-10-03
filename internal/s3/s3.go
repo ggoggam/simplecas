@@ -16,6 +16,8 @@
 // namespaces, with everything else reported as NoSuchBucket. See principal.go —
 // g.namespace is the single chokepoint that turns a name from a request into a
 // row, so no handler here can resolve a namespace outside the caller's scope.
+// CreateBucket is the one place a name outside it shows: names are global, so a
+// taken one answers BucketAlreadyExists (see nameTaken).
 //
 // The gateway parses the request path itself rather than going through
 // http.ServeMux. ServeMux cleans paths — collapsing "//" and resolving "."
@@ -25,6 +27,7 @@
 package s3
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -40,6 +43,7 @@ import (
 	"github.com/ggoggam/simplecas/internal/cas"
 	"github.com/ggoggam/simplecas/internal/config"
 	"github.com/ggoggam/simplecas/internal/db"
+	"github.com/ggoggam/simplecas/internal/reserved"
 	"github.com/ggoggam/simplecas/internal/storage"
 )
 
@@ -75,19 +79,26 @@ func New(database *db.DB, bucket *storage.Bucket, store *cas.Store, cfg *config.
 }
 
 // ServeHTTP verifies the request signature and resolves the tenant scope its
-// credential grants, then dispatches on the addressed level: service,
-// namespace, or object.
+// credential grants, holds the body to the digests its headers claim (see
+// payload.go), then dispatches on the addressed level: service, namespace, or
+// object.
 //
 // The resolved principal rides on the request context from here on, and
 // g.namespace is the only way a handler turns a namespace name into a row — so
 // every level below this point is tenant-scoped by construction.
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	p, err := g.authenticate(r)
+	p, signer, err := g.authenticate(r)
+	if err != nil {
+		g.writeError(w, r, err)
+		return
+	}
+	body, err := newPayload(r, signer)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
 	}
 	r = r.WithContext(withPrincipal(r.Context(), p))
+	r.Body = body
 
 	namespace, key, err := splitPath(r.URL.EscapedPath())
 	if err != nil {
@@ -207,11 +218,19 @@ func contentTypeOf(r *http.Request) string {
 	return "application/octet-stream"
 }
 
-// readXMLBody reads a bounded request body for XML parsing.
+// readXMLBody reads a bounded request body for XML parsing. It reads to the
+// end, so the body's digests are checked before any of it is acted on, and a
+// failed check comes back as itself rather than as malformed XML.
 func readXMLBody(r *http.Request) ([]byte, error) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxXMLBody))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxXMLBody+1))
 	if err != nil {
+		if errors.As(err, new(*apperr.Error)) {
+			return nil, err
+		}
 		return nil, apperr.MalformedXML("%v", err)
+	}
+	if len(body) > maxXMLBody {
+		return nil, apperr.MalformedXML("body exceeds %d bytes", maxXMLBody)
 	}
 	return body, nil
 }
@@ -438,6 +457,10 @@ func (g *Gateway) createNamespace(w http.ResponseWriter, r *http.Request, namesp
 		g.writeError(w, r, apperr.ErrInvalidNamespaceName)
 		return
 	}
+	if reserved.Name(namespace) {
+		g.writeError(w, r, apperr.ErrReservedNamespaceName)
+		return
+	}
 	// A tenanted credential owns what it creates, so the namespace is visible
 	// to that team in /ui and /api too. The admin credential has no tenant
 	// identity to attribute, so its namespaces stay unowned.
@@ -447,11 +470,38 @@ func (g *Gateway) createNamespace(w http.ResponseWriter, r *http.Request, namesp
 		return
 	}
 	if err := g.db.CreateNamespace(r.Context(), namespace, p.tenantID); err != nil {
+		if errors.Is(err, apperr.ErrNamespaceAlreadyExists) {
+			err = g.nameTaken(r, namespace)
+		}
 		g.writeError(w, r, err)
 		return
 	}
 	w.Header().Set("Location", "/"+namespace)
 	w.WriteHeader(http.StatusOK)
+}
+
+// nameTaken answers a CreateBucket whose name already exists. As on S3, names
+// are global, so the clash itself reveals that the name is in use; the answer
+// says no more than that unless the namespace is the caller's.
+//
+// "The caller's" means the name resolves through g.namespace, the same scope
+// every other request is held to: a team key owns its team's namespaces, and
+// the admin credential, which addresses every namespace, owns them all.
+// BucketAlreadyOwnedByYou tells a create-if-missing client it can go ahead and
+// use the bucket, which is true exactly when g.namespace would serve it.
+func (g *Gateway) nameTaken(r *http.Request, name string) error {
+	_, err := g.namespace(r, name)
+	switch {
+	case err == nil:
+		return apperr.ErrNamespaceAlreadyOwned
+	case errors.Is(err, apperr.ErrNoSuchNamespace):
+		// A team key clashing with another team's namespace or an unowned
+		// one. Also a namespace deleted since the insert clashed, which is
+		// gone either way.
+		return apperr.ErrNamespaceAlreadyExists
+	default:
+		return err
+	}
 }
 
 func (g *Gateway) listObjects(w http.ResponseWriter, r *http.Request, namespace string, query url.Values) {
@@ -663,12 +713,13 @@ func (g *Gateway) putObject(w http.ResponseWriter, r *http.Request, namespace, k
 		g.writeError(w, r, err)
 		return
 	}
-	etag, _, err := g.cas.Put(r.Context(), ns.ID, key, contentTypeOf(r), bodyReader(r), declaredLength(r))
+	etag, _, err := g.cas.Put(r.Context(), ns.ID, key, contentTypeOf(r), r.Body, declaredLength(r))
 	if err != nil {
 		g.writeError(w, r, err)
 		return
 	}
 	w.Header().Set("ETag", quotedETag(etag))
+	setChecksumHeaders(w, r)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -896,13 +947,14 @@ func (g *Gateway) uploadPart(w http.ResponseWriter, r *http.Request, namespace, 
 
 	// Parts stay in staging under their own part-level digest; dedup happens
 	// once at completion, when the hash of the whole object is known.
-	staged, err := g.cas.PutPart(r.Context(), upload, int32(partNumber), bodyReader(r), declaredLength(r))
+	staged, err := g.cas.PutPart(r.Context(), upload, int32(partNumber), r.Body, declaredLength(r))
 	if err != nil {
 		g.writeError(w, r, err)
 		return
 	}
 
 	w.Header().Set("ETag", quotedETag(staged.Hash))
+	setChecksumHeaders(w, r)
 	w.WriteHeader(http.StatusOK)
 }
 

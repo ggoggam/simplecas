@@ -4,7 +4,10 @@
 // The upload protocol is written to be safe with N stateless servers and a
 // concurrent garbage collector:
 //
-//  1. Stream the body to staging/<uuid> while feeding a blake3 hasher.
+//  1. Stream the body to staging/<uuid> while feeding a blake3 hasher. The S3
+//     gateway's body reader checks the client's own digests (payload hash,
+//     Content-MD5, checksums) in the same pass and fails the read at the end
+//     of a body that does not match them, which discards the staging file.
 //  2. In one Postgres transaction, claim a blob reference (which row-locks the
 //     blob: refcount++ or insert at 1). If no other reference existed — a new
 //     row, or one revived from refcount 0 — copy staging into blobs/… *before*
@@ -173,8 +176,9 @@ func (s *Store) stage(ctx context.Context, r io.Reader, limit int64, what string
 
 	switch {
 	case src.err != nil && errors.As(src.err, new(*apperr.Error)):
-		// The reader classified its own failure (a stored blob that could not
-		// be read is the server's fault, not the client's).
+		// The reader classified its own failure: a stored blob that could not
+		// be read is the server's fault, not the client's, and a body that
+		// failed its digest or signature check is refused as such.
 		s.DiscardStaging(ctx, key)
 		return StagedBlob{}, src.err
 	case src.err != nil && errors.Is(src.err, os.ErrDeadlineExceeded):

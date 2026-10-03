@@ -2,17 +2,21 @@ package s3
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 
+	"github.com/ggoggam/simplecas/internal/apperr"
 	"github.com/ggoggam/simplecas/internal/config"
 )
 
@@ -118,6 +122,21 @@ func TestChunkedReader(t *testing.T) {
 			input: "4\r\na\r\nb\r\n0\r\n\r\n",
 			want:  "a\r\nb",
 		},
+		{
+			name:  "a line at the length limit",
+			input: "3;" + strings.Repeat("x", maxChunkHeaderLine-4) + "\r\nabc\r\n0\r\n\r\n",
+			want:  "abc",
+		},
+		{
+			name:  "a sixteen-digit size field",
+			input: "0000000000000003\r\nabc\r\n0\r\n\r\n",
+			want:  "abc",
+		},
+		{
+			name:  "the most trailers allowed, and a signature",
+			input: "3\r\nabc\r\n0\r\n" + manyTrailers(maxTrailers) + "x-amz-trailer-signature:abc\r\n\r\n",
+			want:  "abc",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -177,11 +196,88 @@ func TestChunkedReaderRejectsMalformedFraming(t *testing.T) {
 		{"absurd chunk size", "ffffffffffff\r\nabc\r\n"},
 		{"ends at a chunk boundary without the final chunk", "3\r\nabc\r\n"},
 		{"empty body", ""},
+		{"a line past the length limit", "3;" + strings.Repeat("x", maxChunkHeaderLine-3) + "\r\nabc\r\n0\r\n\r\n"},
+		{"a multi-megabyte final line", "3\r\nabc\r\n0\r\nx-amz-meta-a:" + strings.Repeat("a", 4<<20)},
+		{"a size field past sixteen digits", "00000000000000003\r\nabc\r\n0\r\n\r\n"},
+		{"a size field past int64", "8000000000000000\r\nabc\r\n0\r\n\r\n"},
+		{"too many trailers", "3\r\nabc\r\n0\r\n" + manyTrailers(maxTrailers+1) + "\r\n"},
+		{"a trailer repeated", "3\r\nabc\r\n0\r\n" + strings.Repeat("x-amz-checksum-crc32:NSRBwg==\r\n", maxTrailerLines+1) + "\r\n"},
+		{"a trailer signature repeated", "3\r\nabc\r\n0\r\n" + strings.Repeat("x-amz-trailer-signature:abc\r\n", maxTrailerLines+1) + "\r\n"},
+		{"trailers too long together", "3\r\nabc\r\n0\r\n" + manyTrailersOf(2, strings.Repeat("a", maxTrailerBytes/2)) + "\r\n"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := io.ReadAll(newChunkedReader(strings.NewReader(tc.input))); err == nil {
 				t.Errorf("malformed framing %q was accepted", tc.input)
+			}
+		})
+	}
+}
+
+// manyTrailers renders n distinct trailers.
+func manyTrailers(n int) string { return manyTrailersOf(n, "v") }
+
+// manyTrailersOf renders n distinct trailers, each with the given value.
+func manyTrailersOf(n int, value string) string {
+	var b strings.Builder
+	for i := range n {
+		b.WriteString("x-amz-meta-" + strconv.Itoa(i) + ":" + value + "\r\n")
+	}
+	return b.String()
+}
+
+// errReadPastBound marks an endlessReader read further than any bound allows.
+var errReadPastBound = errors.New("read past any framing bound")
+
+// endlessReader yields prefix and then fill, repeated without end, as a client
+// that never stops sending would. It fails a read once it has handed out far
+// more than the framing limits allow, so a reader that does not enforce them
+// fails the test rather than hanging it.
+type endlessReader struct {
+	prefix string
+	fill   string
+	off    int
+	read   int
+}
+
+func (e *endlessReader) Read(p []byte) (int, error) {
+	if e.read > 1<<20 {
+		return 0, errReadPastBound
+	}
+	n := copy(p, e.prefix)
+	e.prefix = e.prefix[n:]
+	for n < len(p) {
+		c := copy(p[n:], e.fill[e.off:])
+		e.off = (e.off + c) % len(e.fill)
+		n += c
+	}
+	e.read += n
+	return n, nil
+}
+
+// A line that never ends, or trailers that never do, must be refused once
+// past their bound, having read no more than the bound from the client. This
+// is all before any chunk signature is checked.
+func TestChunkedReaderBoundsUnendingFraming(t *testing.T) {
+	const lastChunk = "3\r\nabc\r\n0\r\n"
+	tests := []struct{ name, prefix, fill string }{
+		{"chunk size", "", "1"},
+		{"chunk extension", "3;chunk-signature=", "0"},
+		{"line after chunk data", "3\r\nabc", "x"},
+		{"trailer", lastChunk + "x-amz-checksum-crc32:", "A"},
+		{"trailers", lastChunk, "x-amz-checksum-crc32:NSRBwg==\r\n"},
+		{"trailer signatures", lastChunk, "x-amz-trailer-signature:abc\r\n"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &endlessReader{prefix: tc.prefix, fill: tc.fill}
+			_, err := io.Copy(io.Discard, newChunkedReader(src))
+			if err == nil || errors.Is(err, errReadPastBound) {
+				t.Fatalf("unending framing gave %v, want it refused at its bound", err)
+			}
+			// What a line or the trailers may hold, plus one buffer refill.
+			if bound := len(tc.prefix) + 2*maxChunkHeaderLine; src.read > bound {
+				t.Errorf("read %d bytes from the client before refusing, want at most %d", src.read, bound)
 			}
 		})
 	}
@@ -200,10 +296,19 @@ func TestChunkedReaderErrorIsSticky(t *testing.T) {
 	}
 }
 
-// bodyReader must leave an unframed body completely alone.
-func TestBodyReaderPassesThroughUnframedBodies(t *testing.T) {
+// readPayload reads r's body the way a handler sees it after ServeHTTP.
+func readPayload(r *http.Request) ([]byte, error) {
+	p, err := newPayload(r, nil)
+	if err != nil {
+		return nil, err
+	}
+	return io.ReadAll(p)
+}
+
+// An unframed body must be left completely alone.
+func TestPayloadPassesThroughUnframedBodies(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPut, "/ns/key", strings.NewReader("abc"))
-	got, err := io.ReadAll(bodyReader(r))
+	got, err := readPayload(r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,12 +317,13 @@ func TestBodyReaderPassesThroughUnframedBodies(t *testing.T) {
 	}
 }
 
-func TestBodyReaderDecodesFramedBodies(t *testing.T) {
+func TestPayloadDecodesFramedBodies(t *testing.T) {
 	framed := "3\r\nabc\r\n0\r\nx-amz-checksum-crc32:NSRBwg==\r\n\r\n"
 	r := httptest.NewRequest(http.MethodPut, "/ns/key", strings.NewReader(framed))
 	r.Header.Set("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+	r.Header.Set("x-amz-trailer", "x-amz-checksum-crc32")
 
-	got, err := io.ReadAll(bodyReader(r))
+	got, err := readPayload(r)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +334,7 @@ func TestBodyReaderDecodesFramedBodies(t *testing.T) {
 
 // x-amz-decoded-content-length is the client's statement of the object size;
 // a framed body that decodes to anything else must not be stored.
-func TestBodyReaderEnforcesDecodedLength(t *testing.T) {
+func TestPayloadEnforcesDecodedLength(t *testing.T) {
 	framed := "3\r\nabc\r\n0\r\n\r\n"
 	tests := []struct {
 		name     string
@@ -247,7 +353,7 @@ func TestBodyReaderEnforcesDecodedLength(t *testing.T) {
 			r.Header.Set("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
 			r.Header.Set("x-amz-decoded-content-length", tc.declared)
 
-			got, err := io.ReadAll(bodyReader(r))
+			got, err := readPayload(r)
 			if tc.wantErr {
 				if err == nil {
 					t.Errorf("declared %s for a 3-byte body was accepted", tc.declared)
@@ -402,5 +508,230 @@ func TestDeclaredLength(t *testing.T) {
 	framed.Header.Del("x-amz-decoded-content-length")
 	if got := declaredLength(framed); got != -1 {
 		t.Errorf("framed body with no decoded length: declared %d, want -1 (unknown)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Chunk signatures
+// ---------------------------------------------------------------------------
+
+// The worked examples from AWS's "Signature Calculations for the Authorization
+// Header: Transferring Payload in Multiple Chunks" pages, with and without
+// trailing headers: a 66560-byte object of 'a', sent as a 65536-byte chunk, a
+// 1024-byte chunk and the final empty one, signed with the documentation's
+// example credential. If these drift, chunk verification has stopped speaking
+// SigV4 and every signed streaming client will be refused.
+const (
+	awsExampleKeyID  = "AKIAIOSFODNN7EXAMPLE"
+	awsExampleSecret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+	awsExampleDate   = "20130524T000000Z"
+)
+
+var awsExampleAuth = config.AuthConfig{
+	Enabled:         true,
+	AccessKeyID:     awsExampleKeyID,
+	SecretAccessKey: awsExampleSecret,
+}
+
+type awsStreamingExample struct {
+	mode          string
+	signedHeaders string
+	seed          string
+	chunkSigs     [3]string
+	// trailer is the trailing checksum, and trailerSig its signature; both
+	// empty for the example without trailers.
+	trailer    string
+	trailerSig string
+}
+
+var (
+	awsStreamingExample1 = awsStreamingExample{
+		mode:          streamingSigned,
+		signedHeaders: "content-encoding;content-length;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-storage-class",
+		seed:          "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9",
+		chunkSigs: [3]string{
+			"ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648",
+			"0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497",
+			"b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9",
+		},
+	}
+	awsStreamingExample2 = awsStreamingExample{
+		mode:          streamingSignedTrailer,
+		signedHeaders: "content-encoding;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length;x-amz-storage-class;x-amz-trailer",
+		seed:          "106e2a8a18243abcf37539882f36619c00e2dfc72633413f02d3b74544bfeb8e",
+		chunkSigs: [3]string{
+			"b474d8862b1487a5145d686f57f013e54db672cee1c953b3010fb58501ef5aa2",
+			"1c1344b170168f8e65b41376b44b20fe354e373826ccbbe2c1d40a8cae51e5c7",
+			"2ca2aba2005185cf7159c6277faf83795951dd77a3a99e6e65d5c9f85863f992",
+		},
+		trailer:    "x-amz-checksum-crc32c:sOO8/Q==",
+		trailerSig: "d81f82fc3505edab99d459891051a732e8730629a2e4a59689829ca17fe2e435",
+	}
+)
+
+var (
+	awsExampleChunk1 = strings.Repeat("a", 65536)
+	awsExampleChunk2 = strings.Repeat("a", 1024)
+)
+
+// request is the example's request as AWS documents it, carrying body.
+func (e awsStreamingExample) request(body string) *http.Request {
+	r := httptest.NewRequest(http.MethodPut, "/examplebucket/chunkObject.txt", strings.NewReader(body))
+	r.Host = "s3.amazonaws.com"
+	r.Header.Set("x-amz-date", awsExampleDate)
+	r.Header.Set("x-amz-storage-class", "REDUCED_REDUNDANCY")
+	r.Header.Set("x-amz-content-sha256", e.mode)
+	r.Header.Set("Content-Encoding", "aws-chunked")
+	r.Header.Set("x-amz-decoded-content-length", "66560")
+	r.Header.Set("Content-Length", "66824")
+	if e.trailer != "" {
+		r.Header.Set("x-amz-trailer", "x-amz-checksum-crc32c")
+	}
+	r.Header.Set("Authorization", sigV4Algorithm+" Credential="+awsExampleKeyID+"/20130524/us-east-1/s3/aws4_request, "+
+		"SignedHeaders="+e.signedHeaders+", Signature="+e.seed)
+	return r
+}
+
+// body frames the example's chunks and trailer with their documented
+// signatures.
+func (e awsStreamingExample) body() string {
+	body := "10000;chunk-signature=" + e.chunkSigs[0] + "\r\n" + awsExampleChunk1 + "\r\n" +
+		"400;chunk-signature=" + e.chunkSigs[1] + "\r\n" + awsExampleChunk2 + "\r\n" +
+		"0;chunk-signature=" + e.chunkSigs[2] + "\r\n"
+	if e.trailer != "" {
+		body += e.trailer + "\r\n" + trailerSignatureHeader + ":" + e.trailerSig + "\r\n"
+	}
+	return body + "\r\n"
+}
+
+// signer is the signing context the example's chunks chain from.
+func (e awsStreamingExample) signer() *chunkSigner {
+	return &chunkSigner{
+		key:     signingKey(awsExampleSecret, "20130524", "us-east-1", "s3"),
+		amzDate: awsExampleDate,
+		scope:   "20130524/us-east-1/s3/aws4_request",
+		prev:    e.seed,
+	}
+}
+
+// atAWSExampleTime pins the clock to the examples' x-amz-date, so their seed
+// signatures are fresh.
+func atAWSExampleTime(t *testing.T) {
+	t.Helper()
+	at, err := time.Parse(amzDateFormat, awsExampleDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = func() time.Time { return at }
+	t.Cleanup(func() { now = time.Now })
+}
+
+// The documented requests verify end to end: the seed signature on the request
+// line, every chunk's signature, the trailer's, and the trailing CRC32C.
+func TestAWSPublishedStreamingVectors(t *testing.T) {
+	atAWSExampleTime(t)
+	for _, e := range []awsStreamingExample{awsStreamingExample1, awsStreamingExample2} {
+		t.Run(e.mode, func(t *testing.T) {
+			r := e.request(e.body())
+			signer, err := verify(r, awsExampleAuth)
+			if err != nil {
+				t.Fatalf("seed signature rejected: %v", err)
+			}
+			p, err := newPayload(r, signer)
+			if err != nil {
+				t.Fatalf("newPayload: %v", err)
+			}
+			got, err := io.ReadAll(p)
+			if err != nil {
+				t.Fatalf("documented chunks rejected: %v", err)
+			}
+			if string(got) != awsExampleChunk1+awsExampleChunk2 {
+				t.Errorf("decoded %d bytes, want 66560 bytes of 'a'", len(got))
+			}
+		})
+	}
+}
+
+// Every way of altering a signed body must break the signature chain: the
+// request-line signature alone says nothing about which bytes follow it.
+func TestChunkSignaturesRejectTampering(t *testing.T) {
+	e := awsStreamingExample1
+	sigs := e.chunkSigs
+	chunk := func(data, sig string) string {
+		return strconv.FormatInt(int64(len(data)), 16) + ";chunk-signature=" + sig + "\r\n" + data + "\r\n"
+	}
+	final := "0;chunk-signature=" + sigs[2] + "\r\n\r\n"
+	good := e.body()
+
+	tests := []struct{ name, body string }{
+		{"a data byte changed", strings.Replace(good, "a\r\n400;", "b\r\n400;", 1)},
+		{"a chunk signature changed", strings.Replace(good, sigs[1], strings.Repeat("0", 64), 1)},
+		{"a chunk signature missing", strings.Replace(good, "400;chunk-signature="+sigs[1], "400", 1)},
+		{"the final chunk's signature changed", strings.Replace(good, sigs[2], sigs[1], 1)},
+		{"chunks reordered", chunk(awsExampleChunk2, sigs[1]) + chunk(awsExampleChunk1, sigs[0]) + final},
+		{"a chunk dropped", chunk(awsExampleChunk1, sigs[0]) + final},
+		{"a chunk appended", chunk(awsExampleChunk1, sigs[0]) + chunk(awsExampleChunk2, sigs[1]) +
+			chunk("a", sigs[2]) + final},
+		{"cut short at a chunk boundary", chunk(awsExampleChunk1, sigs[0]) + "0;chunk-signature=" + sigs[1] + "\r\n\r\n"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := io.ReadAll(newSignedChunkedReader(strings.NewReader(tc.body), e.signer(), false))
+			if !errors.Is(err, apperr.ErrSignatureDoesNotMatch) {
+				t.Errorf("tampered body: err = %v, want SignatureDoesNotMatch", err)
+			}
+		})
+	}
+
+	// The untampered body passes through the same reader, so the cases above
+	// fail for what they changed.
+	if _, err := io.ReadAll(newSignedChunkedReader(strings.NewReader(good), e.signer(), false)); err != nil {
+		t.Fatalf("documented body rejected: %v", err)
+	}
+}
+
+// Trailers are signed after the final chunk; changing, adding or dropping one,
+// or its signature, must fail.
+func TestTrailerSignatureRejectsTampering(t *testing.T) {
+	e := awsStreamingExample2
+	good := e.body()
+	tests := []struct{ name, body string }{
+		{"the checksum changed", strings.Replace(good, "sOO8/Q==", "AAAAAA==", 1)},
+		{"a trailer added", strings.Replace(good, e.trailer+"\r\n", e.trailer+"\r\nx-amz-meta-extra:1\r\n", 1)},
+		{"the trailer dropped", strings.Replace(good, e.trailer+"\r\n", "", 1)},
+		{"the trailer signature changed", strings.Replace(good, e.trailerSig, e.seed, 1)},
+		{"the trailer signature missing", strings.Replace(good, trailerSignatureHeader+":"+e.trailerSig+"\r\n", "", 1)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := io.ReadAll(newSignedChunkedReader(strings.NewReader(tc.body), e.signer(), true))
+			if !errors.Is(err, apperr.ErrSignatureDoesNotMatch) {
+				t.Errorf("tampered trailer: err = %v, want SignatureDoesNotMatch", err)
+			}
+		})
+	}
+}
+
+// A body signed without trailers has nothing that would sign one, so a trailer
+// there was added in transit.
+func TestSignedBodyWithoutTrailerRefusesTrailers(t *testing.T) {
+	e := awsStreamingExample1
+	body := strings.TrimSuffix(e.body(), "\r\n") + "x-amz-checksum-crc32:NSRBwg==\r\n\r\n"
+	if _, err := io.ReadAll(newSignedChunkedReader(strings.NewReader(body), e.signer(), false)); err == nil {
+		t.Error("a trailer on a STREAMING-AWS4-HMAC-SHA256-PAYLOAD body was accepted")
+	}
+}
+
+// With auth disabled there is no secret to check chunk signatures against; the
+// framing is still decoded.
+func TestSignedChunksDecodeWithAuthDisabled(t *testing.T) {
+	e := awsStreamingExample1
+	body := strings.ReplaceAll(e.body(), e.chunkSigs[1], "not-a-signature")
+	got, err := readPayload(e.request(body))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(got) != 66560 {
+		t.Errorf("decoded %d bytes, want 66560", len(got))
 	}
 }

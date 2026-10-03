@@ -24,7 +24,12 @@ const (
 	KindNoSuchNamespace
 	KindNoSuchKey
 	KindNoSuchUpload
+	// Namespace names are global, so a create can clash with a namespace the
+	// caller cannot address. KindNamespaceAlreadyExists is that clash, and the
+	// one the store reports; a plane narrows it to KindNamespaceAlreadyOwned
+	// only once the name resolves in the caller's own scope.
 	KindNamespaceAlreadyExists
+	KindNamespaceAlreadyOwned
 	KindNamespaceNotEmpty
 	KindInvalidNamespaceName
 	KindNoSuchTenant
@@ -46,6 +51,10 @@ const (
 	KindEntityTooLarge
 	KindQuotaExceeded
 	KindRequestTimeout
+	KindInvalidRequest
+	KindBadDigest
+	KindInvalidDigest
+	KindContentSHA256Mismatch
 )
 
 // Error is a classified failure. Sentinel values below cover the kinds that
@@ -64,9 +73,11 @@ var (
 	ErrNoSuchNamespace        = &Error{Kind: KindNoSuchNamespace, msg: "namespace not found"}
 	ErrNoSuchKey              = &Error{Kind: KindNoSuchKey, msg: "object not found"}
 	ErrNoSuchUpload           = &Error{Kind: KindNoSuchUpload, msg: "multipart upload not found"}
-	ErrNamespaceAlreadyExists = &Error{Kind: KindNamespaceAlreadyExists, msg: "namespace already exists"}
+	ErrNamespaceAlreadyExists = &Error{Kind: KindNamespaceAlreadyExists, msg: "namespace name is already taken"}
+	ErrNamespaceAlreadyOwned  = &Error{Kind: KindNamespaceAlreadyOwned, msg: "namespace already exists and is yours"}
 	ErrNamespaceNotEmpty      = &Error{Kind: KindNamespaceNotEmpty, msg: "namespace is not empty"}
 	ErrInvalidNamespaceName   = &Error{Kind: KindInvalidNamespaceName, msg: "invalid namespace name"}
+	ErrReservedNamespaceName  = &Error{Kind: KindInvalidNamespaceName, msg: "namespace name is reserved"}
 	ErrNoSuchTenant           = &Error{Kind: KindNoSuchTenant, msg: "tenant not found"}
 	ErrTenantAlreadyExists    = &Error{Kind: KindTenantAlreadyExists, msg: "tenant already exists"}
 	ErrTenantNotEmpty         = &Error{Kind: KindTenantNotEmpty, msg: "tenant still has namespaces"}
@@ -79,6 +90,7 @@ var (
 	ErrSignatureDoesNotMatch  = &Error{Kind: KindSignatureDoesNotMatch, msg: "signature mismatch"}
 	ErrRequestTimeTooSkewed   = &Error{Kind: KindRequestTimeTooSkewed, msg: "the difference between the request time and the server's time is too large"}
 	ErrRequestTimeout         = &Error{Kind: KindRequestTimeout, msg: "the request body stopped arriving and the connection timed out"}
+	ErrContentSHA256Mismatch  = &Error{Kind: KindContentSHA256Mismatch, msg: "the body does not match the x-amz-content-sha256 the request was signed with"}
 )
 
 // RequestIDHeader carries the per-request ID the router assigns. The error
@@ -125,6 +137,23 @@ func EntityTooLarge(format string, a ...any) *Error {
 // QuotaExceeded rejects a write that would take a team past its storage quota.
 func QuotaExceeded(format string, a ...any) *Error {
 	return &Error{Kind: KindQuotaExceeded, msg: fmt.Sprintf(format, a...)}
+}
+
+// InvalidRequest rejects a request missing something S3 requires of it, such as
+// a header the operation cannot be checked without.
+func InvalidRequest(format string, a ...any) *Error {
+	return &Error{Kind: KindInvalidRequest, msg: fmt.Sprintf(format, a...)}
+}
+
+// BadDigest rejects a body that does not match a digest the client sent with
+// it: Content-MD5, or an x-amz-checksum-* header or trailer.
+func BadDigest(format string, a ...any) *Error {
+	return &Error{Kind: KindBadDigest, msg: fmt.Sprintf(format, a...)}
+}
+
+// InvalidDigest rejects a Content-MD5 header that is not a base64 MD5 digest.
+func InvalidDigest(format string, a ...any) *Error {
+	return &Error{Kind: KindInvalidDigest, msg: fmt.Sprintf(format, a...)}
 }
 
 // newInternal builds an internal error from a non-nil cause.
@@ -180,6 +209,8 @@ func (e *Error) S3Code() string {
 	case KindNoSuchUpload:
 		return "NoSuchUpload"
 	case KindNamespaceAlreadyExists:
+		return "BucketAlreadyExists"
+	case KindNamespaceAlreadyOwned:
 		return "BucketAlreadyOwnedByYou"
 	case KindNamespaceNotEmpty:
 		return "BucketNotEmpty"
@@ -221,6 +252,14 @@ func (e *Error) S3Code() string {
 		return "QuotaExceeded"
 	case KindRequestTimeout:
 		return "RequestTimeout"
+	case KindInvalidRequest:
+		return "InvalidRequest"
+	case KindBadDigest:
+		return "BadDigest"
+	case KindInvalidDigest:
+		return "InvalidDigest"
+	case KindContentSHA256Mismatch:
+		return "XAmzContentSHA256Mismatch"
 	default:
 		return "InternalError"
 	}
@@ -232,12 +271,13 @@ func (e *Error) Status() int {
 	case KindNoSuchNamespace, KindNoSuchKey, KindNoSuchUpload, KindNoSuchTenant,
 		KindNoSuchCredential, KindNoSuchMember, KindNoSuchInvitation:
 		return http.StatusNotFound
-	case KindNamespaceAlreadyExists, KindNamespaceNotEmpty,
+	case KindNamespaceAlreadyExists, KindNamespaceAlreadyOwned, KindNamespaceNotEmpty,
 		KindTenantAlreadyExists, KindTenantNotEmpty:
 		return http.StatusConflict
 	case KindInvalidNamespaceName, KindInvalidTenantName,
 		KindInvalidArgument, KindInvalidPart, KindMalformedXML,
-		KindEntityTooLarge, KindRequestTimeout:
+		KindEntityTooLarge, KindRequestTimeout, KindInvalidRequest,
+		KindBadDigest, KindInvalidDigest, KindContentSHA256Mismatch:
 		return http.StatusBadRequest
 	case KindInvalidRange:
 		return http.StatusRequestedRangeNotSatisfiable

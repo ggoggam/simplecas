@@ -137,7 +137,7 @@ func TestParseAuthHeader(t *testing.T) {
 // Auth disabled is the documented dev/PWA mode: no signature is required at all.
 func TestVerifySkippedWhenAuthDisabled(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/ns/key", nil)
-	if err := verify(r, config.AuthConfig{Enabled: false}); err != nil {
+	if _, err := verify(r, config.AuthConfig{Enabled: false}); err != nil {
 		t.Errorf("verify with auth disabled = %v, want nil", err)
 	}
 }
@@ -196,6 +196,7 @@ func TestVerifyRejects(t *testing.T) {
 					"Credential=AKID/"+dateStamp+"/us-east-1/s3/aws4_request, "+
 					"SignedHeaders=host;x-amz-absent, Signature=abc")
 				r.Header.Set("x-amz-date", amzDate)
+				r.Header.Set("x-amz-content-sha256", unsignedPayload)
 			},
 			want: apperr.ErrSignatureDoesNotMatch,
 		},
@@ -206,6 +207,7 @@ func TestVerifyRejects(t *testing.T) {
 					"Credential=AKID/"+dateStamp+"/us-east-1/s3/aws4_request, "+
 					"SignedHeaders=host, Signature=0000000000000000")
 				r.Header.Set("x-amz-date", amzDate)
+				r.Header.Set("x-amz-content-sha256", unsignedPayload)
 			},
 			want: apperr.ErrSignatureDoesNotMatch,
 		},
@@ -214,7 +216,7 @@ func TestVerifyRejects(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			r := httptest.NewRequest(http.MethodGet, "/ns/key", nil)
 			tc.prepare(r)
-			err := verify(r, auth)
+			_, err := verify(r, auth)
 			if err != tc.want {
 				t.Errorf("verify = %v, want %v", err, tc.want)
 			}
@@ -222,11 +224,15 @@ func TestVerifyRejects(t *testing.T) {
 	}
 }
 
-// signAt signs r with UNSIGNED-PAYLOAD as keyID/secret at the given time and
-// scope service, the way a real client does: build the canonical request, sign
-// it, and set the Authorization header.
+// signAt signs r as keyID/secret at the given time and scope service, the way
+// a real client does: build the canonical request, sign it, and set the
+// Authorization header. The payload hash is the x-amz-content-sha256 already on
+// r, or UNSIGNED-PAYLOAD when it carries none.
 func signAt(r *http.Request, keyID, secret string, at time.Time, service string) {
-	const payload = "UNSIGNED-PAYLOAD"
+	payload := r.Header.Get("x-amz-content-sha256")
+	if payload == "" {
+		payload = unsignedPayload
+	}
 	amzDate := at.UTC().Format(amzDateFormat)
 	dateStamp := amzDate[:8]
 
@@ -271,8 +277,23 @@ func TestVerifyAcceptsACorrectlySignedRequest(t *testing.T) {
 	r.Host = "cas.example.com"
 	signAt(r, "AKID", "secret", now(), "s3")
 
-	if err := verify(r, testAuth); err != nil {
+	if _, err := verify(r, testAuth); err != nil {
 		t.Fatalf("a correctly signed request was rejected: %v", err)
+	}
+}
+
+// x-amz-content-sha256 is what the signature holds the body to, so S3 requires
+// it on every SigV4 request. Without it a signed request would say nothing
+// about its body at all.
+func TestVerifyRequiresThePayloadHash(t *testing.T) {
+	r := httptest.NewRequest(http.MethodPut, "/ns/key", strings.NewReader("abc"))
+	r.Host = "cas.example.com"
+	signAt(r, "AKID", "secret", now(), "s3")
+	r.Header.Del("x-amz-content-sha256")
+
+	_, err := verify(r, testAuth)
+	if e := apperr.From(err); e == nil || e.S3Code() != "InvalidRequest" {
+		t.Fatalf("verify without x-amz-content-sha256 = %v, want InvalidRequest", err)
 	}
 }
 
@@ -297,7 +318,7 @@ func TestVerifyEnforcesFreshness(t *testing.T) {
 			r := httptest.NewRequest(http.MethodGet, "/ns/key", nil)
 			r.Host = "cas.example.com"
 			signAt(r, "AKID", "secret", now().Add(tc.at), tc.service)
-			if err := verify(r, testAuth); err != tc.want {
+			if _, err := verify(r, testAuth); err != tc.want {
 				t.Errorf("verify = %v, want %v", err, tc.want)
 			}
 		})
@@ -311,12 +332,12 @@ func TestVerifyRejectsMismatchedScopeDate(t *testing.T) {
 	r.Host = "cas.example.com"
 	signAt(r, "AKID", "secret", now(), "s3")
 	r.Header.Set("x-amz-date", now().Add(-48*time.Hour).UTC().Format(amzDateFormat))
-	if err := verify(r, testAuth); err != apperr.ErrAccessDenied {
+	if _, err := verify(r, testAuth); err != apperr.ErrAccessDenied {
 		t.Errorf("verify = %v, want AccessDenied", err)
 	}
 
 	r.Header.Set("x-amz-date", "not-a-date")
-	if err := verify(r, testAuth); err != apperr.ErrAccessDenied {
+	if _, err := verify(r, testAuth); err != apperr.ErrAccessDenied {
 		t.Errorf("verify with a malformed x-amz-date = %v, want AccessDenied", err)
 	}
 }
