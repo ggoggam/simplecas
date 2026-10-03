@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/ggoggam/simplecas/internal/config"
 )
 
@@ -33,6 +35,7 @@ func testRegistry(t *testing.T, providers ...*Provider) *Registry {
 		cfg:        cfg,
 		byID:       map[string]*Provider{},
 		httpClient: &http.Client{Timeout: 5 * time.Second},
+		store:      newMemStore(),
 		log:        slog.New(slog.DiscardHandler),
 	}
 	for _, p := range providers {
@@ -59,7 +62,7 @@ func TestGuard(t *testing.T) {
 	t.Run("a valid session passes through and is attached", func(t *testing.T) {
 		reached, seen = false, nil
 		r := httptest.NewRequest(http.MethodGet, "/api/stats", nil)
-		r.AddCookie(issueSession(t, testSecret, Session{
+		r.AddCookie(reg.signIn(t, Session{
 			Issuer: "https://idp.test", Subject: "sub-1", Email: "dev@example.com", EmailVerified: true,
 			Provider: "google", Expires: time.Now().Add(time.Hour).Unix(),
 		}))
@@ -70,6 +73,25 @@ func TestGuard(t *testing.T) {
 		}
 		if seen == nil || seen.VerifiedEmail() != "dev@example.com" {
 			t.Errorf("session in context = %+v", seen)
+		}
+		// The rows behind it are attached too, for the admin API.
+		if seen != nil && (seen.ID == uuid.Nil || seen.UserID == 0) {
+			t.Errorf("session in context = %+v, want its row ids", seen)
+		}
+	})
+
+	// A genuine cookie is not enough: its session has to have a row.
+	t.Run("a genuine cookie with no session row is refused", func(t *testing.T) {
+		reached = false
+		r := httptest.NewRequest(http.MethodGet, "/api/stats", nil)
+		r.AddCookie(issueSession(t, testSecret, Session{
+			Issuer: "https://idp.test", Subject: "sub-1", Provider: "google",
+			Expires: time.Now().Add(time.Hour).Unix(),
+		}))
+		w := httptest.NewRecorder()
+		guarded.ServeHTTP(w, r)
+		if reached || w.Code != http.StatusUnauthorized {
+			t.Errorf("reached=%v status=%d, want a 401", reached, w.Code)
 		}
 	})
 
@@ -192,7 +214,7 @@ func TestLoginPageRedirectsWhenAlreadySignedIn(t *testing.T) {
 	reg := testRegistry(t, &Provider{ID: "google", Name: "Google"})
 
 	r := httptest.NewRequest(http.MethodGet, "/auth/login?redirect=/ui/x", nil)
-	r.AddCookie(issueSession(t, testSecret, Session{
+	r.AddCookie(reg.signIn(t, Session{
 		Issuer: "https://idp.test", Subject: "s", Provider: "google", Expires: time.Now().Add(time.Hour).Unix(),
 	}))
 	w := httptest.NewRecorder()
@@ -214,7 +236,7 @@ func TestLoginPageRedirectStaysInThePWA(t *testing.T) {
 
 	t.Run("signed in", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, target, nil)
-		r.AddCookie(issueSession(t, testSecret, Session{
+		r.AddCookie(reg.signIn(t, Session{
 			Issuer: "https://idp.test", Subject: "s", Provider: "google", Expires: time.Now().Add(time.Hour).Unix(),
 		}))
 		w := httptest.NewRecorder()
@@ -402,7 +424,7 @@ func TestHandleMe(t *testing.T) {
 
 	t.Run("signed in", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "/auth/me", nil)
-		r.AddCookie(issueSession(t, testSecret, Session{
+		r.AddCookie(reg.signIn(t, Session{
 			Issuer: "https://idp.test", Subject: "sub-1", Email: "dev@example.com", EmailVerified: true,
 			Name: "Dev", Provider: "google", Expires: time.Now().Add(time.Hour).Unix(),
 		}))
@@ -430,7 +452,7 @@ func TestHandleMe(t *testing.T) {
 	// to serialise as null rather than "".
 	t.Run("absent claims serialise as null", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "/auth/me", nil)
-		r.AddCookie(issueSession(t, testSecret, Session{
+		r.AddCookie(reg.signIn(t, Session{
 			Issuer: "https://idp.test", Subject: "sub-1", Provider: "google", Expires: time.Now().Add(time.Hour).Unix(),
 		}))
 		w := httptest.NewRecorder()
@@ -552,8 +574,15 @@ func (idp *fakeIdP) signIDToken(t *testing.T) string {
 	return signingInput + "." + base64.RawURLEncoding.EncodeToString(sig)
 }
 
-// flowRegistry discovers idp and returns a registry pointed at it.
+// flowRegistry discovers idp and returns a registry pointed at it, keeping
+// sessions in memory.
 func flowRegistry(t *testing.T, idp *fakeIdP, cfg *config.OidcConfig) *Registry {
+	t.Helper()
+	return flowRegistryWith(t, idp, cfg, newMemStore())
+}
+
+// flowRegistryWith is flowRegistry keeping sessions in store.
+func flowRegistryWith(t *testing.T, idp *fakeIdP, cfg *config.OidcConfig, store SessionStore) *Registry {
 	t.Helper()
 	cfg.Enabled = true
 	if cfg.PublicURL == "" {
@@ -573,7 +602,7 @@ func flowRegistry(t *testing.T, idp *fakeIdP, cfg *config.OidcConfig) *Registry 
 		ClientSecret: "test-secret",
 	}}
 
-	reg, err := NewRegistry(t.Context(), cfg, slog.New(slog.DiscardHandler))
+	reg, err := NewRegistry(t.Context(), cfg, store, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("discovery against the fake provider failed: %v", err)
 	}
@@ -814,7 +843,7 @@ func TestLoginWithUnverifiedEmailCarriesNoVerifiedAddress(t *testing.T) {
 		if c.Name == sessionCookie && c.MaxAge > 0 {
 			r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
 			r.AddCookie(c)
-			if email := CurrentSession(r, reg.cfg).VerifiedEmail(); email != "" {
+			if email := cookieClaims(r, reg.cfg).VerifiedEmail(); email != "" {
 				t.Errorf("VerifiedEmail = %q, want empty for an unverified address", email)
 			}
 			return
@@ -839,7 +868,7 @@ func TestLoginWithStringEmailVerified(t *testing.T) {
 		if c.Name == sessionCookie && c.MaxAge > 0 {
 			r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
 			r.AddCookie(c)
-			if email := CurrentSession(r, reg.cfg).VerifiedEmail(); email != "dev@example.com" {
+			if email := cookieClaims(r, reg.cfg).VerifiedEmail(); email != "dev@example.com" {
 				t.Errorf("VerifiedEmail = %q, want the verified address", email)
 			}
 			return
@@ -1022,7 +1051,7 @@ func TestRegistryRejectsDuplicateProviderIDs(t *testing.T) {
 			{ID: "dup", Issuer: idp.server.URL, ClientID: "b"},
 		},
 	}
-	if _, err := NewRegistry(t.Context(), cfg, slog.New(slog.DiscardHandler)); err == nil {
+	if _, err := NewRegistry(t.Context(), cfg, newMemStore(), slog.New(slog.DiscardHandler)); err == nil {
 		t.Fatal("duplicate provider ids should be rejected at startup")
 	}
 }
@@ -1037,7 +1066,7 @@ func TestRegistryFailsOnUnreachableIssuer(t *testing.T) {
 			{ID: "broken", Issuer: "http://127.0.0.1:1/nope", ClientID: "a"},
 		},
 	}
-	if _, err := NewRegistry(t.Context(), cfg, slog.New(slog.DiscardHandler)); err == nil {
+	if _, err := NewRegistry(t.Context(), cfg, newMemStore(), slog.New(slog.DiscardHandler)); err == nil {
 		t.Fatal("an unreachable issuer should fail discovery at startup")
 	}
 }

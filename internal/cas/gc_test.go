@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/ggoggam/simplecas/internal/config"
+	"github.com/ggoggam/simplecas/internal/db"
 	"github.com/ggoggam/simplecas/internal/storage"
 )
 
@@ -141,6 +142,35 @@ func TestSweepMultipartReclaimsAbandonedParts(t *testing.T) {
 	}
 }
 
+func TestSweepSessionsRemovesExpiredOnes(t *testing.T) {
+	f := newFixture(t, collectNow())
+	ctx := t.Context()
+	user, err := f.db.ResolveUser(ctx, "https://idp.test", "sub-1", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, expires := range []time.Time{time.Now().Add(-time.Minute), time.Now().Add(time.Hour)} {
+		_, err := f.db.CreateSession(ctx, db.NewSession{
+			TokenHash: []byte{byte(i)}, UserID: user.ID, ExpiresAt: expires,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	f.store.sweepSessions(ctx)
+
+	var total, live int
+	err = f.pool.QueryRow(ctx,
+		"SELECT count(*), count(*) FILTER (WHERE expires_at > now()) FROM sessions").Scan(&total, &live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 || live != 1 {
+		t.Errorf("%d sessions left (%d live), want only the live one", total, live)
+	}
+}
+
 // The sweeps run in sequence, and each has to survive the others' leftovers.
 func TestRunGCStopsOnContextCancel(t *testing.T) {
 	f := newFixture(t, config.GcConfig{IntervalSecs: 1, GraceSecs: 0, MultipartExpirySecs: 0})
@@ -168,6 +198,7 @@ func TestGCPassOnAnEmptyStore(t *testing.T) {
 	f.store.sweepBlobs(ctx)
 	f.store.sweepStaging(ctx)
 	f.store.sweepMultipart(ctx)
+	f.store.sweepSessions(ctx)
 
 	if n := f.countUnder(t, ""); n != 0 {
 		t.Errorf("an empty store gained %d objects during a GC pass", n)

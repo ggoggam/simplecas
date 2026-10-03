@@ -88,6 +88,11 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("POST /api/tenants/{tenant}/invitations", h.createInvitation)
 	mux.HandleFunc("DELETE /api/tenants/{tenant}/invitations/{email}", h.revokeInvitation)
 
+	mux.HandleFunc("GET /api/me/sessions", h.listSessions)
+	mux.HandleFunc("DELETE /api/me/sessions/{id}", h.revokeSession)
+	mux.HandleFunc("POST /api/me/sessions/revoke-others", h.revokeOtherSessions)
+	mux.HandleFunc("POST /api/me/sessions/revoke-all", h.revokeAllSessions)
+
 	mux.HandleFunc("GET /api/invitations", h.myInvitations)
 	mux.HandleFunc("POST /api/invitations/{tenant}/accept", h.acceptInvitation)
 	mux.HandleFunc("POST /api/invitations/{tenant}/decline", h.declineInvitation)
@@ -151,10 +156,14 @@ func decodeJSON(r *http.Request, v any) error {
 // userContextKey carries the caller's users row down to the handlers.
 type userContextKey struct{}
 
-// identify maps the signed-in identity the guard attached to its users row,
-// creating the row on first sight, so every handler authorizes on a user id.
-// With no session (OIDC off) the request passes through untouched and is
-// served by the untenanted plane.
+// identify maps the signed-in identity the guard attached to its users row, so
+// every handler authorizes on a user id. With no session (OIDC off) the
+// request passes through untouched and is served by the untenanted plane.
+//
+// The guard has already found the user while checking the session's row, in
+// the same query, so this costs nothing more. A session attached without that
+// check (auth.WithSession from a test or another front-end) is resolved by its
+// identity, creating the user on first sight.
 func (h *Handler) identify(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		session := auth.FromContext(r.Context())
@@ -166,11 +175,15 @@ func (h *Handler) identify(next http.Handler) http.Handler {
 			h.writeError(w, r, apperr.Forbidden("the session carries no identity"))
 			return
 		}
-		user, err := h.db.ResolveUser(r.Context(),
-			session.Issuer, session.Subject, session.VerifiedEmail(), session.Name)
-		if err != nil {
-			h.writeError(w, r, err)
-			return
+		user := db.User{ID: session.UserID, Email: session.VerifiedEmail(), Name: session.Name}
+		if user.ID == 0 {
+			var err error
+			user, err = h.db.ResolveUser(r.Context(),
+				session.Issuer, session.Subject, session.VerifiedEmail(), session.Name)
+			if err != nil {
+				h.writeError(w, r, err)
+				return
+			}
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userContextKey{}, user)))
 	})

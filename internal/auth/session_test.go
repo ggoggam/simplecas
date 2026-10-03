@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/ggoggam/simplecas/internal/config"
 )
 
@@ -165,21 +167,30 @@ func TestAdmitted(t *testing.T) {
 	}
 }
 
-// mustSession reads the caller's session and fails if there isn't one, so the
-// assertions that follow can dereference it directly.
+// cookieClaims reads the claims of the caller's session cookie, without
+// asking any store whether its session is live.
+func cookieClaims(r *http.Request, cfg *config.OidcConfig) *Session {
+	s, _ := sessionFromCookie(r, cfg)
+	return s
+}
+
+// mustSession reads the caller's session cookie and fails if there isn't a
+// genuine one, so the assertions that follow can dereference it directly.
 func mustSession(t *testing.T, r *http.Request, cfg *config.OidcConfig) *Session {
 	t.Helper()
-	s := CurrentSession(r, cfg)
+	s := cookieClaims(r, cfg)
 	if s == nil {
 		t.Fatal("expected a valid session")
 	}
 	return s
 }
 
-// issueSession mints a signed session cookie the way a completed login does.
+// issueSession mints a signed session cookie shaped like the one a completed
+// login sets, with a fresh token that no store has a row for. It is for the
+// checks made on the cookie alone; Registry.signIn mints a live one.
 func issueSession(t *testing.T, secret string, s Session) *http.Cookie {
 	t.Helper()
-	token, err := signSession(secret, s)
+	token, err := signSession(secret, s, randomToken())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +207,7 @@ func signedJSON(t *testing.T, v any) string {
 	return sign(testSecret, payload)
 }
 
-func TestCurrentSession(t *testing.T) {
+func TestSessionFromCookie(t *testing.T) {
 	cfg := &config.OidcConfig{SessionSecret: testSecret, SessionTTLSecs: 3600}
 	valid := Session{
 		Issuer: "https://idp.test", Subject: "sub-1", Email: "dev@example.com", EmailVerified: true,
@@ -215,7 +226,7 @@ func TestCurrentSession(t *testing.T) {
 
 	t.Run("no cookie", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
-		if CurrentSession(r, cfg) != nil {
+		if cookieClaims(r, cfg) != nil {
 			t.Error("expected no session")
 		}
 	})
@@ -225,7 +236,7 @@ func TestCurrentSession(t *testing.T) {
 		expired.Expires = time.Now().Add(-time.Minute).Unix()
 		r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
 		r.AddCookie(issueSession(t, testSecret, expired))
-		if CurrentSession(r, cfg) != nil {
+		if cookieClaims(r, cfg) != nil {
 			t.Error("an expired session must be rejected")
 		}
 	})
@@ -233,7 +244,7 @@ func TestCurrentSession(t *testing.T) {
 	t.Run("signed with another secret", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
 		r.AddCookie(issueSession(t, "a-different-secret-entirely", valid))
-		if CurrentSession(r, cfg) != nil {
+		if cookieClaims(r, cfg) != nil {
 			t.Error("a session signed elsewhere must be rejected")
 		}
 	})
@@ -241,7 +252,7 @@ func TestCurrentSession(t *testing.T) {
 	t.Run("garbage cookie", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
 		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: "nonsense"})
-		if CurrentSession(r, cfg) != nil {
+		if cookieClaims(r, cfg) != nil {
 			t.Error("a malformed cookie must be rejected")
 		}
 	})
@@ -253,7 +264,7 @@ func TestCurrentSession(t *testing.T) {
 		legacy.Issuer = ""
 		r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
 		r.AddCookie(issueSession(t, testSecret, legacy))
-		if CurrentSession(r, cfg) != nil {
+		if cookieClaims(r, cfg) != nil {
 			t.Error("a session without an issuer must be rejected")
 		}
 	})
@@ -266,7 +277,7 @@ func TestCurrentSession(t *testing.T) {
 			Type: typeFlow, Provider: "google", CSRF: "c", Nonce: "n", PKCEVerifier: "v",
 			RedirectAfter: "/ui/", Expires: time.Now().Add(time.Hour).Unix(),
 		})})
-		if CurrentSession(r, cfg) != nil {
+		if cookieClaims(r, cfg) != nil {
 			t.Error("a flow-state token must not be accepted as a session")
 		}
 	})
@@ -276,9 +287,39 @@ func TestCurrentSession(t *testing.T) {
 	t.Run("a complete session tagged as flow state", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
 		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: signedJSON(t,
-			sessionToken{Type: typeFlow, Session: valid})})
-		if CurrentSession(r, cfg) != nil {
+			sessionToken{Type: typeFlow, Token: randomToken(), Session: valid})})
+		if cookieClaims(r, cfg) != nil {
 			t.Error("a token of another type must not be accepted as a session")
+		}
+	})
+
+	// A stateless session from before sessions had rows carries no token to
+	// look one up by, so it signs its holder out.
+	t.Run("pre-upgrade session without a token", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
+		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: signedJSON(t,
+			sessionToken{Type: typeSession, Session: valid})})
+		if cookieClaims(r, cfg) != nil {
+			t.Error("a session cookie without a token must not be accepted")
+		}
+	})
+
+	// The row ids come from the database; a cookie that claims them gets no
+	// say.
+	t.Run("row ids are not read from the cookie", func(t *testing.T) {
+		payload, err := json.Marshal(map[string]any{
+			"typ": typeSession, "tok": randomToken(), "iss": valid.Issuer, "sub": valid.Subject,
+			"provider": valid.Provider, "exp": valid.Expires,
+			"ID": "6f1c1d9e-0000-4000-8000-000000000000", "UserID": 7,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
+		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: sign(testSecret, payload)})
+		got := mustSession(t, r, cfg)
+		if got.ID != uuid.Nil || got.UserID != 0 {
+			t.Errorf("session = %+v, want no row ids from the cookie", got)
 		}
 	})
 
@@ -286,7 +327,7 @@ func TestCurrentSession(t *testing.T) {
 	t.Run("untagged session", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodGet, "/ui/", nil)
 		r.AddCookie(&http.Cookie{Name: sessionCookie, Value: signedJSON(t, valid)})
-		if CurrentSession(r, cfg) != nil {
+		if cookieClaims(r, cfg) != nil {
 			t.Error("an untagged token must not be accepted as a session")
 		}
 	})
@@ -298,7 +339,7 @@ func TestCurrentSession(t *testing.T) {
 			Name:  sessionCookie,
 			Value: sign(testSecret, []byte(`"not an object"`)),
 		})
-		if CurrentSession(r, cfg) != nil {
+		if cookieClaims(r, cfg) != nil {
 			t.Error("a non-session payload must be rejected")
 		}
 	})
@@ -346,12 +387,12 @@ func TestCookiesTakeTheHostPrefixOverHTTPS(t *testing.T) {
 
 // Over HTTPS only the prefixed cookie is a session; a bare-named one, which a
 // sibling subdomain or a plain-HTTP response could have planted, is ignored.
-func TestCurrentSessionReadsTheHostPrefixedCookieOverHTTPS(t *testing.T) {
+func TestSessionCookieIsHostPrefixedOverHTTPS(t *testing.T) {
 	cfg := &config.OidcConfig{PublicURL: "https://cas.example.com", SessionSecret: testSecret}
 	token, err := signSession(testSecret, Session{
 		Issuer: "https://idp.test", Subject: "sub-1", Provider: "google",
 		Expires: time.Now().Add(time.Hour).Unix(),
-	})
+	}, randomToken())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +405,7 @@ func TestCurrentSessionReadsTheHostPrefixedCookieOverHTTPS(t *testing.T) {
 
 	r = httptest.NewRequest(http.MethodGet, "/ui/", nil)
 	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: token})
-	if CurrentSession(r, cfg) != nil {
+	if cookieClaims(r, cfg) != nil {
 		t.Error("over HTTPS a cookie without the __Host- prefix must be ignored")
 	}
 }
@@ -448,7 +489,7 @@ func TestValidateConfig(t *testing.T) {
 // A disabled OIDC config yields no registry at all, which is what leaves the
 // /auth endpoints unmounted and /ui and /api unguarded.
 func TestNewRegistryDisabled(t *testing.T) {
-	reg, err := NewRegistry(t.Context(), &config.OidcConfig{Enabled: false}, slog.New(slog.DiscardHandler))
+	reg, err := NewRegistry(t.Context(), &config.OidcConfig{Enabled: false}, nil, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("disabled OIDC should not error: %v", err)
 	}

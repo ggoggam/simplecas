@@ -96,7 +96,7 @@ func run(logger *slog.Logger) error {
 
 	// OIDC discovery (and the initial JWKS fetch) happens here so a broken auth
 	// configuration fails startup instead of every login.
-	registry, err := auth.NewRegistry(startupCtx, &cfg.OIDC, logger)
+	registry, err := auth.NewRegistry(startupCtx, &cfg.OIDC, database, logger)
 	if err != nil {
 		return err
 	}

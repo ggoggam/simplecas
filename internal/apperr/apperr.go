@@ -34,6 +34,7 @@ const (
 	KindNoSuchCredential
 	KindNoSuchMember
 	KindNoSuchInvitation
+	KindNoSuchSession
 	KindForbidden
 	KindInvalidArgument
 	KindInvalidPart
@@ -74,6 +75,7 @@ var (
 	ErrNoSuchCredential       = &Error{Kind: KindNoSuchCredential, msg: "credential not found"}
 	ErrNoSuchMember           = &Error{Kind: KindNoSuchMember, msg: "member not found"}
 	ErrNoSuchInvitation       = &Error{Kind: KindNoSuchInvitation, msg: "invitation not found or expired"}
+	ErrNoSuchSession          = &Error{Kind: KindNoSuchSession, msg: "session not found"}
 	ErrInvalidRange           = &Error{Kind: KindInvalidRange, msg: "requested range not satisfiable"}
 	ErrAccessDenied           = &Error{Kind: KindAccessDenied, msg: "access denied"}
 	ErrSignatureDoesNotMatch  = &Error{Kind: KindSignatureDoesNotMatch, msg: "signature mismatch"}
@@ -199,6 +201,8 @@ func (e *Error) S3Code() string {
 		return "NoSuchMember"
 	case KindNoSuchInvitation:
 		return "NoSuchInvitation"
+	case KindNoSuchSession:
+		return "NoSuchSession"
 	case KindForbidden, KindAccessDenied:
 		return "AccessDenied"
 	case KindInvalidArgument:
@@ -230,7 +234,7 @@ func (e *Error) S3Code() string {
 func (e *Error) Status() int {
 	switch e.Kind {
 	case KindNoSuchNamespace, KindNoSuchKey, KindNoSuchUpload, KindNoSuchTenant,
-		KindNoSuchCredential, KindNoSuchMember, KindNoSuchInvitation:
+		KindNoSuchCredential, KindNoSuchMember, KindNoSuchInvitation, KindNoSuchSession:
 		return http.StatusNotFound
 	case KindNamespaceAlreadyExists, KindNamespaceNotEmpty,
 		KindTenantAlreadyExists, KindTenantNotEmpty:

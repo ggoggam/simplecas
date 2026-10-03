@@ -26,6 +26,7 @@ func TestCodesAndStatuses(t *testing.T) {
 		{"tenant exists", ErrTenantAlreadyExists, "TenantAlreadyExists", http.StatusConflict},
 		{"tenant not empty", ErrTenantNotEmpty, "TenantNotEmpty", http.StatusConflict},
 		{"bad tenant name", ErrInvalidTenantName, "InvalidTenantName", http.StatusBadRequest},
+		{"session missing", ErrNoSuchSession, "NoSuchSession", http.StatusNotFound},
 		{"range unsatisfiable", ErrInvalidRange, "InvalidRange", http.StatusRequestedRangeNotSatisfiable},
 		{"access denied", ErrAccessDenied, "AccessDenied", http.StatusForbidden},
 		{"signature mismatch", ErrSignatureDoesNotMatch, "SignatureDoesNotMatch", http.StatusForbidden},
