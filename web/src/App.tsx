@@ -9,6 +9,7 @@ import {
   formatBytes,
   type CreatedCredential,
   type Credential,
+  type Permission,
   type Invitation,
   type Member,
   type Role,
@@ -125,9 +126,37 @@ function lastSeenLabel(iso: string): string {
   return new Date(iso).toLocaleDateString();
 }
 
-/** An S3 key's expiry and last use, for its row in the key list. */
+/**
+ * The access choices offered when minting a key, each a set of permissions.
+ * "full" sends none, so the server grants all of them.
+ */
+const keyAccessOptions: {
+  value: string;
+  label: string;
+  permissions: Permission[] | null;
+}[] = [
+  { value: "full", label: "Full access", permissions: null },
+  { value: "read", label: "Read only", permissions: ["read", "list"] },
+  {
+    value: "nodelete",
+    label: "Read & write, no delete",
+    permissions: ["read", "list", "write"],
+  },
+  { value: "upload", label: "Upload only", permissions: ["write"] },
+];
+
+/** What an S3 key may do and where, for its row in the key list. */
+function credentialScope(
+  c: Pick<Credential, "permissions" | "namespaces">,
+): string {
+  const what =
+    c.permissions.length === 4 ? "full access" : c.permissions.join(", ");
+  return c.namespaces ? `${what} on ${c.namespaces.join(", ")}` : what;
+}
+
+/** An S3 key's scope, expiry and last use, for its row in the key list. */
 function credentialStatus(c: Credential): string {
-  const parts: string[] = [];
+  const parts: string[] = [credentialScope(c)];
   if (c.expires_at) {
     const expires = new Date(c.expires_at);
     parts.push(
@@ -246,6 +275,10 @@ export function BrowserPage() {
   const [keyLabel, setKeyLabel] = useState("");
   // Lifetime of the next key minted, in days; "" never expires.
   const [keyExpiry, setKeyExpiry] = useState("90");
+  // Scope of the next key minted: a keyAccessOptions value, and one namespace
+  // or "" for every namespace the team owns.
+  const [keyAccess, setKeyAccess] = useState("full");
+  const [keyNamespace, setKeyNamespace] = useState("");
   // The just-minted key, held only so its secret can be shown once. The server
   // stores the secret but never returns it again, so losing this means minting
   // a replacement.
@@ -493,6 +526,8 @@ export function BrowserPage() {
     setInviteRole("member");
     setKeyLabel("");
     setKeyExpiry("90");
+    setKeyAccess("full");
+    setKeyNamespace("");
     setFreshKey(null);
     setSentInvitations([]);
     setTeamDialogOpen(true);
@@ -510,6 +545,9 @@ export function BrowserPage() {
         activeTeam,
         keyLabel.trim(),
         keyExpiry === "" ? null : Number(keyExpiry),
+        keyAccessOptions.find((o) => o.value === keyAccess)?.permissions ??
+          null,
+        keyNamespace === "" ? null : [keyNamespace],
       );
       setFreshKey(created);
       setKeyLabel("");
@@ -1721,9 +1759,10 @@ export function BrowserPage() {
                   </h4>
                   <p className="text-xs text-muted-foreground">
                     Point any S3 client at this server. A key reaches only this
-                    team’s namespaces — and grants full read/write over all of
-                    them. An expired key stops working but stays listed until
-                    you revoke it.
+                    team’s namespaces, and can be limited to one of them and to
+                    reading or uploading. Only a full-access key for every
+                    namespace can create or delete namespaces. An expired key
+                    stops working but stays listed until you revoke it.
                   </p>
                 </div>
 
@@ -1744,6 +1783,10 @@ export function BrowserPage() {
                           secret access key:{" "}
                         </span>
                         {freshKey.secret_access_key}
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">scope: </span>
+                        {credentialScope(freshKey)}
                       </div>
                       {freshKey.expires_at && (
                         <div>
@@ -1843,6 +1886,36 @@ export function BrowserPage() {
                       placeholder="ci pipeline"
                     />
                   </div>
+                  <Button variant="outline" onClick={doCreateCredential}>
+                    <Key className="size-4" /> Create key
+                  </Button>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <select
+                    className="h-9 min-w-0 flex-1 rounded-md border bg-background px-2 text-sm"
+                    value={keyAccess}
+                    onChange={(e) => setKeyAccess(e.target.value)}
+                    aria-label="Key access"
+                  >
+                    {keyAccessOptions.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    className="h-9 min-w-0 flex-1 rounded-md border bg-background px-2 text-sm"
+                    value={keyNamespace}
+                    onChange={(e) => setKeyNamespace(e.target.value)}
+                    aria-label="Key namespace"
+                  >
+                    <option value="">All namespaces</option>
+                    {namespaces.map((b) => (
+                      <option key={b.name} value={b.name}>
+                        {b.name}
+                      </option>
+                    ))}
+                  </select>
                   <select
                     className="h-9 rounded-md border bg-background px-2 text-sm"
                     value={keyExpiry}
@@ -1854,9 +1927,6 @@ export function BrowserPage() {
                     <option value="365">1 year</option>
                     <option value="">No expiry</option>
                   </select>
-                  <Button variant="outline" onClick={doCreateCredential}>
-                    <Key className="size-4" /> Create key
-                  </Button>
                 </div>
               </div>
             )}

@@ -15,11 +15,14 @@ import (
 // the gateway and reach only its own namespaces. See internal/s3/principal.go
 // for how a key resolves to a tenant scope on the way in.
 //
-// Minting and revoking are owner-only. A credential is full read/write access
-// to every namespace the tenant owns, so handing one out is closer to adding an
-// owner than to adding a member — there are no per-namespace or read-only keys.
-// A key can be given an expiry when it is minted, after which it verifies
-// nothing; it stays listed until an owner revokes it.
+// Minting and revoking are owner-only. A key minted without a scope is full
+// read/write access to every namespace the tenant owns, now and later, so
+// handing one out is closer to adding an owner than to adding a member. A scope
+// narrows it: to some of read, list, write and delete, and to named namespaces
+// (see s3.Permission for what each permission covers). A key can also be given
+// an expiry when it is minted, after which it verifies nothing; it stays listed
+// until an owner revokes it. A scope cannot be changed after minting: mint a
+// new key and revoke the old one.
 
 // maxCredentialDays caps a key's lifetime when one is asked for. A key that
 // should outlive this is a key minted without an expiry.
@@ -88,7 +91,10 @@ type credentialJSON struct {
 	ExpiresAt   *time.Time `json:"expires_at"`
 	LastUsedAt  *time.Time `json:"last_used_at"`
 	// CreatedBy is the minting owner's address, or "" when it is not known.
-	CreatedBy string `json:"created_by"`
+	CreatedBy   string   `json:"created_by"`
+	Permissions []string `json:"permissions"`
+	// Namespaces is null for a key that reaches every namespace.
+	Namespaces []string `json:"namespaces"`
 }
 
 // createdCredentialJSON is the create response, and the only time the secret
@@ -98,6 +104,8 @@ type createdCredentialJSON struct {
 	SecretAccessKey string     `json:"secret_access_key"`
 	Description     string     `json:"description"`
 	ExpiresAt       *time.Time `json:"expires_at"`
+	Permissions     []string   `json:"permissions"`
+	Namespaces      []string   `json:"namespaces"`
 }
 
 func (h *Handler) listCredentials(w http.ResponseWriter, r *http.Request) {
@@ -121,6 +129,8 @@ func (h *Handler) listCredentials(w http.ResponseWriter, r *http.Request) {
 			ExpiresAt:   c.ExpiresAt,
 			LastUsedAt:  c.LastUsedAt,
 			CreatedBy:   c.CreatedBy,
+			Permissions: c.Permissions,
+			Namespaces:  c.Namespaces,
 		})
 	}
 	h.writeJSON(w, http.StatusOK, out)
@@ -137,11 +147,16 @@ func (h *Handler) createCredential(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The body is optional: a label and an expiry are conveniences, not
-	// requirements. A missing expiry is a key that never expires.
+	// The body is optional: a label, an expiry and a scope are conveniences,
+	// not requirements. A missing expiry is a key that never expires, missing
+	// permissions are all of them, and missing namespaces are every one the
+	// team owns. An empty list of either is refused rather than read as
+	// "all", so a client that meant to grant nothing never grants everything.
 	var req struct {
-		Description   string `json:"description"`
-		ExpiresInDays *int   `json:"expires_in_days"`
+		Description   string          `json:"description"`
+		ExpiresInDays *int            `json:"expires_in_days"`
+		Permissions   []s3.Permission `json:"permissions"`
+		Namespaces    []string        `json:"namespaces"`
 	}
 	if r.ContentLength > 0 {
 		if err := decodeJSON(r, &req); err != nil {
@@ -173,14 +188,17 @@ func (h *Handler) createCredential(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, err)
 		return
 	}
-	if err := h.gateway.StoreCredential(r.Context(), s3.Credential{
+	scope, err := h.gateway.StoreCredential(r.Context(), s3.Credential{
 		AccessKeyID: accessKeyID,
 		Secret:      secret,
 		TenantID:    access.id,
 		Description: description,
 		CreatedBy:   &access.user.ID,
 		ExpiresAt:   expiresAt,
-	}); err != nil {
+		Permissions: req.Permissions,
+		Namespaces:  req.Namespaces,
+	})
+	if err != nil {
 		h.writeError(w, r, err)
 		return
 	}
@@ -190,6 +208,8 @@ func (h *Handler) createCredential(w http.ResponseWriter, r *http.Request) {
 		SecretAccessKey: secret,
 		Description:     description,
 		ExpiresAt:       expiresAt,
+		Permissions:     scope.Permissions,
+		Namespaces:      scope.Namespaces,
 	})
 }
 

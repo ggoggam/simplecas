@@ -667,7 +667,7 @@ func TestTeamCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 	const keyID, secret = "SCASE2ETEAMA", "team-a-secret"
-	if err := s.gateway.StoreCredential(ctx, s3.Credential{
+	if _, err := s.gateway.StoreCredential(ctx, s3.Credential{
 		AccessKeyID: keyID, Secret: secret, TenantID: tenantID, Description: "e2e",
 	}); err != nil {
 		t.Fatal(err)
@@ -702,6 +702,65 @@ func TestTeamCredential(t *testing.T) {
 	if ns.TenantID == nil || *ns.TenantID != tenantID {
 		t.Errorf("team-bucket tenant = %v, want %d", ns.TenantID, tenantID)
 	}
+}
+
+// A scoped team key does what its scope says through ordinary CLI commands: a
+// reader limited to one bucket can list and download there and nothing else,
+// and an upload-only key can run a multipart upload it cannot read back.
+func TestScopedTeamCredential(t *testing.T) {
+	t.Parallel()
+	s := newStack(t)
+	ctx := context.Background()
+
+	owner, err := s.db.ResolveUser(ctx, "https://idp.test", "owner", "owner@example.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantID, err := s.db.CreateTenant(ctx, "team-a", owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"shared", "private"} {
+		if err := s.db.CreateNamespace(ctx, name, &tenantID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mint := func(id string, perms []s3.Permission, namespaces []string) *awsCLI {
+		t.Helper()
+		if _, err := s.gateway.StoreCredential(ctx, s3.Credential{
+			AccessKeyID: id, Secret: id + "-secret", TenantID: tenantID,
+			Permissions: perms, Namespaces: namespaces,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return s.cli(t, id, id+"-secret")
+	}
+	full := mint("SCASE2EFULL", nil, nil)
+	reader := mint("SCASE2EREADER", []s3.Permission{s3.PermRead, s3.PermList}, []string{"shared"})
+	uploader := mint("SCASE2EUPLOADER", []s3.Permission{s3.PermWrite}, []string{"shared"})
+
+	content := []byte("for everyone on the team")
+	full.run("s3", "cp", writeFile(t, t.TempDir(), "f", content), "s3://shared/f")
+	full.run("s3", "cp", writeFile(t, t.TempDir(), "p", []byte("owners only")), "s3://private/p")
+
+	if got := lsNames(reader.run("s3", "ls")); !slices.Equal(got, []string{"shared"}) {
+		t.Errorf("reader s3 ls = %v, want only shared", got)
+	}
+	if got := lsNames(reader.run("s3", "ls", "s3://shared/")); !slices.Equal(got, []string{"f"}) {
+		t.Errorf("reader s3 ls s3://shared/ = %v", got)
+	}
+	sameBytes(t, "reader download", []byte(reader.run("s3", "cp", "s3://shared/f", "-")), content)
+	reader.fails("AccessDenied", "s3", "cp", writeFile(t, t.TempDir(), "g", []byte("no")), "s3://shared/g")
+	reader.fails("AccessDenied", "s3", "rm", "s3://shared/f")
+	reader.fails("NoSuchBucket", "s3", "ls", "s3://private/")
+	reader.fails("AccessDenied", "s3", "mb", "s3://reader-made")
+
+	large := randomBytes(2*partSize+17, 8)
+	uploader.run("s3", "cp", writeFile(t, t.TempDir(), "large", large), "s3://shared/large")
+	sameBytes(t, "uploaded by an upload-only key", full.download("shared", "large"), large)
+	// The CLI downloads after a HeadObject, whose 403 carries no error body.
+	uploader.fails("(403)", "s3", "cp", "s3://shared/large", "-")
+	uploader.fails("AccessDenied", "s3", "ls", "s3://shared/")
 }
 
 // ---------------------------------------------------------------------------

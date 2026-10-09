@@ -29,20 +29,30 @@ type Credential struct {
 	CreatedBy *int64
 	// ExpiresAt is nil for a key that never expires.
 	ExpiresAt *time.Time
+	// Permissions is nil for a key that holds every permission.
+	Permissions []Permission
+	// Namespaces is nil for a key that reaches every namespace the team
+	// owns, now and later. Otherwise each must be the team's when minted.
+	Namespaces []string
 }
 
-// StoreCredential seals c's secret under the current credential key and
-// stores it. It fails without auth.credential_keys, which configuration
-// validation requires wherever someone can sign in to mint a key.
-func (g *Gateway) StoreCredential(ctx context.Context, c Credential) error {
+// StoreCredential checks c's scope against the team, seals its secret under
+// the current credential key, and stores it. It returns the scope as stored. It
+// fails without auth.credential_keys, which configuration validation requires
+// wherever someone can sign in to mint a key.
+func (g *Gateway) StoreCredential(ctx context.Context, c Credential) (db.S3Scope, error) {
 	if g.keys == nil {
-		return apperr.Internalf("s3: cannot store a team key: auth.credential_keys is not set")
+		return db.S3Scope{}, apperr.Internalf("s3: cannot store a team key: auth.credential_keys is not set")
+	}
+	scope, err := g.normalizeScope(ctx, c.TenantID, c.Permissions, c.Namespaces)
+	if err != nil {
+		return db.S3Scope{}, err
 	}
 	keyID, sealed, err := g.keys.Seal([]byte(c.Secret), []byte(c.AccessKeyID))
 	if err != nil {
-		return apperr.Internal(err)
+		return db.S3Scope{}, apperr.Internal(err)
 	}
-	return g.db.CreateS3Credential(ctx, db.NewS3Credential{
+	err = g.db.CreateS3Credential(ctx, db.NewS3Credential{
 		AccessKeyID: c.AccessKeyID,
 		TenantID:    c.TenantID,
 		KeyID:       keyID,
@@ -50,7 +60,12 @@ func (g *Gateway) StoreCredential(ctx context.Context, c Credential) error {
 		Description: c.Description,
 		CreatedBy:   c.CreatedBy,
 		ExpiresAt:   c.ExpiresAt,
+		Scope:       scope,
 	})
+	if err != nil {
+		return db.S3Scope{}, err
+	}
+	return scope, nil
 }
 
 // openSecret recovers a stored secret for signature checking.

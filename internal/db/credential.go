@@ -30,6 +30,16 @@ type S3Credential struct {
 	Secret      StoredSecret
 	// LastUsedAt is nil for a key that has never verified a request.
 	LastUsedAt *time.Time
+	Scope      S3Scope
+}
+
+// S3Scope is what a key may do, within the namespaces its team owns.
+type S3Scope struct {
+	// Permissions is a non-empty subset of read, list, write and delete.
+	Permissions []string
+	// Namespaces is nil for a key that reaches every namespace its team
+	// owns, or the names of the only ones it reaches.
+	Namespaces []string
 }
 
 // NewS3Credential is a key to store. The secret arrives already sealed.
@@ -43,6 +53,7 @@ type NewS3Credential struct {
 	CreatedBy *int64
 	// ExpiresAt is nil for a key that never expires.
 	ExpiresAt *time.Time
+	Scope     S3Scope
 }
 
 // S3CredentialInfo is the listing projection: everything except the secret.
@@ -53,7 +64,9 @@ type S3CredentialInfo struct {
 	ExpiresAt   *time.Time
 	LastUsedAt  *time.Time
 	// CreatedBy is the minting user's address, or "" when it is not known.
-	CreatedBy string
+	CreatedBy   string
+	Permissions []string
+	Namespaces  []string
 }
 
 // LookupS3Credential resolves an access key id to its secret and owning tenant.
@@ -62,11 +75,13 @@ type S3CredentialInfo struct {
 func (d *DB) LookupS3Credential(ctx context.Context, accessKeyID string) (S3Credential, bool, error) {
 	var c S3Credential
 	err := d.pool.QueryRow(ctx, `
-		SELECT access_key_id, tenant_id, secret_access_key, secret_key_id, secret_sealed, last_used_at
+		SELECT access_key_id, tenant_id, secret_access_key, secret_key_id, secret_sealed, last_used_at,
+		       permissions, namespaces
 		FROM tenant_credentials
 		WHERE access_key_id = $1 AND (expires_at IS NULL OR expires_at > now())`,
 		accessKeyID).Scan(&c.AccessKeyID, &c.TenantID,
-		&c.Secret.Plaintext, &c.Secret.KeyID, &c.Secret.Sealed, &c.LastUsedAt)
+		&c.Secret.Plaintext, &c.Secret.KeyID, &c.Secret.Sealed, &c.LastUsedAt,
+		&c.Scope.Permissions, &c.Scope.Namespaces)
 	switch {
 	case err == nil:
 		return c, true, nil
@@ -77,13 +92,16 @@ func (d *DB) LookupS3Credential(ctx context.Context, accessKeyID string) (S3Cred
 	}
 }
 
-// CreateS3Credential stores a freshly minted key.
+// CreateS3Credential stores a freshly minted key. Its scope arrives already
+// checked against the team's namespaces; the table only holds it to shape.
 func (d *DB) CreateS3Credential(ctx context.Context, c NewS3Credential) error {
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO tenant_credentials
-		    (access_key_id, tenant_id, secret_key_id, secret_sealed, description, created_by, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		c.AccessKeyID, c.TenantID, c.KeyID, c.Sealed, c.Description, c.CreatedBy, c.ExpiresAt)
+		    (access_key_id, tenant_id, secret_key_id, secret_sealed, description, created_by, expires_at,
+		     permissions, namespaces)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		c.AccessKeyID, c.TenantID, c.KeyID, c.Sealed, c.Description, c.CreatedBy, c.ExpiresAt,
+		c.Scope.Permissions, c.Scope.Namespaces)
 	return apperr.Internal(err)
 }
 
@@ -92,7 +110,7 @@ func (d *DB) CreateS3Credential(ctx context.Context, c NewS3Credential) error {
 func (d *DB) ListS3Credentials(ctx context.Context, tenantID int64) ([]S3CredentialInfo, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT c.access_key_id, c.description, c.created_at, c.expires_at, c.last_used_at,
-		       COALESCE(u.email, '')
+		       COALESCE(u.email, ''), c.permissions, c.namespaces
 		FROM tenant_credentials c
 		LEFT JOIN users u ON u.id = c.created_by
 		WHERE c.tenant_id = $1

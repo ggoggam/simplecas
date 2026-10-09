@@ -490,12 +490,12 @@ func tenantClients(t *testing.T) (gateway *Gateway, clientA, clientB *awss3.Clie
 	if err := gateway.db.CreateNamespace(ctx, "bucket-b", &tenantB); err != nil {
 		t.Fatal(err)
 	}
-	if err := gateway.StoreCredential(ctx, Credential{
+	if _, err := gateway.StoreCredential(ctx, Credential{
 		AccessKeyID: "SCASTEAMAKEY", Secret: "team-a-secret", TenantID: tenantA, Description: "a",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := gateway.StoreCredential(ctx, Credential{
+	if _, err := gateway.StoreCredential(ctx, Credential{
 		AccessKeyID: "SCASTEAMBKEY", Secret: "team-b-secret", TenantID: tenantB, Description: "b",
 	}); err != nil {
 		t.Fatal(err)

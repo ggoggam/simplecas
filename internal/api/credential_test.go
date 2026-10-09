@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -99,6 +100,67 @@ func TestMintCredentialRejectsAnOutOfRangeExpiry(t *testing.T) {
 	} {
 		w := f.do(t, http.MethodPost, "/api/tenants/team-a/credentials", body, "Content-Type", "application/json")
 		mustStatus(t, w, http.StatusBadRequest)
+	}
+	if list := decodeArray(t, f.do(t, http.MethodGet, "/api/tenants/team-a/credentials", "")); len(list) != 0 {
+		t.Errorf("a rejected request minted %d keys", len(list))
+	}
+}
+
+// A key minted without a scope holds every permission on every namespace, and
+// says so; a scoped key comes back in stored form, from both create and list.
+func TestMintCredentialWithAScope(t *testing.T) {
+	f := newFixture(t)
+	f.signIn("owner@example.com")
+	createTenant(t, f, "team-a")
+	createNamespaceIn(t, f, "logs", "team-a")
+	createNamespaceIn(t, f, "photos", "team-a")
+
+	full := mintCredential(t, f, "team-a", "full")
+	if got := fmt.Sprint(full["permissions"]); got != "[read list write delete]" {
+		t.Errorf("unscoped permissions = %s, want all four", got)
+	}
+	if full["namespaces"] != nil {
+		t.Errorf("unscoped namespaces = %v, want null", full["namespaces"])
+	}
+
+	w := f.do(t, http.MethodPost, "/api/tenants/team-a/credentials",
+		`{"description":"reader","permissions":["list","read","read"],"namespaces":["photos","logs"]}`,
+		"Content-Type", "application/json")
+	mustStatus(t, w, http.StatusCreated)
+	created := decodeObject(t, w)
+	if got := fmt.Sprint(created["permissions"], created["namespaces"]); got != "[read list] [logs photos]" {
+		t.Errorf("created scope = %s, want [read list] [logs photos]", got)
+	}
+
+	for _, c := range decodeArray(t, f.do(t, http.MethodGet, "/api/tenants/team-a/credentials", "")) {
+		if c["access_key_id"] == created["access_key_id"] {
+			if got := fmt.Sprint(c["permissions"], c["namespaces"]); got != "[read list] [logs photos]" {
+				t.Errorf("listed scope = %s, want [read list] [logs photos]", got)
+			}
+		}
+	}
+}
+
+func TestMintCredentialRejectsABadScope(t *testing.T) {
+	f := newFixture(t)
+	f.signIn("owner@example.com")
+	createTenant(t, f, "team-a")
+	createTenant(t, f, "team-b")
+	createNamespaceIn(t, f, "theirs", "team-b")
+
+	for _, body := range []string{
+		`{"permissions":[]}`,
+		`{"permissions":["admin"]}`,
+		`{"permissions":"read"}`,
+		`{"namespaces":[]}`,
+		`{"namespaces":["missing"]}`,
+		// A team the caller also owns is still another team.
+		`{"namespaces":["theirs"]}`,
+	} {
+		w := f.do(t, http.MethodPost, "/api/tenants/team-a/credentials", body, "Content-Type", "application/json")
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400 (body: %s)", body, w.Code, w.Body.String())
+		}
 	}
 	if list := decodeArray(t, f.do(t, http.MethodGet, "/api/tenants/team-a/credentials", "")); len(list) != 0 {
 		t.Errorf("a rejected request minted %d keys", len(list))
