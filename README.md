@@ -524,7 +524,11 @@ the ordinary staging sweeper.
 - **Crash safety.** A committed object row always has backing bytes (bytes are
   copied from staging before the transaction commits). Orphaned staging files
   from interrupted uploads are cleaned up by the staging sweeper, and abandoned
-  multipart uploads (with their staged parts) by the multipart sweeper.
+  multipart uploads (with their staged parts) by the multipart sweeper. Blob
+  bytes left by a commit that copied them and then failed are found by the
+  orphan sweep, which lists `blobs/` against the table every
+  `[gc] orphan_interval_secs`; it claims each hash the way an upload does, so
+  it never deletes bytes a commit still in flight is about to publish.
 
 ## Source layout
 

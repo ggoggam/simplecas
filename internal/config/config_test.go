@@ -19,7 +19,7 @@ func TestDefaultsAreServiceable(t *testing.T) {
 	if c.Storage.Backend != "fs" {
 		t.Errorf("storage backend = %q, want fs", c.Storage.Backend)
 	}
-	if c.GC.IntervalSecs != 60 || c.GC.GraceSecs != 300 || c.GC.MultipartExpirySecs != 86400 {
+	if c.GC.IntervalSecs != 60 || c.GC.GraceSecs != 300 || c.GC.MultipartExpirySecs != 86400 || c.GC.OrphanIntervalSecs != 86400 {
 		t.Errorf("gc defaults = %+v", c.GC)
 	}
 	if c.OIDC.SessionTTLSecs != 86400 {

@@ -23,6 +23,28 @@ func TestBlobPathFansOut(t *testing.T) {
 	}
 }
 
+func TestHashFromBlobPath(t *testing.T) {
+	const hash = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+	if got, ok := HashFromBlobPath(BlobPath(hash)); !ok || got != hash {
+		t.Errorf("HashFromBlobPath(BlobPath(h)) = %q, %v; want the hash back", got, ok)
+	}
+	// Nothing BlobPath would not have written for a BLAKE3 digest is a blob.
+	for _, key := range []string{
+		"blobs/ab",
+		"blobs/README",
+		"blobs/af/13/" + hash + ".tmp",
+		"blobs/af/14/" + hash,
+		"blobs/" + hash,
+		"blobs/AF/13/" + strings.ToUpper(hash),
+		"blobs/af/13/af13" + strings.Repeat("z", 60),
+		"staging/af/13/" + hash,
+	} {
+		if got, ok := HashFromBlobPath(key); ok {
+			t.Errorf("HashFromBlobPath(%q) = %q, want no hash", key, got)
+		}
+	}
+}
+
 func TestStagingPath(t *testing.T) {
 	got := StagingPath("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 	if want := "staging/6ba7b810-9dad-11d1-80b4-00c04fd430c8"; got != want {
