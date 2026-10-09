@@ -23,6 +23,11 @@ const abcHash = "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d8
 
 // newGateway builds a gateway over a scratch database and a scratch fs bucket.
 // Each option adjusts the configuration before the gateway is built.
+// testCredentialKey seals the team secrets every test gateway stores. It is
+// parsed when the gateway is built, so a test that later replaces cfg.Auth
+// keeps it.
+const testCredentialKey = "test:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
 func newGateway(t *testing.T, options ...func(*config.Config)) *Gateway {
 	t.Helper()
 	ctx := t.Context()
@@ -42,6 +47,7 @@ func newGateway(t *testing.T, options ...func(*config.Config)) *Gateway {
 
 	cfg := config.Default()
 	cfg.Database.URL = dsn
+	cfg.Auth.CredentialKeys = []string{testCredentialKey}
 	for _, option := range options {
 		option(&cfg)
 	}

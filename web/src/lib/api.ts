@@ -87,6 +87,12 @@ export interface Credential {
   access_key_id: string;
   description: string;
   created_at: string;
+  /** Null for a key that never expires. Expired keys stay listed. */
+  expires_at: string | null;
+  /** Null for a key that has never signed a request. */
+  last_used_at: string | null;
+  /** The minting owner's address, or "" when it is not known. */
+  created_by: string;
 }
 
 /**
@@ -97,6 +103,7 @@ export interface CreatedCredential {
   access_key_id: string;
   secret_access_key: string;
   description: string;
+  expires_at: string | null;
 }
 
 export interface ObjectEntry {
@@ -325,15 +332,21 @@ export const api = {
   },
 
   // The resolved value carries the secret, which the server will not repeat.
+  // `expiresInDays` null mints a key that never expires.
   async createCredential(
     tenant: string,
     description: string,
+    expiresInDays: number | null,
   ): Promise<CreatedCredential> {
     return (
       await req(`/api/tenants/${encodeURIComponent(tenant)}/credentials`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ description }),
+        body: JSON.stringify(
+          expiresInDays === null
+            ? { description }
+            : { description, expires_in_days: expiresInDays },
+        ),
       })
     ).json();
   },

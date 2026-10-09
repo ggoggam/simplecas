@@ -31,7 +31,8 @@ import (
 )
 
 // startupTimeout bounds the work done before the listener opens: connecting to
-// Postgres, running migrations, checking the blob backend, and OIDC discovery.
+// Postgres, running migrations, checking the blob backend, OIDC discovery, and
+// sealing stored S3 secrets.
 const startupTimeout = 2 * time.Minute
 
 // shutdownTimeout is how long in-flight requests get to finish on SIGTERM.
@@ -100,10 +101,16 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	cancelStartup()
 
 	store := cas.New(database, bucket, cfg.GC, cfg.Limits, logger)
 	gateway := s3.New(database, bucket, store, cfg, logger)
+
+	// Seal any team S3 secret still in plaintext, or under a rotated-out
+	// key, before the gateway verifies anything with it.
+	if err := gateway.SealStoredCredentials(startupCtx); err != nil {
+		return err
+	}
+	cancelStartup()
 
 	// When OIDC is on, the guard wraps the /ui and /api surfaces only: the S3
 	// gateway keeps its own SigV4 auth, and the /auth endpoints have to stay

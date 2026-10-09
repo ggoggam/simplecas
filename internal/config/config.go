@@ -13,6 +13,8 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/ggoggam/simplecas/internal/seal"
 )
 
 // EnvPrefix is the prefix every configuration environment variable carries.
@@ -88,6 +90,24 @@ type AuthConfig struct {
 	Enabled         bool   `toml:"enabled"`
 	AccessKeyID     string `toml:"access_key_id"`
 	SecretAccessKey string `toml:"secret_access_key"`
+	// CredentialKeys seal the per-team S3 secrets in the database, as
+	// "id:base64key" entries of 32 random bytes each. The first seals new
+	// secrets; the rest only open what was sealed under them, so a key is
+	// rotated by adding the new one at the end, then moving it to the front.
+	// Required with OIDC on, since only signed-in owners mint team keys.
+	CredentialKeys []string `toml:"credential_keys"`
+}
+
+// Keyring parses CredentialKeys. It is nil, with no error, when none are set.
+func (a *AuthConfig) Keyring() (*seal.Keyring, error) {
+	if len(a.CredentialKeys) == 0 {
+		return nil, nil
+	}
+	k, err := seal.Parse(a.CredentialKeys)
+	if err != nil {
+		return nil, fmt.Errorf("auth.credential_keys: %w", err)
+	}
+	return k, nil
 }
 
 // OidcConfig configures single sign-on for the human-facing surface (the PWA at
@@ -384,6 +404,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("auth.secret_access_key is required when auth.enabled is true")
 		}
 	}
+	if _, err := c.Auth.Keyring(); err != nil {
+		return err
+	}
 
 	// Without OIDC nothing authenticates /api, which creates and deletes every
 	// namespace and object and mints gateway credentials. That is a sensible
@@ -409,6 +432,14 @@ func (c *Config) Validate() error {
 		if c.Auth.SecretAccessKey == SampleSecretAccessKey {
 			return fmt.Errorf("auth.secret_access_key is still the sample value from simplecas.toml; " +
 				"set a private secret before enabling oidc")
+		}
+		// Team owners mint S3 keys only once they can sign in, and those
+		// secrets are stored recoverably, so they are sealed rather than
+		// left readable to anyone with a database dump or a backup.
+		if len(c.Auth.CredentialKeys) == 0 {
+			return fmt.Errorf("auth.credential_keys is required when oidc.enabled is true: " +
+				"it seals the teams' S3 secrets in the database; " +
+				"set it to [\"k1:<output of openssl rand -base64 32>\"]")
 		}
 	}
 	return nil

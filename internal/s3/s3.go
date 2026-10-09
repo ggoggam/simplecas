@@ -44,6 +44,7 @@ import (
 	"github.com/ggoggam/simplecas/internal/config"
 	"github.com/ggoggam/simplecas/internal/db"
 	"github.com/ggoggam/simplecas/internal/reserved"
+	"github.com/ggoggam/simplecas/internal/seal"
 	"github.com/ggoggam/simplecas/internal/storage"
 )
 
@@ -71,11 +72,19 @@ type Gateway struct {
 	cas  *cas.Store
 	cfg  *config.Config
 	log  *slog.Logger
+	// keys seals and opens the per-team secrets; nil when
+	// auth.credential_keys is unset. See credential.go.
+	keys *seal.Keyring
 }
 
-// New returns a Gateway over the given store.
+// New returns a Gateway over the given store. It panics on malformed
+// auth.credential_keys, which config.Validate rejects before this runs.
 func New(database *db.DB, bucket *storage.Bucket, store *cas.Store, cfg *config.Config, log *slog.Logger) *Gateway {
-	return &Gateway{db: database, blob: bucket, cas: store, cfg: cfg, log: log}
+	keys, err := cfg.Auth.Keyring()
+	if err != nil {
+		panic(err)
+	}
+	return &Gateway{db: database, blob: bucket, cas: store, cfg: cfg, log: log, keys: keys}
 }
 
 // ServeHTTP verifies the request signature and resolves the tenant scope its

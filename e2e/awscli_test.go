@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/ggoggam/simplecas/internal/s3"
 )
 
 // ---------------------------------------------------------------------------
@@ -665,7 +667,9 @@ func TestTeamCredential(t *testing.T) {
 		t.Fatal(err)
 	}
 	const keyID, secret = "SCASE2ETEAMA", "team-a-secret"
-	if err := s.db.CreateS3Credential(ctx, tenantID, keyID, secret, "e2e"); err != nil {
+	if err := s.gateway.StoreCredential(ctx, s3.Credential{
+		AccessKeyID: keyID, Secret: secret, TenantID: tenantID, Description: "e2e",
+	}); err != nil {
 		t.Fatal(err)
 	}
 	team := s.cli(t, keyID, secret)
