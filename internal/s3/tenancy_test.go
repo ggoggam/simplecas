@@ -72,6 +72,7 @@ func newTenantFixture(t *testing.T) *tenantFixture {
 		Enabled:         true,
 		AccessKeyID:     adminKeyID,
 		SecretAccessKey: adminSecret,
+		CredentialKeys:  []string{testCredentialKey},
 	}
 	gc := config.GcConfig{IntervalSecs: 60, GraceSecs: 300, MultipartExpirySecs: 86400}
 	log := slog.New(slog.DiscardHandler)
@@ -88,8 +89,8 @@ func newTenantFixture(t *testing.T) *tenantFixture {
 	mustCreateNamespace(t, database, f.namespaceA, &f.tenantA)
 	mustCreateNamespace(t, database, f.namespcB, &f.tenantB)
 
-	f.keyA, f.secretA = mustCreateCredential(t, database, f.tenantA, "key-a")
-	f.keyB, f.secretB = mustCreateCredential(t, database, f.tenantB, "key-b")
+	f.keyA, f.secretA = mustCreateCredential(t, f.g, f.tenantA, "key-a")
+	f.keyB, f.secretB = mustCreateCredential(t, f.g, f.tenantB, "key-b")
 	return f
 }
 
@@ -113,13 +114,16 @@ func mustCreateNamespace(t *testing.T, d *db.DB, name string, tenantID *int64) {
 	}
 }
 
-func mustCreateCredential(t *testing.T, d *db.DB, tenantID int64, label string) (id, secret string) {
+func mustCreateCredential(t *testing.T, g *Gateway, tenantID int64, label string) (id, secret string) {
 	t.Helper()
 	// The ids only have to be distinct and non-colliding with the admin key;
 	// the API's generator is exercised in the api package.
 	id = "SCASTESTKEY" + strings.ToUpper(strings.ReplaceAll(label, "-", ""))
 	secret = "secret-for-" + label
-	if err := d.CreateS3Credential(context.Background(), tenantID, id, secret, label); err != nil {
+	err := g.StoreCredential(context.Background(), Credential{
+		AccessKeyID: id, Secret: secret, TenantID: tenantID, Description: label,
+	})
+	if err != nil {
 		t.Fatalf("create credential %s: %v", label, err)
 	}
 	return id, secret
@@ -227,7 +231,9 @@ func TestRevokedCredentialStopsWorking(t *testing.T) {
 func TestAdminKeyCannotBeShadowedByATenantRow(t *testing.T) {
 	f := newTenantFixture(t)
 
-	err := f.g.db.CreateS3Credential(t.Context(), f.tenantB, adminKeyID, "attacker-chosen-secret", "shadow")
+	err := f.g.StoreCredential(t.Context(), Credential{
+		AccessKeyID: adminKeyID, Secret: "attacker-chosen-secret", TenantID: f.tenantB, Description: "shadow",
+	})
 	if err != nil {
 		t.Fatalf("plant shadow row: %v", err)
 	}

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // mintCredential creates an S3 key for a tenant and returns the create
@@ -45,6 +46,62 @@ func TestMintAndListCredentials(t *testing.T) {
 	}
 	if _, leaked := list[0]["secret_access_key"]; leaked {
 		t.Error("the listing returned the secret")
+	}
+	// The listing says who minted it, and that it has neither expired nor
+	// been used.
+	if list[0]["created_by"] != "owner@example.com" {
+		t.Errorf("created_by = %v, want the minting owner", list[0]["created_by"])
+	}
+	if list[0]["expires_at"] != nil || list[0]["last_used_at"] != nil {
+		t.Errorf("expires_at = %v, last_used_at = %v; want both null", list[0]["expires_at"], list[0]["last_used_at"])
+	}
+}
+
+func TestMintCredentialWithExpiry(t *testing.T) {
+	f := newFixture(t)
+	f.signIn("owner@example.com")
+	createTenant(t, f, "team-a")
+
+	before := time.Now()
+	w := f.do(t, http.MethodPost, "/api/tenants/team-a/credentials",
+		`{"description":"short-lived","expires_in_days":30}`, "Content-Type", "application/json")
+	mustStatus(t, w, http.StatusCreated)
+	created := decodeObject(t, w)
+
+	raw, _ := created["expires_at"].(string)
+	expires, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		t.Fatalf("expires_at = %v: %v", created["expires_at"], err)
+	}
+	want := before.Add(30 * 24 * time.Hour)
+	if expires.Before(want.Add(-time.Minute)) || expires.After(want.Add(time.Minute)) {
+		t.Errorf("expires_at = %v, want about %v", expires, want)
+	}
+
+	list := decodeArray(t, f.do(t, http.MethodGet, "/api/tenants/team-a/credentials", ""))
+	listedRaw, _ := list[0]["expires_at"].(string)
+	listed, err := time.Parse(time.RFC3339Nano, listedRaw)
+	if err != nil || !listed.Equal(expires) {
+		t.Errorf("listed expires_at = %q, want %v", listedRaw, expires)
+	}
+}
+
+func TestMintCredentialRejectsAnOutOfRangeExpiry(t *testing.T) {
+	f := newFixture(t)
+	f.signIn("owner@example.com")
+	createTenant(t, f, "team-a")
+
+	for _, body := range []string{
+		`{"expires_in_days":0}`,
+		`{"expires_in_days":-1}`,
+		`{"expires_in_days":3651}`,
+		`{"expires_in_days":"30"}`,
+	} {
+		w := f.do(t, http.MethodPost, "/api/tenants/team-a/credentials", body, "Content-Type", "application/json")
+		mustStatus(t, w, http.StatusBadRequest)
+	}
+	if list := decodeArray(t, f.do(t, http.MethodGet, "/api/tenants/team-a/credentials", "")); len(list) != 0 {
+		t.Errorf("a rejected request minted %d keys", len(list))
 	}
 }
 

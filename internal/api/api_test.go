@@ -60,6 +60,7 @@ func newFixture(t *testing.T) *fixture {
 
 	cfg := config.Default()
 	cfg.Database.URL = dsn
+	cfg.Auth.CredentialKeys = []string{"test:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}
 	log := slog.New(slog.DiscardHandler)
 	store := cas.New(database, bucket, config.GcConfig{
 		IntervalSecs: 60, GraceSecs: 300, MultipartExpirySecs: 86400,

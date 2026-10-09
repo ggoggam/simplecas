@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ggoggam/simplecas/internal/apperr"
+	"github.com/ggoggam/simplecas/internal/s3"
 )
 
 // S3 credentials are minted here so a team can point ordinary S3 tooling at
@@ -17,6 +18,12 @@ import (
 // Minting and revoking are owner-only. A credential is full read/write access
 // to every namespace the tenant owns, so handing one out is closer to adding an
 // owner than to adding a member — there are no per-namespace or read-only keys.
+// A key can be given an expiry when it is minted, after which it verifies
+// nothing; it stays listed until an owner revokes it.
+
+// maxCredentialDays caps a key's lifetime when one is asked for. A key that
+// should outlive this is a key minted without an expiry.
+const maxCredentialDays = 3650
 
 // accessKeyIDBytes and secretBytes size the generated credential. The shapes
 // mirror AWS's (a short opaque id, a long high-entropy secret) because clients
@@ -35,8 +42,8 @@ const accessKeyPrefix = "SCAS"
 // The id is base32 so it survives being pasted into places that mangle case,
 // which is what AWS-style tooling expects of an access key id. The secret is
 // base64 and is shown exactly once, in the response that creates it: the
-// server needs it verbatim to verify SigV4 signatures, so it is stored
-// recoverably and never re-displayed.
+// server needs it verbatim to verify SigV4 signatures, so it is stored sealed
+// rather than hashed (see s3.StoreCredential) and never re-displayed.
 func generateCredential() (accessKeyID, secret string, err error) {
 	idRaw := make([]byte, accessKeyIDBytes)
 	if _, err := rand.Read(idRaw); err != nil {
@@ -75,17 +82,22 @@ func base32Upper(raw []byte) string {
 }
 
 type credentialJSON struct {
-	AccessKeyID string    `json:"access_key_id"`
-	Description string    `json:"description"`
-	CreatedAt   time.Time `json:"created_at"`
+	AccessKeyID string     `json:"access_key_id"`
+	Description string     `json:"description"`
+	CreatedAt   time.Time  `json:"created_at"`
+	ExpiresAt   *time.Time `json:"expires_at"`
+	LastUsedAt  *time.Time `json:"last_used_at"`
+	// CreatedBy is the minting owner's address, or "" when it is not known.
+	CreatedBy string `json:"created_by"`
 }
 
 // createdCredentialJSON is the create response, and the only time the secret
 // is ever sent.
 type createdCredentialJSON struct {
-	AccessKeyID     string `json:"access_key_id"`
-	SecretAccessKey string `json:"secret_access_key"`
-	Description     string `json:"description"`
+	AccessKeyID     string     `json:"access_key_id"`
+	SecretAccessKey string     `json:"secret_access_key"`
+	Description     string     `json:"description"`
+	ExpiresAt       *time.Time `json:"expires_at"`
 }
 
 func (h *Handler) listCredentials(w http.ResponseWriter, r *http.Request) {
@@ -106,21 +118,30 @@ func (h *Handler) listCredentials(w http.ResponseWriter, r *http.Request) {
 			AccessKeyID: c.AccessKeyID,
 			Description: c.Description,
 			CreatedAt:   c.CreatedAt,
+			ExpiresAt:   c.ExpiresAt,
+			LastUsedAt:  c.LastUsedAt,
+			CreatedBy:   c.CreatedBy,
 		})
 	}
 	h.writeJSON(w, http.StatusOK, out)
 }
 
 func (h *Handler) createCredential(w http.ResponseWriter, r *http.Request) {
-	tenantID, err := h.authorizeTenant(r, r.PathValue("tenant"), true)
+	access, err := h.authorizeTenantAccess(r, r.PathValue("tenant"))
 	if err != nil {
 		h.writeError(w, r, err)
 		return
 	}
+	if access.role != "owner" {
+		h.writeError(w, r, apperr.Forbidden("owner role required"))
+		return
+	}
 
-	// The body is optional: a label is a convenience, not a requirement.
+	// The body is optional: a label and an expiry are conveniences, not
+	// requirements. A missing expiry is a key that never expires.
 	var req struct {
-		Description string `json:"description"`
+		Description   string `json:"description"`
+		ExpiresInDays *int   `json:"expires_in_days"`
 	}
 	if r.ContentLength > 0 {
 		if err := decodeJSON(r, &req); err != nil {
@@ -133,13 +154,33 @@ func (h *Handler) createCredential(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, r, apperr.InvalidArgument("description must be 200 characters or fewer"))
 		return
 	}
+	var expiresAt *time.Time
+	if req.ExpiresInDays != nil {
+		days := *req.ExpiresInDays
+		if days < 1 || days > maxCredentialDays {
+			h.writeError(w, r, apperr.InvalidArgument(
+				"expires_in_days must be between 1 and %d; omit it for a key that does not expire", maxCredentialDays))
+			return
+		}
+		// Truncated so the stored and returned times agree to the
+		// microsecond Postgres keeps.
+		at := time.Now().Add(time.Duration(days) * 24 * time.Hour).UTC().Truncate(time.Microsecond)
+		expiresAt = &at
+	}
 
 	accessKeyID, secret, err := generateCredential()
 	if err != nil {
 		h.writeError(w, r, err)
 		return
 	}
-	if err := h.db.CreateS3Credential(r.Context(), tenantID, accessKeyID, secret, description); err != nil {
+	if err := h.gateway.StoreCredential(r.Context(), s3.Credential{
+		AccessKeyID: accessKeyID,
+		Secret:      secret,
+		TenantID:    access.id,
+		Description: description,
+		CreatedBy:   &access.user.ID,
+		ExpiresAt:   expiresAt,
+	}); err != nil {
 		h.writeError(w, r, err)
 		return
 	}
@@ -148,6 +189,7 @@ func (h *Handler) createCredential(w http.ResponseWriter, r *http.Request) {
 		AccessKeyID:     accessKeyID,
 		SecretAccessKey: secret,
 		Description:     description,
+		ExpiresAt:       expiresAt,
 	})
 }
 

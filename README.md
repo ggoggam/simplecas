@@ -276,7 +276,9 @@ header through unchanged for the `Origin` fallback to match.
 > **Note:** OIDC gates the bundled PWA and admin API only, so with OIDC on the
 > server **refuses to start** unless `[auth] enabled = true` with a secret other
 > than the sample `simplecas-secret` — an unauthenticated gateway would serve
-> every team's namespaces to anyone who can reach the port. With OIDC off, it
+> every team's namespaces to anyone who can reach the port — and
+> `auth.credential_keys` is set to seal the teams' S3 secrets (see
+> [Per-team S3 credentials](#per-team-s3-credentials)). With OIDC off, it
 > refuses a non-loopback bind instead; see
 > [Binding without sign-in](#binding-without-sign-in).
 
@@ -355,6 +357,14 @@ API (JSON, cookie-authenticated):
 Creating a namespace (`POST /api/namespaces`) takes a `tenant` field naming the
 owning team.
 
+> **Upgrading to sealed S3 secrets:** migration `0006_credential_lifecycle`
+> keeps existing team keys as they are; the first start with
+> `auth.credential_keys` set seals them, and holders keep using the same
+> secrets. A deployment with OIDC on must add the setting before upgrading, or
+> the server refuses to start. Instances still on the old version cannot read a
+> sealed secret, so during a rolling upgrade team keys fail with `500` on them
+> until they are replaced; replace them together to avoid that window.
+
 > **Upgrading from email-keyed membership:** migration `0004_users` cannot
 > attach existing memberships to users that do not exist yet, so it turns each
 > into a pending invitation with the same role and no expiry. After upgrading,
@@ -375,13 +385,19 @@ team's object into your own namespace.
 
 | Endpoint | |
 | --- | --- |
-| `GET /api/tenants/{team}/credentials` | list keys (no secrets) |
-| `POST /api/tenants/{team}/credentials` | mint one; **the secret is returned once and never again** |
+| `GET /api/tenants/{team}/credentials` | list keys (no secrets), with `expires_at`, `last_used_at` and `created_by` |
+| `POST /api/tenants/{team}/credentials` | mint one: `{"description","expires_in_days"}`, both optional; **the secret is returned once and never again** |
 | `DELETE /api/tenants/{team}/credentials/{accessKeyId}` | revoke |
 
 All three are **owner-only**: a key is unrestricted read/write over everything
 the team owns, so issuing one is closer to adding an owner than adding a member.
 There are no per-namespace or read-only keys.
+
+`expires_in_days` (1–3650) gives a key a lifetime; leave it out for one that
+never expires. An expired key is refused like an unknown one (`403
+AccessDenied`) and stays listed until an owner revokes it. `last_used_at` moves
+when a request signed with the key verifies, at most once every 5 minutes, so
+an owner can tell a key in use from one that is safe to revoke.
 
 Buckets created with a team key are **owned by that team**, so they show up in
 `/ui` and `/api` for its members — unlike buckets created with the admin
@@ -393,10 +409,37 @@ the per-team lookup (so a database row can never shadow or impersonate it) and
 it addresses every namespace, owned or not, so a `CreateBucket` clash is always
 `BucketAlreadyOwnedByYou` for it. Treat it as a root key.
 
-> Secrets in `tenant_credentials` are stored **recoverably, not hashed**. SigV4
-> is symmetric HMAC — the server has to re-derive the signing key from the
-> secret to check a signature, so a one-way hash cannot work. Treat that table
-> as equivalent to the objects it grants access to.
+**Secrets are sealed at rest.** SigV4 is symmetric HMAC: the server has to
+re-derive the signing key from the secret to check a signature, so it cannot
+keep a one-way hash. Instead each secret is encrypted (AES-256-GCM, bound to its
+access key id) under a server key from `auth.credential_keys`, which lives in
+the configuration rather than the database. A database dump or backup alone
+then grants nothing. The setting is required with OIDC on:
+
+```toml
+[auth]
+# "id:base64key", 32 random bytes each: openssl rand -base64 32
+credential_keys = ["k1:…"]
+```
+
+or `SIMPLECAS__AUTH__CREDENTIAL_KEYS=k1:…` (a comma-separated list). Every
+instance needs the same list.
+
+The first key seals; any others only open what was sealed under them. On
+startup the server reseals every secret that is not under the first key, which
+is how plaintext rows from before sealing are converted and how a key is
+**rotated**:
+
+1. Add the new key **at the end** and roll it out, so every instance can open
+   what it will seal.
+2. Move it **to the front** and roll that out. Each instance reseals the stored
+   secrets under it as it starts.
+3. Drop the old key.
+
+The server refuses to start if a secret is sealed under a key the list no
+longer holds, or if the list is empty while sealed secrets exist, rather than
+lock those keys out. Without any keys (OIDC off), existing plaintext secrets
+keep working and a warning is logged, but no new team key can be minted.
 
 Tenanted S3 access requires `[auth] enabled = true`, and with OIDC on the server
 will not start without it. With auth off (and OIDC off) there are no credentials

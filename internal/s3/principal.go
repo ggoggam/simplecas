@@ -76,9 +76,14 @@ func (g *Gateway) authenticate(r *http.Request) (principal, *chunkSigner, error)
 		return principal{}, nil, err
 	}
 	if !found {
-		// An unknown key is reported the same way a bad signature is, so the
-		// gateway is not an oracle for which access key ids exist.
+		// An unknown or expired key is reported the same way a bad
+		// signature is, so the gateway is not an oracle for which access
+		// key ids exist.
 		return principal{}, nil, apperr.ErrAccessDenied
+	}
+	secret, err := g.openSecret(cred)
+	if err != nil {
+		return principal{}, nil, err
 	}
 
 	// Reuse the single-credential path rather than reimplementing the
@@ -87,11 +92,12 @@ func (g *Gateway) authenticate(r *http.Request) (principal, *chunkSigner, error)
 	signer, err := verify(r, config.AuthConfig{
 		Enabled:         true,
 		AccessKeyID:     cred.AccessKeyID,
-		SecretAccessKey: cred.SecretAccessKey,
+		SecretAccessKey: secret,
 	})
 	if err != nil {
 		return principal{}, nil, err
 	}
+	g.touchCredential(r.Context(), cred)
 	return principal{tenantID: &cred.TenantID}, signer, nil
 }
 

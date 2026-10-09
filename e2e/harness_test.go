@@ -76,8 +76,9 @@ var awsCLIPath = sync.OnceValues(func() (string, error) {
 // stack is one running server: the full router, as main.go assembles it, over
 // a scratch schema and a scratch fs blob store.
 type stack struct {
-	url string
-	db  *db.DB
+	url     string
+	db      *db.DB
+	gateway *s3.Gateway
 	// caBundle is the PEM file the CLI must trust; set only over TLS.
 	caBundle string
 }
@@ -128,6 +129,7 @@ func newStack(t *testing.T, options ...stackOption) *stack {
 		Enabled:         !opts.authOff,
 		AccessKeyID:     adminKeyID,
 		SecretAccessKey: adminSecret,
+		CredentialKeys:  []string{"e2e:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
 	}
 	log := slog.New(slog.DiscardHandler)
 
@@ -141,7 +143,7 @@ func newStack(t *testing.T, options ...stackOption) *stack {
 	}
 
 	srv := httptest.NewUnstartedServer(routes.Handler(log))
-	s := &stack{db: database}
+	s := &stack{db: database, gateway: gateway}
 	if opts.tls {
 		srv.TLS = &tls.Config{MinVersion: tls.VersionTLS12}
 		srv.StartTLS()

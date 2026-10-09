@@ -208,6 +208,9 @@ func TestLoadMissingConfigFile(t *testing.T) {
 	}
 }
 
+// testCredentialKey is a well-formed auth.credential_keys entry.
+const testCredentialKey = "k1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
 func TestValidate(t *testing.T) {
 	base := func() Config {
 		c := Default()
@@ -241,7 +244,10 @@ func TestValidate(t *testing.T) {
 	t.Run("oidc with a private gateway credential", func(t *testing.T) {
 		c := base()
 		c.OIDC.Enabled = true
-		c.Auth = AuthConfig{Enabled: true, AccessKeyID: "admin", SecretAccessKey: "a-private-secret"}
+		c.Auth = AuthConfig{
+			Enabled: true, AccessKeyID: "admin", SecretAccessKey: "a-private-secret",
+			CredentialKeys: []string{testCredentialKey},
+		}
 		if err := c.Validate(); err != nil {
 			t.Fatal(err)
 		}
@@ -251,7 +257,10 @@ func TestValidate(t *testing.T) {
 		c := base()
 		c.Server.Bind = "0.0.0.0:9000"
 		c.OIDC.Enabled = true
-		c.Auth = AuthConfig{Enabled: true, AccessKeyID: "admin", SecretAccessKey: "a-private-secret"}
+		c.Auth = AuthConfig{
+			Enabled: true, AccessKeyID: "admin", SecretAccessKey: "a-private-secret",
+			CredentialKeys: []string{testCredentialKey},
+		}
 		if err := c.Validate(); err != nil {
 			t.Fatal(err)
 		}
@@ -271,6 +280,29 @@ func TestValidate(t *testing.T) {
 		c.Auth = AuthConfig{Enabled: true, AccessKeyID: "simplecas", SecretAccessKey: SampleSecretAccessKey}
 		if err := c.Validate(); err != nil {
 			t.Fatal(err)
+		}
+	})
+
+	t.Run("credential keys are optional without oidc", func(t *testing.T) {
+		c := base()
+		c.Auth = AuthConfig{Enabled: true, AccessKeyID: "admin", SecretAccessKey: "a-private-secret"}
+		if err := c.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		if k, err := c.Auth.Keyring(); k != nil || err != nil {
+			t.Errorf("Keyring() = %v, %v; want nil, nil with no keys", k, err)
+		}
+	})
+
+	t.Run("credential keys parse into a keyring", func(t *testing.T) {
+		c := base()
+		c.Auth.CredentialKeys = []string{testCredentialKey}
+		if err := c.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		k, err := c.Auth.Keyring()
+		if err != nil || k == nil || k.Current() != "k1" {
+			t.Errorf("Keyring() = %v, %v; want one keyed k1", k, err)
 		}
 	})
 
@@ -312,7 +344,18 @@ func TestValidate(t *testing.T) {
 		}},
 		{"oidc with the sample admin secret", func(c *Config) {
 			c.OIDC.Enabled = true
-			c.Auth = AuthConfig{Enabled: true, AccessKeyID: "simplecas", SecretAccessKey: SampleSecretAccessKey}
+			c.Auth = AuthConfig{
+				Enabled: true, AccessKeyID: "simplecas", SecretAccessKey: SampleSecretAccessKey,
+				CredentialKeys: []string{testCredentialKey},
+			}
+		}},
+		{"oidc without credential keys", func(c *Config) {
+			c.OIDC.Enabled = true
+			c.Auth = AuthConfig{Enabled: true, AccessKeyID: "admin", SecretAccessKey: "a-private-secret"}
+		}},
+		// Checked with or without oidc: a key list that is set is meant.
+		{"malformed credential key", func(c *Config) {
+			c.Auth.CredentialKeys = []string{"k1:not-a-32-byte-key"}
 		}},
 	}
 	for _, tc := range tests {

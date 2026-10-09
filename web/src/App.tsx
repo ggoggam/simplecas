@@ -125,6 +125,27 @@ function lastSeenLabel(iso: string): string {
   return new Date(iso).toLocaleDateString();
 }
 
+/** An S3 key's expiry and last use, for its row in the key list. */
+function credentialStatus(c: Credential): string {
+  const parts: string[] = [];
+  if (c.expires_at) {
+    const expires = new Date(c.expires_at);
+    parts.push(
+      expires.getTime() <= Date.now()
+        ? "expired"
+        : `expires ${expires.toLocaleDateString()}`,
+    );
+  }
+  if (!c.last_used_at) {
+    parts.push("never used");
+  } else {
+    // Recorded at most every few minutes, like a session's last_seen_at.
+    const seen = lastSeenLabel(c.last_used_at);
+    parts.push(seen === "active now" ? "in use" : `last used ${seen}`);
+  }
+  return parts.join(" · ");
+}
+
 /** Track a CSS media query, re-rendering on change. */
 function useMediaQuery(query: string): boolean {
   const [matches, setMatches] = useState(
@@ -223,6 +244,8 @@ export function BrowserPage() {
   const [credentials, setCredentials] = useState<Credential[]>([]);
   const [credentialsLoading, setCredentialsLoading] = useState(false);
   const [keyLabel, setKeyLabel] = useState("");
+  // Lifetime of the next key minted, in days; "" never expires.
+  const [keyExpiry, setKeyExpiry] = useState("90");
   // The just-minted key, held only so its secret can be shown once. The server
   // stores the secret but never returns it again, so losing this means minting
   // a replacement.
@@ -469,6 +492,7 @@ export function BrowserPage() {
     setInviteEmail("");
     setInviteRole("member");
     setKeyLabel("");
+    setKeyExpiry("90");
     setFreshKey(null);
     setSentInvitations([]);
     setTeamDialogOpen(true);
@@ -482,7 +506,11 @@ export function BrowserPage() {
   const doCreateCredential = async () => {
     if (!activeTeam) return;
     try {
-      const created = await api.createCredential(activeTeam, keyLabel.trim());
+      const created = await api.createCredential(
+        activeTeam,
+        keyLabel.trim(),
+        keyExpiry === "" ? null : Number(keyExpiry),
+      );
       setFreshKey(created);
       setKeyLabel("");
       loadCredentials();
@@ -1694,7 +1722,8 @@ export function BrowserPage() {
                   <p className="text-xs text-muted-foreground">
                     Point any S3 client at this server. A key reaches only this
                     team’s namespaces — and grants full read/write over all of
-                    them.
+                    them. An expired key stops working but stays listed until
+                    you revoke it.
                   </p>
                 </div>
 
@@ -1716,6 +1745,14 @@ export function BrowserPage() {
                         </span>
                         {freshKey.secret_access_key}
                       </div>
+                      {freshKey.expires_at && (
+                        <div>
+                          <span className="text-muted-foreground">
+                            expires:{" "}
+                          </span>
+                          {new Date(freshKey.expires_at).toLocaleString()}
+                        </div>
+                      )}
                     </div>
                     <div className="flex gap-2">
                       <Button
@@ -1743,7 +1780,7 @@ export function BrowserPage() {
                   </div>
                 )}
 
-                <div className="max-h-32 overflow-y-auto rounded-md border">
+                <div className="max-h-40 overflow-y-auto rounded-md border">
                   {credentialsLoading ? (
                     <div className="flex items-center justify-center gap-2 py-4 text-sm text-muted-foreground">
                       <Loader2 className="size-4 animate-spin" /> Loading…
@@ -1759,14 +1796,28 @@ export function BrowserPage() {
                         className="flex items-center gap-2 border-b px-3 py-2 text-sm last:border-b-0"
                       >
                         <Key className="size-3.5 shrink-0 text-muted-foreground" />
-                        <span className="min-w-0 flex-1 truncate font-mono text-xs">
-                          {c.access_key_id}
-                        </span>
-                        {c.description && (
-                          <span className="shrink-0 truncate text-xs text-muted-foreground">
-                            {c.description}
-                          </span>
-                        )}
+                        <div
+                          className="min-w-0 flex-1"
+                          title={
+                            c.created_by
+                              ? `created by ${c.created_by} on ${new Date(c.created_at).toLocaleDateString()}`
+                              : `created ${new Date(c.created_at).toLocaleDateString()}`
+                          }
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className="truncate font-mono text-xs">
+                              {c.access_key_id}
+                            </span>
+                            {c.description && (
+                              <span className="truncate text-xs text-muted-foreground">
+                                {c.description}
+                              </span>
+                            )}
+                          </div>
+                          <div className="truncate text-xs text-muted-foreground">
+                            {credentialStatus(c)}
+                          </div>
+                        </div>
                         <button
                           onClick={() => doDeleteCredential(c.access_key_id)}
                           title="Revoke key"
@@ -1792,6 +1843,17 @@ export function BrowserPage() {
                       placeholder="ci pipeline"
                     />
                   </div>
+                  <select
+                    className="h-9 rounded-md border bg-background px-2 text-sm"
+                    value={keyExpiry}
+                    onChange={(e) => setKeyExpiry(e.target.value)}
+                    aria-label="Key expiry"
+                  >
+                    <option value="30">30 days</option>
+                    <option value="90">90 days</option>
+                    <option value="365">1 year</option>
+                    <option value="">No expiry</option>
+                  </select>
                   <Button variant="outline" onClick={doCreateCredential}>
                     <Key className="size-4" /> Create key
                   </Button>
