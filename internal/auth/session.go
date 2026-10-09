@@ -2,20 +2,24 @@
 // /ui and the JSON admin API at /api. The S3 gateway keeps its own SigV4 auth —
 // OIDC is a browser flow and does not apply to machine clients.
 //
-// Everything here is stateless, which is what lets any number of instances sit
-// behind a load balancer sharing only a session secret:
+// Instances share nothing but the database and a session secret, so any
+// number of them can sit behind a load balancer:
 //
-//   - Authentication needs no database. Any identity that authenticates at a
-//     configured provider is admitted, optionally narrowed by an email
-//     allowlist. Authorization is a separate layer in the admin API: it maps
-//     the session's (issuer, subject) to a users row and scopes each namespace
-//     to the teams that user belongs to.
-//   - Sessions are HMAC-signed cookies carrying the identity and an expiry.
-//     There is no session table and no server-side revocation; logging out
-//     clears the cookie.
+//   - Any identity that authenticates at a configured provider is admitted,
+//     optionally narrowed by an email allowlist. Authorization is a separate
+//     layer in the admin API, which scopes each namespace to the teams the
+//     session's user belongs to.
+//   - A session is a row in the sessions table plus an HMAC-signed cookie
+//     carrying the identity, an expiry and a random bearer token; the table
+//     keeps only the token's SHA-256. Every guarded request checks the
+//     cookie's signature and then that its row still exists and has not
+//     expired, in one indexed query that also yields the user id the admin
+//     API authorizes on. Deleting the row revokes the session wherever the
+//     cookie is: signing out deletes the current one, and a user can list and
+//     end the others.
 //   - Login flow state (the CSRF token, nonce and PKCE verifier) rides along in
 //     a second short-lived signed cookie across the redirect to the provider
-//     and back, so the callback needs no shared store either.
+//     and back, so a login in progress needs no shared store.
 //   - Cross-site requests are refused from the request's own Sec-Fetch-Site
 //     and Origin headers (see RejectCrossSite), so state-changing calls need
 //     no CSRF token either.
@@ -26,11 +30,14 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/google/uuid"
 
 	"github.com/ggoggam/simplecas/internal/config"
 )
@@ -73,12 +80,22 @@ type Session struct {
 	Provider      string `json:"provider"`
 	// Expires is a Unix timestamp.
 	Expires int64 `json:"exp"`
+
+	// ID and UserID are the sessions and users rows behind the cookie, filled
+	// in from the database when the guard checks it; neither is in the
+	// cookie. A Session attached by WithSession alone has neither.
+	ID     uuid.UUID `json:"-"`
+	UserID int64     `json:"-"`
 }
 
 // sessionToken is the signed form of a Session: its fields, tagged with their
-// type.
+// type, and the bearer token that names its row in the sessions table.
 type sessionToken struct {
 	Type string `json:"typ"`
+	// Token is random and secret; the sessions table holds only its hash
+	// (see hashToken). A cookie without one predates server-side sessions and
+	// is refused.
+	Token string `json:"tok"`
 	Session
 }
 
@@ -194,42 +211,64 @@ func clearCookie(base string, secure bool) *http.Cookie {
 // Session reading
 // ---------------------------------------------------------------------------
 
-// CurrentSession returns the caller's session if the cookie is present, signed
-// with the configured secret, and unexpired.
-func CurrentSession(r *http.Request, cfg *config.OidcConfig) *Session {
+// sessionFromCookie returns the claims and bearer token of the caller's
+// session cookie if it is present, signed with the configured secret, of the
+// session type, unexpired and complete. It does not consult the database, so
+// a cookie it accepts may still belong to a revoked session:
+// Registry.authenticate is the check a request has to pass.
+func sessionFromCookie(r *http.Request, cfg *config.OidcConfig) (*Session, string) {
 	cookie, err := r.Cookie(cookieName(sessionCookie, secureCookies(cfg)))
 	if err != nil {
-		return nil
+		return nil, ""
 	}
 	payload := unsign(cfg.SessionSecret, cookie.Value)
 	if payload == nil {
-		return nil
+		return nil, ""
 	}
 	var token sessionToken
 	if err := json.Unmarshal(payload, &token); err != nil {
-		return nil
+		return nil, ""
 	}
-	if token.Type != typeSession {
-		return nil
+	if token.Type != typeSession || token.Token == "" {
+		return nil, ""
 	}
 	s := token.Session
 	if s.Expires <= time.Now().Unix() {
-		return nil
+		return nil, ""
 	}
 	// Without both halves of the identity there is nobody to authorize.
 	if s.Issuer == "" || s.Subject == "" {
-		return nil
+		return nil, ""
 	}
-	return &s
+	return &s, token.Token
 }
 
-// signSession renders s as a session cookie value.
-func signSession(secret string, s Session) (string, error) {
-	payload, err := json.Marshal(sessionToken{Type: typeSession, Session: s})
+// signSession renders s, with its bearer token, as a session cookie value.
+func signSession(secret string, s Session, token string) (string, error) {
+	payload, err := json.Marshal(sessionToken{Type: typeSession, Token: token, Session: s})
 	if err != nil {
 		return "", err
 	}
 	return sign(secret, payload), nil
+}
+
+// hashToken is the form of a bearer token the sessions table keeps. The token
+// is 256 random bits, so a plain SHA-256 is enough: there is nothing to
+// brute-force, only a leaked table to make useless.
+func hashToken(token string) []byte {
+	sum := sha256.Sum256([]byte(token))
+	return sum[:]
+}
+
+// clientIP is the address a request came from, for display in the sessions
+// list. It is the peer address: behind a reverse proxy that is the proxy's,
+// because a forwarded header is only the client's word for it.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // defaultLanding is where a login lands when it names no acceptable

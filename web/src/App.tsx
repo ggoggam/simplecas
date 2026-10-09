@@ -12,8 +12,10 @@ import {
   type Invitation,
   type Member,
   type Role,
+  type Session,
 } from "@/lib/api";
 import { loadLevel, loadTree, type Node, type NodeData } from "@/lib/tree";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -54,6 +56,7 @@ import {
   LogOut,
   Mail,
   Menu,
+  MonitorSmartphone,
   Moon,
   Plus,
   RefreshCw,
@@ -77,6 +80,49 @@ function normalizeDest(p: string): string {
 /** How a member is named in the UI: their address, else their name. */
 function memberLabel(m: Member): string {
   return m.email || m.name || `user ${m.id}`;
+}
+
+/** A short name for the browser a session signed in from, e.g. "Firefox on
+ *  macOS", read from its user agent. The full string goes in a tooltip. */
+function describeAgent(ua: string): string {
+  if (!ua) return "Unknown browser";
+  // Order matters: Edge and Opera also claim Chrome, and Chrome claims Safari.
+  const browser = /Edg\//.test(ua)
+    ? "Edge"
+    : /OPR\/|Opera/.test(ua)
+      ? "Opera"
+      : /Firefox\//.test(ua)
+        ? "Firefox"
+        : /Chrome\/|CriOS\//.test(ua)
+          ? "Chrome"
+          : /Safari\//.test(ua)
+            ? "Safari"
+            : null;
+  const os = /iPhone|iPad|iPod/.test(ua)
+    ? "iOS"
+    : /Android/.test(ua)
+      ? "Android"
+      : /CrOS/.test(ua)
+        ? "ChromeOS"
+        : /Mac OS X|Macintosh/.test(ua)
+          ? "macOS"
+          : /Windows/.test(ua)
+            ? "Windows"
+            : /Linux/.test(ua)
+              ? "Linux"
+              : null;
+  if (browser && os) return `${browser} on ${os}`;
+  return browser ?? os ?? ua;
+}
+
+/** When a session was last used, roughly. The server only records it every
+ *  few minutes, so anything inside that window is "active now". */
+function lastSeenLabel(iso: string): string {
+  const minutes = Math.floor((Date.now() - new Date(iso).getTime()) / 60_000);
+  if (minutes < 5) return "active now";
+  if (minutes < 60) return `${minutes} min ago`;
+  if (minutes < 24 * 60) return `${Math.floor(minutes / 60)} h ago`;
+  return new Date(iso).toLocaleDateString();
 }
 
 /** Track a CSS media query, re-rendering on change. */
@@ -169,6 +215,10 @@ export function BrowserPage() {
   const [sentInvitations, setSentInvitations] = useState<Invitation[]>([]);
   // Invitations addressed to the caller, answered from their own dialog.
   const [inboxOpen, setInboxOpen] = useState(false);
+  // The caller's own sessions (where they are signed in), in their own dialog.
+  const [sessionsOpen, setSessionsOpen] = useState(false);
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
   // S3 access keys for the active team, managed from the same dialog.
   const [credentials, setCredentials] = useState<Credential[]>([]);
   const [credentialsLoading, setCredentialsLoading] = useState(false);
@@ -543,6 +593,60 @@ export function BrowserPage() {
     } catch (e) {
       toast.error((e as Error).message);
       await reload();
+    }
+  };
+
+  const loadSessions = useCallback(async () => {
+    setSessionsLoading(true);
+    try {
+      setSessions(await api.listSessions());
+    } catch (e) {
+      toast.error(`sessions: ${(e as Error).message}`);
+    } finally {
+      setSessionsLoading(false);
+    }
+  }, []);
+
+  const openSessionsDialog = () => {
+    setSessions([]);
+    setSessionsOpen(true);
+    loadSessions();
+  };
+
+  const doRevokeSession = async (s: Session) => {
+    try {
+      await api.revokeSession(s.id);
+      toast.success(`signed out ${describeAgent(s.user_agent)}`);
+      loadSessions();
+    } catch (e) {
+      toast.error((e as Error).message);
+      loadSessions();
+    }
+  };
+
+  const doRevokeOtherSessions = async () => {
+    if (!confirm("Sign out every other browser and device signed in to this account?")) {
+      return;
+    }
+    try {
+      const n = await api.revokeOtherSessions();
+      toast.success(
+        n === 0
+          ? "no other sessions to sign out"
+          : `signed out ${n} other session${n === 1 ? "" : "s"}`,
+      );
+      loadSessions();
+    } catch (e) {
+      toast.error((e as Error).message);
+    }
+  };
+
+  const doSignOutEverywhere = async () => {
+    if (!confirm("Sign out everywhere, including here?")) return;
+    try {
+      await api.signOutEverywhere();
+    } catch (e) {
+      toast.error((e as Error).message);
     }
   };
 
@@ -1118,6 +1222,15 @@ export function BrowserPage() {
                 {me.email ?? me.name ?? me.sub}
               </span>
               <Button
+                variant="ghost"
+                size="sm"
+                onClick={openSessionsDialog}
+                title="Where you're signed in"
+              >
+                <MonitorSmartphone className="size-4" />
+                <span className="hidden sm:inline">Sessions</span>
+              </Button>
+              <Button
                 variant="outline"
                 size="sm"
                 onClick={() =>
@@ -1366,6 +1479,78 @@ export function BrowserPage() {
               ))
             )}
           </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Where the signed-in user is signed in */}
+      <Dialog open={sessionsOpen} onOpenChange={setSessionsOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <MonitorSmartphone className="size-4" /> Sessions
+            </DialogTitle>
+            <DialogDescription>
+              Browsers and devices signed in to this account. Signing one out
+              takes effect on its next request.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-72 overflow-y-auto rounded-md border">
+            {sessionsLoading && sessions.length === 0 ? (
+              <div className="flex items-center justify-center gap-2 py-6 text-sm text-muted-foreground">
+                <Loader2 className="size-4 animate-spin" /> Loading…
+              </div>
+            ) : sessions.length === 0 ? (
+              <p className="py-6 text-center text-sm text-muted-foreground">
+                No sessions
+              </p>
+            ) : (
+              sessions.map((s) => (
+                <div
+                  key={s.id}
+                  className="flex items-center gap-2 border-b px-3 py-2 text-sm last:border-b-0"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span
+                        className="truncate font-medium"
+                        title={s.user_agent || undefined}
+                      >
+                        {describeAgent(s.user_agent)}
+                      </span>
+                      {s.current && <Badge variant="secondary">This device</Badge>}
+                    </div>
+                    <div
+                      className="truncate text-xs text-muted-foreground"
+                      title={`signed in ${new Date(s.created_at).toLocaleString()}`}
+                    >
+                      {s.ip || "unknown address"} · {lastSeenLabel(s.last_seen_at)}
+                    </div>
+                  </div>
+                  {!s.current && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => doRevokeSession(s)}
+                    >
+                      Revoke
+                    </Button>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={doSignOutEverywhere}>
+              <LogOut className="size-4" /> Sign out everywhere
+            </Button>
+            <Button
+              variant="outline"
+              onClick={doRevokeOtherSessions}
+              disabled={!sessions.some((s) => !s.current)}
+            >
+              Sign out everywhere else
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 

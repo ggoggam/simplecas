@@ -68,13 +68,14 @@ func (p *Provider) verifier() *oidc.IDTokenVerifier {
 	return p.provider.Verifier(&oidc.Config{ClientID: p.clientID})
 }
 
-// Registry holds every configured provider in declaration order, plus the HTTP
-// client used to talk to them.
+// Registry holds every configured provider in declaration order, the HTTP
+// client used to talk to them, and the store sessions are kept in.
 type Registry struct {
 	cfg        *config.OidcConfig
 	providers  []*Provider
 	byID       map[string]*Provider
 	httpClient *http.Client
+	store      SessionStore
 	log        *slog.Logger
 }
 
@@ -93,16 +94,19 @@ func (r *Registry) provider(id string) (*Provider, bool) {
 var errNoRedirect = errors.New("redirects are not followed")
 
 // NewRegistry performs OIDC discovery for every configured provider, returning
-// nil when OIDC is disabled.
+// nil when OIDC is disabled. Sessions are kept in store.
 //
 // Misconfiguration and unreachable issuers are fatal here, so a broken auth
 // setup fails at startup rather than on every login attempt.
-func NewRegistry(ctx context.Context, cfg *config.OidcConfig, log *slog.Logger) (*Registry, error) {
+func NewRegistry(ctx context.Context, cfg *config.OidcConfig, store SessionStore, log *slog.Logger) (*Registry, error) {
 	if !cfg.Enabled {
 		return nil, nil
 	}
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
+	}
+	if store == nil {
+		return nil, errors.New("oidc is enabled but no session store was given")
 	}
 
 	httpClient := &http.Client{
@@ -117,6 +121,7 @@ func NewRegistry(ctx context.Context, cfg *config.OidcConfig, log *slog.Logger) 
 		cfg:        cfg,
 		byID:       make(map[string]*Provider, len(cfg.Providers)),
 		httpClient: httpClient,
+		store:      store,
 		log:        log,
 	}
 	publicURL := trimTrailingSlash(cfg.PublicURL)
@@ -220,7 +225,8 @@ func (r *Registry) RunRefresh(ctx context.Context) {
 	}
 }
 
-// randomToken returns an unguessable value for CSRF state and nonces.
+// randomToken returns an unguessable value for CSRF state, nonces and session
+// tokens.
 func randomToken() string {
 	var buf [32]byte
 	// crypto/rand.Read never fails on any supported platform; it panics
