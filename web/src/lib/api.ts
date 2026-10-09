@@ -82,6 +82,9 @@ export interface Session {
   current: boolean;
 }
 
+/** What an S3 key may do in the namespaces it reaches. */
+export type Permission = "read" | "list" | "write" | "delete";
+
 /** An S3 access key belonging to a team. Never carries the secret. */
 export interface Credential {
   access_key_id: string;
@@ -93,6 +96,9 @@ export interface Credential {
   last_used_at: string | null;
   /** The minting owner's address, or "" when it is not known. */
   created_by: string;
+  permissions: Permission[];
+  /** Null for a key that reaches every namespace the team owns. */
+  namespaces: string[] | null;
 }
 
 /**
@@ -104,6 +110,8 @@ export interface CreatedCredential {
   secret_access_key: string;
   description: string;
   expires_at: string | null;
+  permissions: Permission[];
+  namespaces: string[] | null;
 }
 
 export interface ObjectEntry {
@@ -332,21 +340,25 @@ export const api = {
   },
 
   // The resolved value carries the secret, which the server will not repeat.
-  // `expiresInDays` null mints a key that never expires.
+  // A null `expiresInDays` never expires, null `permissions` grants all of
+  // them, and null `namespaces` reaches every namespace the team owns.
   async createCredential(
     tenant: string,
     description: string,
     expiresInDays: number | null,
+    permissions: Permission[] | null,
+    namespaces: string[] | null,
   ): Promise<CreatedCredential> {
     return (
       await req(`/api/tenants/${encodeURIComponent(tenant)}/credentials`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(
-          expiresInDays === null
-            ? { description }
-            : { description, expires_in_days: expiresInDays },
-        ),
+        body: JSON.stringify({
+          description,
+          ...(expiresInDays !== null && { expires_in_days: expiresInDays }),
+          ...(permissions !== null && { permissions }),
+          ...(namespaces !== null && { namespaces }),
+        }),
       })
     ).json();
   },

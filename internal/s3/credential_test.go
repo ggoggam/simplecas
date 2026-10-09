@@ -89,13 +89,13 @@ func TestExpiredTeamKeyIsDenied(t *testing.T) {
 	f := newTenantFixture(t)
 
 	past := time.Now().Add(-time.Second)
-	if err := f.g.StoreCredential(t.Context(), Credential{
+	if _, err := f.g.StoreCredential(t.Context(), Credential{
 		AccessKeyID: "SCASEXPIRED", Secret: "expired-secret", TenantID: f.tenantA, ExpiresAt: &past,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	future := time.Now().Add(time.Hour)
-	if err := f.g.StoreCredential(t.Context(), Credential{
+	if _, err := f.g.StoreCredential(t.Context(), Credential{
 		AccessKeyID: "SCASCURRENT", Secret: "current-secret", TenantID: f.tenantA, ExpiresAt: &future,
 	}); err != nil {
 		t.Fatal(err)
@@ -214,7 +214,7 @@ func TestNoKeysLeavesPlaintextAlone(t *testing.T) {
 	}
 	mustCode(t, f.signed(t, "SCASLEGACY", "legacy-secret", http.MethodGet, "/ns-a/", ""), http.StatusOK, "")
 
-	err := f.g.StoreCredential(t.Context(), Credential{AccessKeyID: "SCASNEW", Secret: "s", TenantID: f.tenantA})
+	_, err := f.g.StoreCredential(t.Context(), Credential{AccessKeyID: "SCASNEW", Secret: "s", TenantID: f.tenantA})
 	if err == nil {
 		t.Fatal("a key was stored without a credential key to seal it")
 	}

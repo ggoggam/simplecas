@@ -357,6 +357,12 @@ API (JSON, cookie-authenticated):
 Creating a namespace (`POST /api/namespaces`) takes a `tenant` field naming the
 owning team.
 
+> **Upgrading to scoped S3 keys:** migration `0007_credential_scopes` gives
+> every existing team key all four permissions on every namespace, which is
+> what it could already do. Instances still on the old version ignore scopes,
+> so during a rolling upgrade a scoped key may be served at full access; mint
+> scoped keys once every instance runs the new version.
+
 > **Upgrading to sealed S3 secrets:** migration `0006_credential_lifecycle`
 > keeps existing team keys as they are; the first start with
 > `auth.credential_keys` set seals them, and holders keep using the same
@@ -385,13 +391,36 @@ team's object into your own namespace.
 
 | Endpoint | |
 | --- | --- |
-| `GET /api/tenants/{team}/credentials` | list keys (no secrets), with `expires_at`, `last_used_at` and `created_by` |
-| `POST /api/tenants/{team}/credentials` | mint one: `{"description","expires_in_days"}`, both optional; **the secret is returned once and never again** |
+| `GET /api/tenants/{team}/credentials` | list keys (no secrets), with `expires_at`, `last_used_at`, `created_by`, `permissions` and `namespaces` |
+| `POST /api/tenants/{team}/credentials` | mint one: `{"description","expires_in_days","permissions","namespaces"}`, all optional; **the secret is returned once and never again** |
 | `DELETE /api/tenants/{team}/credentials/{accessKeyId}` | revoke |
 
-All three are **owner-only**: a key is unrestricted read/write over everything
-the team owns, so issuing one is closer to adding an owner than adding a member.
-There are no per-namespace or read-only keys.
+All three are **owner-only**: a key minted without a scope is unrestricted
+read/write over everything the team owns, now and later, so issuing one is
+closer to adding an owner than adding a member.
+
+A **scope** narrows a key. `permissions` is any of `read`, `list`, `write` and
+`delete` (all four when left out), and `namespaces` names the only ones of the
+team's namespaces the key reaches (all of them, including ones created later,
+when left out). Each named namespace must belong to the team when the key is
+minted. A scope is fixed once minted: to change one, mint a new key and revoke
+the old.
+
+| Permission | S3 operations |
+| --- | --- |
+| `read` | `GetObject`, `HeadObject`, `GetObjectTagging`, and being the source of `CopyObject` or `UploadPartCopy` |
+| `list` | `ListObjects` (V1 and V2), `ListMultipartUploads`, `ListParts` |
+| `write` | `PutObject`, the destination of `CopyObject`, and the whole multipart lifecycle: initiate, `UploadPart`, `UploadPartCopy`, complete, abort |
+| `delete` | `DeleteObject`, `DeleteObjects` |
+
+`HeadBucket` and `GetBucketLocation` need no particular permission, and
+`ListBuckets` shows only the namespaces a key reaches. `CreateBucket` needs
+`write` and `DeleteBucket` needs `delete`, both on a key not limited to named
+namespaces: a limited key could not reach a namespace it created. A namespace
+outside a key's list answers `NoSuchBucket`, exactly as another team's does; a
+missing permission on one inside it answers `403 AccessDenied`. For example, a
+CI uploader gets `["write"]`, which can upload but not read back, list or
+delete, and a backup reader gets `["read","list"]` on one namespace.
 
 `expires_in_days` (1–3650) gives a key a lifetime; leave it out for one that
 never expires. An expired key is refused like an unknown one (`403

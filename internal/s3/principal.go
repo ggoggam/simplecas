@@ -10,14 +10,43 @@ import (
 	"github.com/ggoggam/simplecas/internal/db"
 )
 
-// principal is who a verified S3 request belongs to.
+// principal is who a verified S3 request belongs to, and what it may do.
 //
 // tenantID nil means the admin credential — the one in simplecas.toml, or no
 // credential at all when auth is disabled — which addresses every namespace
 // including unowned ones. A non-nil tenantID is a per-tenant credential, and
 // it may address only that tenant's namespaces.
+//
+// perms and namespaces are the key's scope (see scope.go). The zero value
+// holds no permissions, so a principal is only ever as capable as the code
+// that built it said.
 type principal struct {
 	tenantID *int64
+	perms    permSet
+	// namespaces is nil when the principal reaches every namespace it
+	// could address at all; otherwise the names of the only ones it reaches.
+	namespaces map[string]struct{}
+}
+
+// adminPrincipal is the admin credential's scope: everything.
+func adminPrincipal() principal {
+	return principal{perms: allPerms}
+}
+
+// tenantPrincipal is a team key's scope, from its stored row.
+func tenantPrincipal(c db.S3Credential) principal {
+	perms := make([]Permission, len(c.Scope.Permissions))
+	for i, perm := range c.Scope.Permissions {
+		perms[i] = Permission(perm)
+	}
+	p := principal{tenantID: &c.TenantID, perms: permSetOf(perms)}
+	if c.Scope.Namespaces != nil {
+		p.namespaces = make(map[string]struct{}, len(c.Scope.Namespaces))
+		for _, name := range c.Scope.Namespaces {
+			p.namespaces[name] = struct{}{}
+		}
+	}
+	return p
 }
 
 // principalKey types the context value, so nothing else can collide with it.
@@ -38,7 +67,7 @@ func principalFrom(ctx context.Context) (principal, bool) {
 	return p, ok
 }
 
-// authenticate verifies the request signature and resolves the tenant scope its
+// authenticate verifies the request signature and resolves the scope its
 // credential grants. Signature checking and scope resolution are deliberately
 // one call: a caller cannot obtain one without the other, so no handler can end
 // up authenticated but unscoped. The signing context comes back too, for the
@@ -49,7 +78,7 @@ func (g *Gateway) authenticate(r *http.Request) (principal, *chunkSigner, error)
 	// `aws s3 --no-sign-request` work against a dev instance. Tenanted S3
 	// access requires auth.enabled.
 	if !g.cfg.Auth.Enabled {
-		return principal{}, nil, nil
+		return adminPrincipal(), nil, nil
 	}
 
 	parsed, ok := parseAuthHeader(r.Header.Get("Authorization"))
@@ -68,7 +97,7 @@ func (g *Gateway) authenticate(r *http.Request) (principal, *chunkSigner, error)
 		if err != nil {
 			return principal{}, nil, err
 		}
-		return principal{}, signer, nil
+		return adminPrincipal(), signer, nil
 	}
 
 	cred, found, err := g.db.LookupS3Credential(r.Context(), parsed.accessKeyID)
@@ -98,20 +127,5 @@ func (g *Gateway) authenticate(r *http.Request) (principal, *chunkSigner, error)
 		return principal{}, nil, err
 	}
 	g.touchCredential(r.Context(), cred)
-	return principal{tenantID: &cred.TenantID}, signer, nil
-}
-
-// namespace resolves a namespace name within the caller's scope. Every handler
-// goes through here rather than calling db.GetNamespace, which is what makes
-// tenant scoping impossible to forget: there is no unscoped way to turn a
-// namespace name from a request into a namespace row.
-func (g *Gateway) namespace(r *http.Request, name string) (db.Namespace, error) {
-	p, ok := principalFrom(r.Context())
-	if !ok {
-		return db.Namespace{}, apperr.Internalf("s3: request reached %s without authentication", r.URL.Path)
-	}
-	if p.tenantID != nil {
-		return g.db.GetNamespaceForTenant(r.Context(), name, *p.tenantID)
-	}
-	return g.db.GetNamespace(r.Context(), name)
+	return tenantPrincipal(cred), signer, nil
 }

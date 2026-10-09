@@ -13,11 +13,14 @@
 // Authorization: every request is SigV4-verified, and the credential decides
 // what it can address. The key in simplecas.toml is a superuser that reaches
 // every namespace; a key from tenant_credentials reaches only its own tenant's
-// namespaces, with everything else reported as NoSuchBucket. See principal.go —
-// g.namespace is the single chokepoint that turns a name from a request into a
-// row, so no handler here can resolve a namespace outside the caller's scope.
-// CreateBucket is the one place a name outside it shows: names are global, so a
-// taken one answers BucketAlreadyExists (see nameTaken).
+// namespaces, with everything else reported as NoSuchBucket, and its scope may
+// narrow that to some of them and to some of read, list, write and delete. See
+// principal.go and scope.go — g.authorize is the single chokepoint that turns
+// a name from a request into a row, and it takes the action the row is for, so
+// no handler here can resolve a namespace outside the caller's scope or act on
+// it beyond its permissions. CreateBucket is the one place a name outside the
+// scope shows: names are global, so a taken one answers BucketAlreadyExists
+// (see nameTaken).
 //
 // The gateway parses the request path itself rather than going through
 // http.ServeMux. ServeMux cleans paths — collapsing "//" and resolving "."
@@ -93,8 +96,8 @@ func New(database *db.DB, bucket *storage.Bucket, store *cas.Store, cfg *config.
 // object.
 //
 // The resolved principal rides on the request context from here on, and
-// g.namespace is the only way a handler turns a namespace name into a row — so
-// every level below this point is tenant-scoped by construction.
+// g.authorize is the only way a handler turns a namespace name into a row — so
+// every level below this point is scoped by construction.
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p, signer, err := g.authenticate(r)
 	if err != nil {
@@ -388,6 +391,11 @@ func (g *Gateway) listNamespaces(w http.ResponseWriter, r *http.Request) {
 
 	entries := make([]bucketEntry, 0, len(namespaces))
 	for _, ns := range namespaces {
+		// A key limited to some namespaces lists only those, as every
+		// other request would answer NoSuchBucket for the rest.
+		if !p.reaches(ns.Name) {
+			continue
+		}
 		entries = append(entries, bucketEntry{
 			Name:         ns.Name,
 			CreationDate: iso8601(ns.CreatedAt),
@@ -415,7 +423,7 @@ func (g *Gateway) namespaceDispatch(w http.ResponseWriter, r *http.Request, name
 		// Resolved in scope first: a tenant must not be able to delete a
 		// namespace it cannot address, and an out-of-scope name has to look
 		// missing rather than forbidden.
-		if _, err := g.namespace(r, namespace); err != nil {
+		if _, err := g.authorize(r, namespace, actionDeleteNamespace); err != nil {
 			g.writeError(w, r, err)
 			return
 		}
@@ -426,7 +434,7 @@ func (g *Gateway) namespaceDispatch(w http.ResponseWriter, r *http.Request, name
 		w.WriteHeader(http.StatusNoContent)
 
 	case http.MethodHead:
-		if _, err := g.namespace(r, namespace); err != nil {
+		if _, err := g.authorize(r, namespace, actionLocate); err != nil {
 			g.writeError(w, r, err)
 			return
 		}
@@ -434,12 +442,20 @@ func (g *Gateway) namespaceDispatch(w http.ResponseWriter, r *http.Request, name
 
 	case http.MethodGet:
 		switch {
-		case query.Has("location"):
-			g.writeXML(w, r, http.StatusOK, locationConstraint{
-				Xmlns:  xmlns,
-				Region: g.cfg.Server.Region,
-			})
-		case query.Has("versioning"):
+		case query.Has("location"), query.Has("versioning"):
+			// These say nothing about the namespace's contents, but they
+			// still answer only for one the caller reaches, as S3 does.
+			if _, err := g.authorize(r, namespace, actionLocate); err != nil {
+				g.writeError(w, r, err)
+				return
+			}
+			if query.Has("location") {
+				g.writeXML(w, r, http.StatusOK, locationConstraint{
+					Xmlns:  xmlns,
+					Region: g.cfg.Server.Region,
+				})
+				return
+			}
 			g.writeXML(w, r, http.StatusOK, versioningConfiguration{Xmlns: xmlns})
 		case query.Has("uploads"):
 			g.listMultipartUploads(w, r, namespace, query)
@@ -473,9 +489,9 @@ func (g *Gateway) createNamespace(w http.ResponseWriter, r *http.Request, namesp
 	// A tenanted credential owns what it creates, so the namespace is visible
 	// to that team in /ui and /api too. The admin credential has no tenant
 	// identity to attribute, so its namespaces stay unowned.
-	p, ok := principalFrom(r.Context())
-	if !ok {
-		g.writeError(w, r, apperr.Internalf("s3: CreateBucket without authentication"))
+	p, err := permit(r.Context(), namespace, actionCreateNamespace)
+	if err != nil {
+		g.writeError(w, r, err)
 		return
 	}
 	if err := g.db.CreateNamespace(r.Context(), namespace, p.tenantID); err != nil {
@@ -493,13 +509,13 @@ func (g *Gateway) createNamespace(w http.ResponseWriter, r *http.Request, namesp
 // are global, so the clash itself reveals that the name is in use; the answer
 // says no more than that unless the namespace is the caller's.
 //
-// "The caller's" means the name resolves through g.namespace, the same scope
+// "The caller's" means the name resolves through g.authorize, the same scope
 // every other request is held to: a team key owns its team's namespaces, and
 // the admin credential, which addresses every namespace, owns them all.
 // BucketAlreadyOwnedByYou tells a create-if-missing client it can go ahead and
-// use the bucket, which is true exactly when g.namespace would serve it.
+// use the bucket, which is true exactly when g.authorize would serve it.
 func (g *Gateway) nameTaken(r *http.Request, name string) error {
-	_, err := g.namespace(r, name)
+	_, err := g.authorize(r, name, actionLocate)
 	switch {
 	case err == nil:
 		return apperr.ErrNamespaceAlreadyOwned
@@ -514,7 +530,7 @@ func (g *Gateway) nameTaken(r *http.Request, name string) error {
 }
 
 func (g *Gateway) listObjects(w http.ResponseWriter, r *http.Request, namespace string, query url.Values) {
-	ns, err := g.namespace(r, namespace)
+	ns, err := g.authorize(r, namespace, actionList)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -611,7 +627,7 @@ func listStartMarker(query url.Values, v2 bool) (string, error) {
 }
 
 func (g *Gateway) deleteObjects(w http.ResponseWriter, r *http.Request, namespace string) {
-	ns, err := g.namespace(r, namespace)
+	ns, err := g.authorize(r, namespace, actionDelete)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -717,7 +733,7 @@ func (g *Gateway) objectDispatch(w http.ResponseWriter, r *http.Request, namespa
 }
 
 func (g *Gateway) putObject(w http.ResponseWriter, r *http.Request, namespace, key string) {
-	ns, err := g.namespace(r, namespace)
+	ns, err := g.authorize(r, namespace, actionWrite)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -738,14 +754,16 @@ func (g *Gateway) putObject(w http.ResponseWriter, r *http.Request, namespace, k
 // Source and destination are both resolved in the caller's scope, so a tenanted
 // credential can only copy within its own tenant. Naming another tenant's
 // bucket as the source fails as NoSuchBucket — without this, copy would be a
-// way to pull any tenant's object into your own namespace by name.
+// way to pull any tenant's object into your own namespace by name. The source
+// needs read and the destination write, so a key cannot copy its way around
+// either.
 func (g *Gateway) copyObject(w http.ResponseWriter, r *http.Request, dstNamespace, dstKey string) {
 	src, err := g.copySource(r)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
 	}
-	dstNS, err := g.namespace(r, dstNamespace)
+	dstNS, err := g.authorize(r, dstNamespace, actionWrite)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -777,7 +795,7 @@ func (g *Gateway) copyObject(w http.ResponseWriter, r *http.Request, dstNamespac
 }
 
 // copySource resolves the object x-amz-copy-source names, in the caller's
-// scope like any other namespace.
+// scope like any other namespace, for reading.
 func (g *Gateway) copySource(r *http.Request) (db.ObjectMeta, error) {
 	source, err := url.PathUnescape(r.Header.Get("x-amz-copy-source"))
 	if err != nil {
@@ -787,7 +805,7 @@ func (g *Gateway) copySource(r *http.Request) (db.ObjectMeta, error) {
 	if !ok || srcKey == "" {
 		return db.ObjectMeta{}, apperr.InvalidArgument("x-amz-copy-source must be bucket/key")
 	}
-	srcNS, err := g.namespace(r, srcNamespace)
+	srcNS, err := g.authorize(r, srcNamespace, actionRead)
 	if err != nil {
 		return db.ObjectMeta{}, err
 	}
@@ -798,7 +816,7 @@ func (g *Gateway) copySource(r *http.Request) (db.ObjectMeta, error) {
 // not stored, but the AWS CLI asks for them before every s3-to-s3 copy, and a
 // refusal there fails the copy itself.
 func (g *Gateway) getObjectTagging(w http.ResponseWriter, r *http.Request, namespace, key string) {
-	ns, err := g.namespace(r, namespace)
+	ns, err := g.authorize(r, namespace, actionRead)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -811,7 +829,7 @@ func (g *Gateway) getObjectTagging(w http.ResponseWriter, r *http.Request, names
 }
 
 func (g *Gateway) deleteObject(w http.ResponseWriter, r *http.Request, namespace, key string) {
-	ns, err := g.namespace(r, namespace)
+	ns, err := g.authorize(r, namespace, actionDelete)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -837,7 +855,7 @@ func (g *Gateway) ServeObject(w http.ResponseWriter, r *http.Request, ns db.Name
 
 // serveObject resolves the namespace in the caller's S3 scope, then serves it.
 func (g *Gateway) serveObject(w http.ResponseWriter, r *http.Request, namespace, key string, headOnly bool) {
-	ns, err := g.namespace(r, namespace)
+	ns, err := g.authorize(r, namespace, actionRead)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -913,7 +931,7 @@ func (g *Gateway) serveResolvedObject(w http.ResponseWriter, r *http.Request, ns
 // ---------------------------------------------------------------------------
 
 func (g *Gateway) initiateMultipart(w http.ResponseWriter, r *http.Request, namespace, key string) {
-	ns, err := g.namespace(r, namespace)
+	ns, err := g.authorize(r, namespace, actionWrite)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -943,7 +961,7 @@ func (g *Gateway) uploadPart(w http.ResponseWriter, r *http.Request, namespace, 
 		return
 	}
 
-	ns, err := g.namespace(r, namespace)
+	ns, err := g.authorize(r, namespace, actionWrite)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -985,7 +1003,7 @@ func (g *Gateway) uploadPartCopy(w http.ResponseWriter, r *http.Request, namespa
 		g.writeError(w, r, err)
 		return
 	}
-	ns, err := g.namespace(r, namespace)
+	ns, err := g.authorize(r, namespace, actionWrite)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -1071,7 +1089,7 @@ func (g *Gateway) listParts(w http.ResponseWriter, r *http.Request, namespace, k
 		g.writeError(w, r, err)
 		return
 	}
-	ns, err := g.namespace(r, namespace)
+	ns, err := g.authorize(r, namespace, actionList)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -1121,7 +1139,7 @@ func (g *Gateway) listParts(w http.ResponseWriter, r *http.Request, namespace, k
 }
 
 func (g *Gateway) listMultipartUploads(w http.ResponseWriter, r *http.Request, namespace string, query url.Values) {
-	ns, err := g.namespace(r, namespace)
+	ns, err := g.authorize(r, namespace, actionList)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -1159,7 +1177,7 @@ func (g *Gateway) completeMultipart(w http.ResponseWriter, r *http.Request, name
 		g.writeError(w, r, err)
 		return
 	}
-	ns, err := g.namespace(r, namespace)
+	ns, err := g.authorize(r, namespace, actionWrite)
 	if err != nil {
 		g.writeError(w, r, err)
 		return
@@ -1212,7 +1230,7 @@ func (g *Gateway) abortMultipart(w http.ResponseWriter, r *http.Request, namespa
 		g.writeError(w, r, err)
 		return
 	}
-	ns, err := g.namespace(r, namespace)
+	ns, err := g.authorize(r, namespace, actionWrite)
 	if err != nil {
 		g.writeError(w, r, err)
 		return

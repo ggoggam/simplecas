@@ -120,7 +120,7 @@ func mustCreateCredential(t *testing.T, g *Gateway, tenantID int64, label string
 	// the API's generator is exercised in the api package.
 	id = "SCASTESTKEY" + strings.ToUpper(strings.ReplaceAll(label, "-", ""))
 	secret = "secret-for-" + label
-	err := g.StoreCredential(context.Background(), Credential{
+	_, err := g.StoreCredential(context.Background(), Credential{
 		AccessKeyID: id, Secret: secret, TenantID: tenantID, Description: label,
 	})
 	if err != nil {
@@ -231,7 +231,7 @@ func TestRevokedCredentialStopsWorking(t *testing.T) {
 func TestAdminKeyCannotBeShadowedByATenantRow(t *testing.T) {
 	f := newTenantFixture(t)
 
-	err := f.g.StoreCredential(t.Context(), Credential{
+	_, err := f.g.StoreCredential(t.Context(), Credential{
 		AccessKeyID: adminKeyID, Secret: "attacker-chosen-secret", TenantID: f.tenantB, Description: "shadow",
 	})
 	if err != nil {

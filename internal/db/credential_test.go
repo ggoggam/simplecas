@@ -14,10 +14,15 @@ import (
 // returns the bytes it is given and never interprets them.
 func sealedFor(accessKeyID string) []byte { return []byte("sealed:" + accessKeyID) }
 
+// allPermissions is the scope of a key with no limits, which the gateway
+// fills in when a key is minted without one.
+var allPermissions = S3Scope{Permissions: []string{"read", "list", "write", "delete"}}
+
 func mustCredential(t *testing.T, d *DB, tenantID int64, accessKeyID string) {
 	t.Helper()
 	err := d.CreateS3Credential(t.Context(), NewS3Credential{
 		AccessKeyID: accessKeyID, TenantID: tenantID, KeyID: "k1", Sealed: sealedFor(accessKeyID),
+		Scope: allPermissions,
 	})
 	if err != nil {
 		t.Fatalf("create credential %s: %v", accessKeyID, err)
@@ -35,7 +40,7 @@ func TestS3CredentialRoundTrip(t *testing.T) {
 	}
 	if err := d.CreateS3Credential(ctx, NewS3Credential{
 		AccessKeyID: "SCASKEY1", TenantID: tenantID, KeyID: "k1", Sealed: sealedFor("SCASKEY1"),
-		Description: "ci", CreatedBy: &owner,
+		Description: "ci", CreatedBy: &owner, Scope: allPermissions,
 	}); err != nil {
 		t.Fatalf("create credential: %v", err)
 	}
@@ -85,6 +90,7 @@ func TestExpiredS3CredentialDoesNotResolve(t *testing.T) {
 	for id, expires := range map[string]*time.Time{"SCASPAST": &past, "SCASFUTURE": &future} {
 		if err := d.CreateS3Credential(ctx, NewS3Credential{
 			AccessKeyID: id, TenantID: tenantID, KeyID: "k1", Sealed: sealedFor(id), ExpiresAt: expires,
+			Scope: allPermissions,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -154,6 +160,7 @@ func TestResealS3Credential(t *testing.T) {
 	mustCredential(t, d, tenantID, "SCASOLD")
 	if err := d.CreateS3Credential(ctx, NewS3Credential{
 		AccessKeyID: "SCASCURRENT", TenantID: tenantID, KeyID: "k2", Sealed: sealedFor("SCASCURRENT"),
+		Scope: allPermissions,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -219,6 +226,92 @@ func TestS3CredentialSecretForm(t *testing.T) {
 	} {
 		if _, err := d.pool.Exec(ctx, stmt, tenantID); err == nil {
 			t.Errorf("%s: the row was accepted", name)
+		}
+	}
+}
+
+// A key's scope comes back as it was stored, from both the gateway's lookup
+// and the listing; a key with no namespace list reaches every one.
+func TestS3CredentialScopeRoundTrip(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	tenantID, err := d.CreateTenant(ctx, "team-a", mustUser(t, d, "a@example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped := S3Scope{Permissions: []string{"read", "list"}, Namespaces: []string{"logs", "photos"}}
+	if err := d.CreateS3Credential(ctx, NewS3Credential{
+		AccessKeyID: "SCASSCOPED", TenantID: tenantID, KeyID: "k1", Sealed: sealedFor("SCASSCOPED"), Scope: scoped,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mustCredential(t, d, tenantID, "SCASFULL")
+
+	cred, ok, err := d.LookupS3Credential(ctx, "SCASSCOPED")
+	if err != nil || !ok {
+		t.Fatalf("lookup: ok = %v, err = %v", ok, err)
+	}
+	if !slices.Equal(cred.Scope.Permissions, scoped.Permissions) || !slices.Equal(cred.Scope.Namespaces, scoped.Namespaces) {
+		t.Errorf("looked up scope %+v, want %+v", cred.Scope, scoped)
+	}
+	full, _, _ := d.LookupS3Credential(ctx, "SCASFULL")
+	if full.Scope.Namespaces != nil {
+		t.Errorf("a key minted for every namespace came back limited to %q", full.Scope.Namespaces)
+	}
+
+	list, err := d.ListS3Credentials(ctx, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range list {
+		if c.AccessKeyID == "SCASSCOPED" &&
+			(!slices.Equal(c.Permissions, scoped.Permissions) || !slices.Equal(c.Namespaces, scoped.Namespaces)) {
+			t.Errorf("listed scope %q in %q, want %+v", c.Permissions, c.Namespaces, scoped)
+		}
+	}
+}
+
+// A key minted before scopes existed keeps the access it always had.
+func TestLegacyS3CredentialHasFullScope(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	tenantID, err := d.CreateTenant(ctx, "team-a", mustUser(t, d, "a@example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertPlaintext(t, d, tenantID, "SCASLEGACY", "legacy-secret")
+
+	cred, ok, err := d.LookupS3Credential(ctx, "SCASLEGACY")
+	if err != nil || !ok {
+		t.Fatalf("lookup: ok = %v, err = %v", ok, err)
+	}
+	if !slices.Equal(cred.Scope.Permissions, allPermissions.Permissions) || cred.Scope.Namespaces != nil {
+		t.Errorf("legacy key scope = %+v, want every permission on every namespace", cred.Scope)
+	}
+}
+
+// The table refuses a scope that grants nothing, names an unknown permission,
+// or lists no namespaces, whatever the gateway lets through.
+func TestS3CredentialScopeShape(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	tenantID, err := d.CreateTenant(ctx, "team-a", mustUser(t, d, "a@example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, scope := range map[string]S3Scope{
+		"no permissions":     {Permissions: []string{}},
+		"unknown permission": {Permissions: []string{"read", "admin"}},
+		"empty namespaces":   {Permissions: []string{"read"}, Namespaces: []string{}},
+	} {
+		err := d.CreateS3Credential(ctx, NewS3Credential{
+			AccessKeyID: "SCASX", TenantID: tenantID, KeyID: "k1", Sealed: sealedFor("SCASX"), Scope: scope,
+		})
+		if err == nil {
+			t.Errorf("%s: the key was stored", name)
 		}
 	}
 }
