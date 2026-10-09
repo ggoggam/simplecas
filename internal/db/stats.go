@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -150,4 +151,82 @@ func (d *DB) GCSweep(ctx context.Context, graceSecs int64, limit int64, deleteBy
 		swept++
 	}
 	return swept, errors.Join(errs...)
+}
+
+// UnknownBlobs returns those of hashes that have no blobs row. The orphan sweep
+// uses it to set aside, one round trip per page of a listing, the stored blobs
+// the table already accounts for; only the rest need ReclaimOrphanBlob.
+func (d *DB) UnknownBlobs(ctx context.Context, hashes []string) ([]string, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT h FROM unnest($1::text[]) AS h
+		WHERE NOT EXISTS (SELECT 1 FROM blobs WHERE blobs.hash = h)`, hashes)
+	if err != nil {
+		return nil, apperr.Internal(err)
+	}
+	unknown, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, apperr.Internal(err)
+	}
+	return unknown, nil
+}
+
+// OrphanLockTimeout bounds how long ReclaimOrphanBlob waits on a claim of the
+// same hash that is still in flight. A commit holds its claim while it copies
+// the bytes into place, which for a large blob can take minutes, and the sweep
+// should move on rather than hold a connection for the length of that copy.
+var OrphanLockTimeout = 2 * time.Second
+
+// ReclaimOrphanBlob deletes the stored bytes of a blob that has no row,
+// calling deleteBytes only while it is certain that none will appear. It
+// reports whether the bytes were deleted.
+//
+// Bytes with no row are left by a commit that copied them into place and then
+// failed to commit. They cannot simply be deleted on sight, because a commit
+// in progress looks exactly the same from outside: ClaimBlob has inserted the
+// row but not yet committed it, and the bytes it copied are already in place.
+//
+// So the sweep claims the hash itself, by inserting the blob's row in a
+// transaction it always rolls back. Postgres makes that insert wait for any
+// uncommitted insert of the same hash, and makes any later ClaimBlob wait for
+// it, so the claim is the same serialization point GCSweep's row lock is:
+//
+//   - A claim in flight commits first: the insert then conflicts, and the
+//     blob is the table's to manage.
+//   - A claim in flight rolls back: the bytes really are orphaned, and the
+//     insert goes ahead.
+//   - A claim that arrives during the delete waits for the rollback, and then
+//     inserts a fresh row, so ClaimBlob reports needsBytes and the commit
+//     copies its bytes back after the delete.
+//
+// A claim still in flight after OrphanLockTimeout skips the blob for this
+// pass; a later pass sees how it ended.
+func (d *DB) ReclaimOrphanBlob(ctx context.Context, hash string, deleteBytes func(ctx context.Context, hash string) error) (reclaimed bool, err error) {
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return false, apperr.Internal(err)
+	}
+	// Never committed: the row exists only to hold the claim.
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	timeout := fmt.Sprintf("SET LOCAL lock_timeout = %d", OrphanLockTimeout.Milliseconds())
+	if _, err := tx.Exec(ctx, timeout); err != nil {
+		return false, apperr.Internal(err)
+	}
+
+	var claimed bool
+	err = tx.QueryRow(ctx, `
+		INSERT INTO blobs (hash, size, refcount) VALUES ($1, 0, 0)
+		ON CONFLICT (hash) DO NOTHING
+		RETURNING true`, hash).Scan(&claimed)
+	if notFound(err) || lockNotAvailable(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, apperr.Internal(err)
+	}
+
+	if err := deleteBytes(ctx, hash); err != nil {
+		return false, err
+	}
+	return true, nil
 }

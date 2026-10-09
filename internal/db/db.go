@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -185,4 +186,11 @@ type Stats struct {
 // lookups translate into a domain-level "does not exist" error.
 func notFound(err error) bool {
 	return errors.Is(err, pgx.ErrNoRows)
+}
+
+// lockNotAvailable reports whether err is Postgres giving up on a lock wait
+// that ran past lock_timeout.
+func lockNotAvailable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "55P03"
 }

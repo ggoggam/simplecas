@@ -19,8 +19,13 @@ const gcBatch = 1000
 // time querying than reclaiming.
 const minGCInterval = 5 * time.Second
 
+// orphanPage is how many listed blobs the orphan sweep checks against the
+// blobs table in one query.
+const orphanPage = 1000
+
 // RunGC reclaims space until ctx is cancelled: unreferenced blobs, orphaned
-// staging files, abandoned multipart uploads, and expired sign-in sessions.
+// staging files, abandoned multipart uploads, and expired sign-in sessions on
+// every tick, and stored bytes no blob row accounts for every orphan interval.
 // Every pass is best-effort — a failure is logged and retried on the next tick
 // rather than ending the loop, because a transient database or backend blip
 // must not silently stop reclamation for the lifetime of the process.
@@ -32,6 +37,9 @@ func (s *Store) RunGC(ctx context.Context) {
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	orphanInterval := time.Duration(s.gc.OrphanIntervalSecs) * time.Second
+	var lastOrphanSweep time.Time
 
 	for {
 		// Sleep first, matching the previous behaviour: startup is busy
@@ -46,6 +54,10 @@ func (s *Store) RunGC(ctx context.Context) {
 		s.sweepStaging(ctx)
 		s.sweepMultipart(ctx)
 		s.sweepSessions(ctx)
+		if time.Since(lastOrphanSweep) >= orphanInterval {
+			s.sweepOrphanBlobs(ctx)
+			lastOrphanSweep = time.Now()
+		}
 	}
 }
 
@@ -91,17 +103,7 @@ func (s *Store) sweepStaging(ctx context.Context) {
 			continue
 		}
 
-		modified := obj.ModTime
-		if modified.IsZero() {
-			// Backends that omit timestamps from listings get a stat. If even
-			// that has none, skip: never delete on an unknown age.
-			attrs, err := s.blob.Attributes(ctx, obj.Key)
-			if err != nil {
-				continue
-			}
-			modified = attrs.ModTime
-		}
-		if modified.IsZero() || modified.After(cutoff) {
+		if !s.olderThan(ctx, obj, cutoff) {
 			continue
 		}
 
@@ -162,4 +164,104 @@ func (s *Store) sweepSessions(ctx context.Context) {
 	if swept > 0 {
 		s.log.Info("gc: removed expired sessions", "swept", swept)
 	}
+}
+
+// sweepOrphanBlobs deletes stored blobs that no blob row accounts for and that
+// are older than the grace period. A commit that copied its bytes into place
+// and then failed to commit — a quota refusal, a lost connection, a crash —
+// leaves exactly that behind, and GCSweep, which works from the rows, can
+// never find them.
+//
+// The listing is checked against the table a page at a time, so the cost is
+// one query per page; only blobs with no row go on to ReclaimOrphanBlob, which
+// decides under the same lock a commit takes. The grace period is not what
+// keeps an in-flight commit safe — that lock is — but it spares the lock for
+// the fresh bytes of commits that are bound to succeed.
+func (s *Store) sweepOrphanBlobs(ctx context.Context) {
+	cutoff := time.Now().Add(-time.Duration(s.gc.GraceSecs) * time.Second)
+
+	var removed int
+	page := make([]string, 0, orphanPage)
+	it := s.blob.List(&blob.ListOptions{Prefix: storage.BlobPrefix})
+	for {
+		obj, err := it.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			if ctx.Err() == nil {
+				s.log.Warn("orphan blob sweep failed", "err", err)
+			}
+			return
+		}
+		if obj.IsDir {
+			continue
+		}
+		hash, ok := storage.HashFromBlobPath(obj.Key)
+		if !ok || !s.olderThan(ctx, obj, cutoff) {
+			continue
+		}
+
+		page = append(page, hash)
+		if len(page) < orphanPage {
+			continue
+		}
+		n, ok := s.reclaimOrphans(ctx, page)
+		removed += n
+		if !ok {
+			return
+		}
+		page = page[:0]
+	}
+	if len(page) > 0 {
+		n, _ := s.reclaimOrphans(ctx, page)
+		removed += n
+	}
+
+	if removed > 0 {
+		s.log.Info("gc: removed orphaned blobs", "removed", removed)
+	}
+}
+
+// reclaimOrphans deletes those of hashes that have no blob row. ok is false
+// when the table could not be consulted at all, which ends the pass.
+func (s *Store) reclaimOrphans(ctx context.Context, hashes []string) (removed int, ok bool) {
+	unknown, err := s.db.UnknownBlobs(ctx, hashes)
+	if err != nil {
+		if ctx.Err() == nil {
+			s.log.Warn("orphan blob sweep could not check blob rows", "err", err)
+		}
+		return 0, false
+	}
+	for _, hash := range unknown {
+		reclaimed, err := s.db.ReclaimOrphanBlob(ctx, hash, func(ctx context.Context, hash string) error {
+			return s.deleteIfPresent(ctx, storage.BlobPath(hash))
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				return removed, false
+			}
+			s.log.Warn("could not delete orphaned blob", "hash", hash, "err", err)
+			continue
+		}
+		if reclaimed {
+			removed++
+		}
+	}
+	return removed, true
+}
+
+// olderThan reports whether a listed file was last modified before cutoff.
+// Backends that omit timestamps from listings get a stat; if even that has
+// none, the answer is no, because nothing is ever deleted on an unknown age.
+func (s *Store) olderThan(ctx context.Context, obj *blob.ListObject, cutoff time.Time) bool {
+	modified := obj.ModTime
+	if modified.IsZero() {
+		attrs, err := s.blob.Attributes(ctx, obj.Key)
+		if err != nil {
+			return false
+		}
+		modified = attrs.ModTime
+	}
+	return !modified.IsZero() && modified.Before(cutoff)
 }

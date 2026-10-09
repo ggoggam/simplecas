@@ -171,6 +171,87 @@ func TestSweepSessionsRemovesExpiredOnes(t *testing.T) {
 	}
 }
 
+// writeBlob puts bytes at hash's blob path directly, the way a commit that
+// copied them into place and then failed to commit leaves them.
+func (f *fixture) writeBlob(t *testing.T, hash, content string) {
+	t.Helper()
+	if err := f.bucket.WriteAll(t.Context(), storage.BlobPath(hash), []byte(content), nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSweepOrphanBlobsReclaimsBytesWithNoRow(t *testing.T) {
+	f := newFixture(t, collectNow())
+	ctx := t.Context()
+	nsID := f.namespace(t, "ns", nil)
+
+	// The orphan: bytes in place, no row.
+	f.writeBlob(t, hashABC, "abc")
+	// A live blob, and one at refcount 0 that GCSweep has not taken yet. Both
+	// have rows, so neither is the orphan sweep's business.
+	if _, err := f.store.Commit(ctx, nsID, "kept", "text/plain", f.stage(t, "")); err != nil {
+		t.Fatal(err)
+	}
+	unreferenced := f.stage(t, "unreferenced")
+	if _, err := f.store.Commit(ctx, nsID, "gone", "text/plain", unreferenced); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.DeleteObject(ctx, nsID, "gone"); err != nil {
+		t.Fatal(err)
+	}
+	// Something under blobs/ that is not a blob at all.
+	if err := f.bucket.WriteAll(ctx, "blobs/README", []byte("not a blob"), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	f.store.sweepOrphanBlobs(ctx)
+
+	if ok, _ := f.bucket.Exists(ctx, storage.BlobPath(hashABC)); ok {
+		t.Error("bytes no row accounts for should have been reclaimed")
+	}
+	for _, key := range []string{storage.BlobPath(hashEmpty), storage.BlobPath(unreferenced.Hash), "blobs/README"} {
+		if ok, _ := f.bucket.Exists(ctx, key); !ok {
+			t.Errorf("%s must survive the orphan sweep", key)
+		}
+	}
+	if _, ok := f.refcount(t, hashABC); ok {
+		t.Error("the orphan sweep must not leave a blob row behind")
+	}
+}
+
+// Fresh bytes with no row are most likely a commit about to succeed; the grace
+// period spares them the lock.
+func TestSweepOrphanBlobsHonoursTheGracePeriod(t *testing.T) {
+	f := newFixture(t, config.GcConfig{IntervalSecs: 60, GraceSecs: 3600, MultipartExpirySecs: 86400})
+	ctx := t.Context()
+
+	f.writeBlob(t, hashABC, "abc")
+	f.store.sweepOrphanBlobs(ctx)
+
+	if ok, _ := f.bucket.Exists(ctx, storage.BlobPath(hashABC)); !ok {
+		t.Error("bytes inside the grace period must not be reclaimed")
+	}
+}
+
+// Once an orphan is reclaimed, the same content uploaded again must come back
+// whole: the claim sees no row and writes the bytes afresh.
+func TestReuploadAfterOrphanSweepRewritesTheBytes(t *testing.T) {
+	f := newFixture(t, collectNow())
+	ctx := t.Context()
+	nsID := f.namespace(t, "ns", nil)
+
+	f.writeBlob(t, hashABC, "abc")
+	f.store.sweepOrphanBlobs(ctx)
+
+	if _, err := f.store.Commit(ctx, nsID, "k", "text/plain", f.stage(t, "abc")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := f.bucket.ReadAll(ctx, storage.BlobPath(hashABC))
+	if err != nil || string(got) != "abc" {
+		t.Errorf("blob bytes = %q, %v; want the re-upload's bytes in place", got, err)
+	}
+}
+
 // The sweeps run in sequence, and each has to survive the others' leftovers.
 func TestRunGCStopsOnContextCancel(t *testing.T) {
 	f := newFixture(t, config.GcConfig{IntervalSecs: 1, GraceSecs: 0, MultipartExpirySecs: 0})
@@ -199,6 +280,7 @@ func TestGCPassOnAnEmptyStore(t *testing.T) {
 	f.store.sweepStaging(ctx)
 	f.store.sweepMultipart(ctx)
 	f.store.sweepSessions(ctx)
+	f.store.sweepOrphanBlobs(ctx)
 
 	if n := f.countUnder(t, ""); n != 0 {
 		t.Errorf("an empty store gained %d objects during a GC pass", n)

@@ -142,6 +142,11 @@ type GcConfig struct {
 	// activity (initiation or a new part) before it is abandoned and its
 	// staged parts reclaimed.
 	MultipartExpirySecs int64 `toml:"multipart_expiry_secs"`
+	// OrphanIntervalSecs is how often GC lists every stored blob to reclaim
+	// bytes no blob row accounts for, which a failed commit leaves behind.
+	// The listing touches every blob, so it runs far less often than the
+	// other sweeps; such bytes are rare and harmless until then.
+	OrphanIntervalSecs int64 `toml:"orphan_interval_secs"`
 }
 
 // LimitsConfig bounds what one request, and one team, can consume.
@@ -176,6 +181,7 @@ func Default() Config {
 			IntervalSecs:        60,
 			GraceSecs:           300,
 			MultipartExpirySecs: 86400,
+			OrphanIntervalSecs:  86400,
 		},
 		Limits: LimitsConfig{
 			MaxObjectBytes:   5 << 40,
@@ -352,7 +358,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("storage.backend %q is not one of fs, s3, gcs, azblob", c.Storage.Backend)
 	}
 
-	if c.GC.IntervalSecs < 1 || c.GC.GraceSecs < 0 || c.GC.MultipartExpirySecs < 1 {
+	if c.GC.IntervalSecs < 1 || c.GC.GraceSecs < 0 || c.GC.MultipartExpirySecs < 1 || c.GC.OrphanIntervalSecs < 1 {
 		return fmt.Errorf("gc intervals must be positive")
 	}
 

@@ -68,6 +68,10 @@ grace_secs = 300
 # How long a multipart upload may sit inactive (no initiation or new part)
 # before it's abandoned and its staged parts reclaimed. Default: 86400 (24h).
 multipart_expiry_secs = 86400
+# How often to list every stored blob and reclaim bytes no blob row accounts
+# for (left by an upload that failed to commit). The listing touches every
+# blob, so keep it infrequent. Default: 86400 (24h).
+orphan_interval_secs = 86400
 
 # Request and storage limits. Over-limit uploads get 400 EntityTooLarge, and
 # writes past a team's quota get 403 QuotaExceeded.

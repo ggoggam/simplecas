@@ -46,6 +46,10 @@ type Bucket struct {
 	*blob.Bucket
 }
 
+// BlobPrefix is the prefix every content-addressed blob lives under, and what
+// the orphan sweep lists.
+const BlobPrefix = "blobs/"
+
 // BlobPath is where the bytes for a content hash live. The two levels of
 // two-hex-character fanout keep any single directory small on filesystem
 // backends and spread the keyspace on object stores.
@@ -53,9 +57,27 @@ func BlobPath(hash string) string {
 	if len(hash) < 4 {
 		// Never reachable with a blake3 digest, but a short hash must not
 		// panic its way out of a request handler.
-		return "blobs/" + hash
+		return BlobPrefix + hash
 	}
-	return fmt.Sprintf("blobs/%s/%s/%s", hash[0:2], hash[2:4], hash)
+	return fmt.Sprintf("%s%s/%s/%s", BlobPrefix, hash[0:2], hash[2:4], hash)
+}
+
+// HashFromBlobPath is the inverse of BlobPath for a BLAKE3 digest: it returns
+// the hash whose bytes live at key, and false for any key BlobPath would not
+// have produced from one. Anything else under blobs/ — a backend's temporary
+// file, a key written by hand — is not a blob, and the orphan sweep must leave
+// it alone rather than guess.
+func HashFromBlobPath(key string) (string, bool) {
+	hash := key[strings.LastIndexByte(key, '/')+1:]
+	if len(hash) != 64 || BlobPath(hash) != key {
+		return "", false
+	}
+	for _, c := range hash {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "", false
+		}
+	}
+	return hash, true
 }
 
 // StagingPrefix is the prefix the staging sweeper lists.
