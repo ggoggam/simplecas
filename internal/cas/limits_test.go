@@ -211,8 +211,8 @@ func TestQuotaRefusesNewContentBeforePromotingIt(t *testing.T) {
 	if !isKind(err, apperr.KindQuotaExceeded) {
 		t.Fatalf("err = %v, want QuotaExceeded", err)
 	}
-	if n := f.countUnder(t, "blobs/"); n != 1 {
-		t.Errorf("%d blob files, want 1: refused content must not reach blobs/", n)
+	if n := f.countUnder(t, storage.XorbPrefix); n != 1 {
+		t.Errorf("%d xorbs, want 1: refused content must not reach xorbs/", n)
 	}
 }
 

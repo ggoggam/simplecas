@@ -4,19 +4,21 @@
 //
 // The layout is identical on every backend:
 //
-//	blobs/<h[0:2]>/<h[2:4]>/<hash>  – content-addressed, immutable
-//	staging/<uuid>                  – in-flight uploads and multipart parts
+//	xorbs/<h[0:2]>/<h[2:4]>/<hash> – Xet xorbs of content-defined chunks; immutable
+//	blobs/<h[0:2]>/<h[2:4]>/<hash> – whole files stored before chunking
+//	staging/<uuid>                 – in-flight uploads and multipart parts
 //
-// Promoting a staged upload to its content-addressed home goes through
-// Bucket.Copy, which every driver implements with the backend's own copy
-// operation (S3 CopyObject, the GCS copier, Azure's copy API, a local file copy
-// for fs) — so the bytes never travel back through the server. The one limit
-// inherited from the drivers is S3's 5GiB single-copy ceiling, the same ceiling
-// the previous OpenDAL-based implementation had.
+// A commit reads the staging file back and writes its new chunks into xorbs,
+// each written in one request. Content stored before chunking was promoted
+// whole through Bucket.Copy, which every driver implements with the backend's
+// own copy operation, and still is when such a blob is revived from zero; that
+// path inherits S3's 5GiB single-copy ceiling.
 package storage
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -27,6 +29,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	s3v2 "github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 	"golang.org/x/oauth2/google"
 
 	"gocloud.dev/blob"
@@ -34,6 +37,7 @@ import (
 	"gocloud.dev/blob/fileblob"
 	"gocloud.dev/blob/gcsblob"
 	"gocloud.dev/blob/s3blob"
+	"gocloud.dev/gcerrors"
 	"gocloud.dev/gcp"
 
 	"github.com/ggoggam/simplecas/internal/config"
@@ -44,22 +48,62 @@ import (
 // directly on it.
 type Bucket struct {
 	*blob.Bucket
+	// put writes an object in one request where the driver would split it,
+	// or is nil where WriteAll already sends one.
+	put func(ctx context.Context, key string, data []byte, ifNew bool) error
+}
+
+// ErrExists is PutOnce refusing to replace an object.
+var ErrExists = errors.New("object already exists")
+
+// PutOnce writes data to key in a single request, which is what object stores
+// bill. With ifNew, an object already at key is left as it is and the write
+// fails with ErrExists.
+//
+// The S3 driver hands writes to the AWS transfer manager, which turns any
+// object of 16 MiB or more into a multipart upload: three requests (create,
+// part, complete) where one PutObject would do. PutOnce calls PutObject
+// directly instead. On the other backends a write buffered whole is already
+// one request, or a local file.
+func (b *Bucket) PutOnce(ctx context.Context, key string, data []byte, ifNew bool) error {
+	if b.put != nil {
+		return b.put(ctx, key, data, ifNew)
+	}
+	err := b.WriteAll(ctx, key, data, &blob.WriterOptions{
+		BufferSize:  len(data) + 1,
+		ContentType: "application/octet-stream",
+		IfNotExist:  ifNew,
+	})
+	if ifNew && gcerrors.Code(err) == gcerrors.FailedPrecondition {
+		return ErrExists
+	}
+	return err
 }
 
 // BlobPrefix is the prefix every content-addressed blob lives under, and what
 // the orphan sweep lists.
 const BlobPrefix = "blobs/"
 
-// BlobPath is where the bytes for a content hash live. The two levels of
+// XorbPrefix is the prefix every xorb lives under, and what the xorb orphan
+// sweep lists.
+const XorbPrefix = "xorbs/"
+
+// BlobPath is where the bytes of a whole-file blob live. The two levels of
 // two-hex-character fanout keep any single directory small on filesystem
 // backends and spread the keyspace on object stores.
-func BlobPath(hash string) string {
+func BlobPath(hash string) string { return fanOut(BlobPrefix, hash) }
+
+// XorbPath is where a xorb lives, named by its Xet hash and fanned out as
+// BlobPath is.
+func XorbPath(hash string) string { return fanOut(XorbPrefix, hash) }
+
+func fanOut(prefix, hash string) string {
 	if len(hash) < 4 {
 		// Never reachable with a blake3 digest, but a short hash must not
 		// panic its way out of a request handler.
-		return BlobPrefix + hash
+		return prefix + hash
 	}
-	return fmt.Sprintf("%s%s/%s/%s", BlobPrefix, hash[0:2], hash[2:4], hash)
+	return fmt.Sprintf("%s%s/%s/%s", prefix, hash[0:2], hash[2:4], hash)
 }
 
 // HashFromBlobPath is the inverse of BlobPath for a BLAKE3 digest: it returns
@@ -67,9 +111,14 @@ func BlobPath(hash string) string {
 // have produced from one. Anything else under blobs/ — a backend's temporary
 // file, a key written by hand — is not a blob, and the orphan sweep must leave
 // it alone rather than guess.
-func HashFromBlobPath(key string) (string, bool) {
+func HashFromBlobPath(key string) (string, bool) { return hashFromPath(key, BlobPath) }
+
+// HashFromXorbPath is HashFromBlobPath for XorbPath.
+func HashFromXorbPath(key string) (string, bool) { return hashFromPath(key, XorbPath) }
+
+func hashFromPath(key string, path func(string) string) (string, bool) {
 	hash := key[strings.LastIndexByte(key, '/')+1:]
-	if len(hash) != 64 || BlobPath(hash) != key {
+	if len(hash) != 64 || path(hash) != key {
 		return "", false
 	}
 	for _, c := range hash {
@@ -91,13 +140,14 @@ func StagingPath(id string) string { return StagingPrefix + id }
 func Open(ctx context.Context, cfg config.StorageConfig) (*Bucket, error) {
 	var (
 		bucket *blob.Bucket
+		client *s3v2.Client
 		err    error
 	)
 	switch cfg.Backend {
 	case "fs":
 		bucket, err = openFS(cfg)
 	case "s3":
-		bucket, err = openS3(ctx, cfg)
+		bucket, client, err = openS3(ctx, cfg)
 	case "gcs":
 		bucket, err = openGCS(ctx, cfg)
 	case "azblob":
@@ -112,12 +162,43 @@ func Open(ctx context.Context, cfg config.StorageConfig) (*Bucket, error) {
 
 	// For fs the root is the directory itself; everywhere else it is a key
 	// prefix. An empty or "/" root means no prefix at all.
+	prefix := ""
 	if cfg.Backend != "fs" {
-		if prefix := keyPrefix(cfg.Root); prefix != "" {
+		if prefix = keyPrefix(cfg.Root); prefix != "" {
 			bucket = blob.PrefixedBucket(bucket, prefix)
 		}
 	}
-	return &Bucket{Bucket: bucket}, nil
+	b := &Bucket{Bucket: bucket}
+	if client != nil {
+		b.put = s3Put(client, cfg.Bucket, prefix)
+	}
+	return b, nil
+}
+
+// s3Put writes an object with one PutObject. The key carries the bucket's
+// prefix, which the blob.Bucket adds to every other call.
+func s3Put(client *s3v2.Client, bucket, prefix string) func(context.Context, string, []byte, bool) error {
+	return func(ctx context.Context, key string, data []byte, ifNew bool) error {
+		in := &s3v2.PutObjectInput{
+			Bucket:        aws.String(bucket),
+			Key:           aws.String(prefix + key),
+			Body:          bytes.NewReader(data),
+			ContentLength: aws.Int64(int64(len(data))),
+			ContentType:   aws.String("application/octet-stream"),
+		}
+		if ifNew {
+			in.IfNoneMatch = aws.String("*")
+		}
+		_, err := client.PutObject(ctx, in)
+		var apiErr smithy.APIError
+		if ifNew && errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed" {
+			return ErrExists
+		}
+		if err != nil {
+			return fmt.Errorf("put %s: %w", key, err)
+		}
+		return nil
+	}
 }
 
 // gcsScope is the OAuth scope a GCS service account needs to read and write
@@ -172,7 +253,7 @@ func openFS(cfg config.StorageConfig) (*blob.Bucket, error) {
 	})
 }
 
-func openS3(ctx context.Context, cfg config.StorageConfig) (*blob.Bucket, error) {
+func openS3(ctx context.Context, cfg config.StorageConfig) (*blob.Bucket, *s3v2.Client, error) {
 	opts := []func(*awsconfig.LoadOptions) error{}
 	if cfg.Region != "" {
 		opts = append(opts, awsconfig.WithRegion(cfg.Region))
@@ -186,7 +267,7 @@ func openS3(ctx context.Context, cfg config.StorageConfig) (*blob.Bucket, error)
 	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("load aws config: %w", err)
+		return nil, nil, fmt.Errorf("load aws config: %w", err)
 	}
 	client := s3v2.NewFromConfig(awsCfg, func(o *s3v2.Options) {
 		if cfg.Endpoint != "" {
@@ -196,7 +277,8 @@ func openS3(ctx context.Context, cfg config.StorageConfig) (*blob.Bucket, error)
 			o.UsePathStyle = true
 		}
 	})
-	return s3blob.OpenBucket(ctx, client, cfg.Bucket, nil)
+	bucket, err := s3blob.OpenBucket(ctx, client, cfg.Bucket, nil)
+	return bucket, client, err
 }
 
 func openGCS(ctx context.Context, cfg config.StorageConfig) (*blob.Bucket, error) {

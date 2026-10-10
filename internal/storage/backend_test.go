@@ -2,6 +2,7 @@ package storage_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -34,6 +35,7 @@ func TestBackendContract(t *testing.T) {
 			t.Run("listing has modification times", func(t *testing.T) { testList(t, open(t)) })
 			t.Run("missing keys are NotFound", func(t *testing.T) { testNotFound(t, open(t)) })
 			t.Run("delete", func(t *testing.T) { testDelete(t, open(t)) })
+			t.Run("put once", func(t *testing.T) { testPutOnce(t, open(t)) })
 		})
 	}
 }
@@ -192,5 +194,27 @@ func list(t *testing.T, b *storage.Bucket, prefix string) []string {
 			t.Fatalf("list: %v", err)
 		}
 		keys = append(keys, obj.Key)
+	}
+}
+
+// PutOnce writes under the bucket's root like every other call, and with
+// ifNew leaves an existing object alone.
+func testPutOnce(t *testing.T, b *storage.Bucket) {
+	ctx := t.Context()
+	key := storage.XorbPath(hash)
+	if err := b.PutOnce(ctx, key, []byte("first"), true); err != nil {
+		t.Fatalf("PutOnce: %v", err)
+	}
+	if err := b.PutOnce(ctx, key, []byte("second"), true); !errors.Is(err, storage.ErrExists) {
+		t.Errorf("a second ifNew PutOnce = %v, want ErrExists", err)
+	}
+	if got, err := b.ReadAll(ctx, key); err != nil || string(got) != "first" {
+		t.Errorf("read %q, %v; want the first write kept", got, err)
+	}
+	if err := b.PutOnce(ctx, key, []byte("replaced"), false); err != nil {
+		t.Fatalf("PutOnce: %v", err)
+	}
+	if got, err := b.ReadAll(ctx, key); err != nil || string(got) != "replaced" {
+		t.Errorf("read %q, %v; want the unconditional write", got, err)
 	}
 }
