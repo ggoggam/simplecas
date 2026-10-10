@@ -13,7 +13,7 @@ import (
 	"github.com/ggoggam/simplecas/internal/cas"
 	"github.com/ggoggam/simplecas/internal/config"
 	"github.com/ggoggam/simplecas/internal/db"
-	"github.com/ggoggam/simplecas/internal/storage"
+	"github.com/ggoggam/simplecas/internal/testblob"
 	"github.com/ggoggam/simplecas/internal/testdb"
 )
 
@@ -21,7 +21,8 @@ import (
 // content must produce.
 const abcHash = "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
 
-// newGateway builds a gateway over a scratch database and a scratch fs bucket.
+// newGateway builds a gateway over a scratch database and a scratch bucket
+// (testblob).
 // Each option adjusts the configuration before the gateway is built.
 // testCredentialKey seals the team secrets every test gateway stores. It is
 // parsed when the gateway is built, so a test that later replaces cfg.Auth
@@ -39,11 +40,7 @@ func newGateway(t *testing.T, options ...func(*config.Config)) *Gateway {
 	}
 	t.Cleanup(database.Close)
 
-	bucket, err := storage.Open(ctx, config.StorageConfig{Backend: "fs", Root: t.TempDir()})
-	if err != nil {
-		t.Fatalf("open bucket: %v", err)
-	}
-	t.Cleanup(func() { _ = bucket.Close() })
+	bucket := testblob.Open(t)
 
 	cfg := config.Default()
 	cfg.Database.URL = dsn

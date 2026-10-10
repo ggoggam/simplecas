@@ -17,6 +17,7 @@ import (
 	"github.com/ggoggam/simplecas/internal/config"
 	"github.com/ggoggam/simplecas/internal/db"
 	"github.com/ggoggam/simplecas/internal/storage"
+	"github.com/ggoggam/simplecas/internal/testblob"
 	"github.com/ggoggam/simplecas/internal/testdb"
 )
 
@@ -27,8 +28,9 @@ const (
 	hashABC   = "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
 )
 
-// fixture is a Store wired to a scratch database and a scratch fs bucket, plus
-// a raw pool for the assertions that need to look behind the abstraction.
+// fixture is a Store wired to a scratch database and a scratch bucket
+// (testblob), plus a raw pool for the assertions that need to look behind the
+// abstraction.
 type fixture struct {
 	store  *Store
 	db     *db.DB
@@ -59,11 +61,7 @@ func newFixtureWithLimits(t *testing.T, gc config.GcConfig, limits config.Limits
 	}
 	t.Cleanup(pool.Close)
 
-	bucket, err := storage.Open(ctx, config.StorageConfig{Backend: "fs", Root: t.TempDir()})
-	if err != nil {
-		t.Fatalf("open bucket: %v", err)
-	}
-	t.Cleanup(func() { _ = bucket.Close() })
+	bucket := testblob.Open(t)
 
 	return &fixture{
 		store:  New(database, bucket, gc, limits, slog.New(slog.DiscardHandler)),
