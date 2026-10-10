@@ -62,8 +62,17 @@ jobs:
         with:
           commit_message: "style: auto-format via pre-commit hooks"
 
-  test:
+  tests:
     runs-on: ubuntu-latest
+
+    # Every suite runs twice: with blobs on the fs backend, and with blobs on a
+    # real S3 store (RustFS), which also serves as the reference the S3
+    # conformance suite (e2e/conformance_test.go) is checked against.
+    strategy:
+      fail-fast: false
+      matrix:
+        blobs: [fs, s3]
+    name: test (${{ matrix.blobs }} blobs)
 
     # The db/cas integration tests need a real Postgres; unit tests skip it.
     services:
@@ -93,7 +102,33 @@ jobs:
           key: go-test-${{ runner.os }}-${{ hashFiles('go.sum') }}
           restore-keys: go-test-${{ runner.os }}-
 
+      # Started by hand rather than as a service: a service container cannot
+      # be given the command RustFS needs (its data directory).
+      - name: Start RustFS
+        if: matrix.blobs == 's3'
+        run: |
+          docker run -d --name rustfs -p 9000:9000 \
+            -e RUSTFS_ACCESS_KEY=rustfsadmin -e RUSTFS_SECRET_KEY=rustfsadmin \
+            rustfs/rustfs:1.0.1 /data
+          for _ in $(seq 1 30); do
+            curl -sf http://localhost:9000/health >/dev/null && exit 0
+            sleep 1
+          done
+          docker logs rustfs
+          exit 1
+
       - name: Test
         run: go test -race -count=1 ./...
         env:
           SIMPLECAS_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/simplecas
+          # Empty on the fs leg, which leaves the tests on the fs backend.
+          SIMPLECAS_TEST_S3_URL: ${{ matrix.blobs == 's3' && 'http://rustfsadmin:rustfsadmin@localhost:9000/simplecas-test' || '' }}
+
+  # The main ruleset requires a check named "test"; this reports the matrix
+  # above as that one check.
+  test:
+    if: ${{ !cancelled() }}
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ needs.tests.result }}" = success

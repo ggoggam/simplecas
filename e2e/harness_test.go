@@ -1,4 +1,5 @@
-// Package e2e drives a fully assembled simplecas server with the real AWS CLI.
+// Package e2e drives a fully assembled simplecas server with the real AWS CLI,
+// and checks it against a reference S3 with the AWS SDK (conformance_test.go).
 //
 // The SDK interop tests in internal/s3 check the wire protocol against one
 // signing implementation. These check what users actually run: `aws s3` and
@@ -7,8 +8,9 @@
 // and frames streamed uploads as aws-chunked over TLS — none of which the SDK
 // tests choose on their own.
 //
-// The tests skip unless SIMPLECAS_TEST_DATABASE_URL is set and AWS CLI v2 is on
-// PATH (`mise run test:e2e` arranges both).
+// The tests skip unless SIMPLECAS_TEST_DATABASE_URL is set; the CLI tests also
+// need AWS CLI v2 on PATH, and the conformance reference needs
+// SIMPLECAS_TEST_S3_URL (`mise run test:s3` arranges all three).
 package e2e
 
 import (
@@ -39,7 +41,7 @@ import (
 	"github.com/ggoggam/simplecas/internal/db"
 	"github.com/ggoggam/simplecas/internal/s3"
 	"github.com/ggoggam/simplecas/internal/server"
-	"github.com/ggoggam/simplecas/internal/storage"
+	"github.com/ggoggam/simplecas/internal/testblob"
 	"github.com/ggoggam/simplecas/internal/testdb"
 	"github.com/ggoggam/simplecas/internal/ui"
 	"github.com/ggoggam/simplecas/web"
@@ -74,7 +76,7 @@ var awsCLIPath = sync.OnceValues(func() (string, error) {
 })
 
 // stack is one running server: the full router, as main.go assembles it, over
-// a scratch schema and a scratch fs blob store.
+// a scratch schema and a scratch blob store (testblob).
 type stack struct {
 	url     string
 	db      *db.DB
@@ -100,9 +102,6 @@ func withAuthDisabled() stackOption { return func(o *stackOptions) { o.authOff =
 
 func newStack(t *testing.T, options ...stackOption) *stack {
 	t.Helper()
-	if _, err := awsCLIPath(); err != nil {
-		t.Skipf("AWS CLI v2 not available: %v", err)
-	}
 	var opts stackOptions
 	for _, option := range options {
 		option(&opts)
@@ -117,11 +116,7 @@ func newStack(t *testing.T, options ...stackOption) *stack {
 	}
 	t.Cleanup(database.Close)
 
-	bucket, err := storage.Open(ctx, config.StorageConfig{Backend: "fs", Root: t.TempDir()})
-	if err != nil {
-		t.Fatalf("open bucket: %v", err)
-	}
-	t.Cleanup(func() { _ = bucket.Close() })
+	bucket := testblob.Open(t)
 
 	cfg := config.Default()
 	cfg.Database.URL = dsn
@@ -174,6 +169,9 @@ type awsCLI struct {
 
 func (s *stack) cli(t *testing.T, keyID, secret string) *awsCLI {
 	t.Helper()
+	if _, err := awsCLIPath(); err != nil {
+		t.Skipf("AWS CLI v2 not available: %v", err)
+	}
 	home := t.TempDir()
 	configFile := filepath.Join(home, "config")
 	// The classic transfer client keeps transfers deterministic: "auto" would

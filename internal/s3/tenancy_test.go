@@ -14,7 +14,7 @@ import (
 	"github.com/ggoggam/simplecas/internal/cas"
 	"github.com/ggoggam/simplecas/internal/config"
 	"github.com/ggoggam/simplecas/internal/db"
-	"github.com/ggoggam/simplecas/internal/storage"
+	"github.com/ggoggam/simplecas/internal/testblob"
 	"github.com/ggoggam/simplecas/internal/testdb"
 )
 
@@ -54,11 +54,7 @@ func newTenantFixture(t *testing.T) *tenantFixture {
 	}
 	t.Cleanup(database.Close)
 
-	bucket, err := storage.Open(ctx, config.StorageConfig{Backend: "fs", Root: t.TempDir()})
-	if err != nil {
-		t.Fatalf("open bucket: %v", err)
-	}
-	t.Cleanup(func() { _ = bucket.Close() })
+	bucket := testblob.Open(t)
 
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {

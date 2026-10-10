@@ -18,7 +18,7 @@ import (
 	"github.com/ggoggam/simplecas/internal/db"
 	"github.com/ggoggam/simplecas/internal/s3"
 	"github.com/ggoggam/simplecas/internal/server"
-	"github.com/ggoggam/simplecas/internal/storage"
+	"github.com/ggoggam/simplecas/internal/testblob"
 	"github.com/ggoggam/simplecas/internal/testdb"
 )
 
@@ -52,11 +52,7 @@ func newFixture(t *testing.T) *fixture {
 	}
 	t.Cleanup(pool.Close)
 
-	bucket, err := storage.Open(ctx, config.StorageConfig{Backend: "fs", Root: t.TempDir()})
-	if err != nil {
-		t.Fatalf("open bucket: %v", err)
-	}
-	t.Cleanup(func() { _ = bucket.Close() })
+	bucket := testblob.Open(t)
 
 	cfg := config.Default()
 	cfg.Database.URL = dsn

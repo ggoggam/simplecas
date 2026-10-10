@@ -87,6 +87,7 @@ on backend startup.
 | `mise run test`     | Unit tests (database-backed tests skip without a DB)     |
 | `mise run test:integration` | Full suite against the dev Postgres              |
 | `mise run test:e2e` | AWS CLI end-to-end suite against the dev Postgres        |
+| `mise run test:s3`  | Full suite with blobs on the dev RustFS, plus S3 conformance |
 | `mise run check`    | `lint` + `test` (`fmt`, `vet`, `lint` also defined)      |
 | `mise run web:build`| Build the PWA into `web/dist`                            |
 
@@ -748,3 +749,18 @@ buckets, `mv`, `sync`, `rm`, listings and pagination, multipart (including
 `UploadPartCopy`), signatures, team keys, and aws-chunked uploads over TLS. It
 skips unless the database variable is set and `aws` v2 is on `PATH`; mise
 installs the CLI, and `mise run test:e2e` runs just this suite.
+
+Blobs go to a temporary directory on the fs backend unless
+`SIMPLECAS_TEST_S3_URL` (`http://KEY:SECRET@host:port/bucket`) names an
+S3-compatible store; then every test stores its blobs under its own prefix of
+that bucket instead (`internal/testblob`), so the same suites cover the s3
+backend. `mise run test:s3` runs everything that way against the dev RustFS,
+and CI runs the suite once on each backend.
+
+`e2e/conformance_test.go` states S3 behaviour through the AWS SDK for Go —
+errors, ranges, listing order and pagination, awkward keys, copy, multipart,
+conditional requests, presigning — and runs each case against the store
+`SIMPLECAS_TEST_S3_URL` names as a reference, then against simplecas. A case
+simplecas is known to fail names the gap it waits on, and is reported as
+skipped until the fix lands; one that starts passing fails the suite until the
+gap is removed.
