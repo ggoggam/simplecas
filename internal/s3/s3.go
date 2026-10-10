@@ -7,10 +7,11 @@
 // complete, abort), and GetObjectTagging, which always answers an empty tag set.
 //
 // Divergence from AWS: ETags are blake3 digests of the content, not MD5.
-// Deliberately unsupported: versioning, ACLs and policies, presigned URLs,
-// virtual-host addressing, and storing tags.
+// Deliberately unsupported: versioning, ACLs and policies, POST-policy
+// uploads, virtual-host addressing, and storing tags.
 //
-// Authorization: every request is SigV4-verified, and the credential decides
+// Authorization: every request is SigV4-verified, signed in its Authorization
+// header or as a presigned URL (see sigv4.go), and the credential decides
 // what it can address. The key in simplecas.toml is a superuser that reaches
 // every namespace; a key from tenant_credentials reaches only its own tenant's
 // namespaces, with everything else reported as NoSuchBucket, and its scope may

@@ -1,7 +1,10 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -792,4 +795,41 @@ func TestChunkedUploadsOverTLS(t *testing.T) {
 		t.Errorf("file etag = %s, want %s", h.ETag, etagOf(file))
 	}
 	sameBytes(t, "file over tls", aws.download("secure", "file"), file)
+}
+
+// `aws s3 presign` hands out a URL that downloads with no credentials at all,
+// and only the object it was signed for.
+func TestPresign(t *testing.T) {
+	t.Parallel()
+	s := newStack(t)
+	admin := s.admin(t)
+	admin.run("s3", "mb", "s3://handout")
+	content := []byte("for whoever holds the link")
+	admin.run("s3", "cp", writeFile(t, t.TempDir(), "notes.txt", content), "s3://handout/notes.txt")
+
+	get := func(url string) (int, []byte) {
+		t.Helper()
+		resp, err := http.Get(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.StatusCode, body
+	}
+
+	url := strings.TrimSpace(admin.run("s3", "presign", "s3://handout/notes.txt", "--expires-in", "300"))
+	status, body := get(url)
+	if status != http.StatusOK {
+		t.Fatalf("presigned GET = %d %s", status, body)
+	}
+	sameBytes(t, "presigned download", body, content)
+
+	tampered := strings.Replace(url, "notes.txt", "other.txt", 1)
+	if status, body = get(tampered); status != http.StatusForbidden || !bytes.Contains(body, []byte("SignatureDoesNotMatch")) {
+		t.Errorf("retargeted URL = %d %s, want 403 SignatureDoesNotMatch", status, body)
+	}
 }

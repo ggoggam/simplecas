@@ -1,11 +1,18 @@
 // AWS Signature Version 4 verification.
 //
-// Header-signed requests only (`Authorization: AWS4-HMAC-SHA256 …`).
-// Presigned-URL query auth and POST-policy uploads are rejected outright
-// rather than half-supported. The signature covers x-amz-content-sha256 as
-// sent, which is only a claim about the body: the body itself is checked
-// against it while it streams into staging (see payload.go), so nothing has to
-// buffer a request body and a body swapped under valid headers is refused.
+// A request is signed in one of two places: the Authorization header
+// (`AWS4-HMAC-SHA256 …`), or the query string of a presigned URL
+// (`X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`,
+// `X-Amz-SignedHeaders`, `X-Amz-Signature`). Both are checked by the same code
+// against the same credential, so a presigned URL is exactly as capable as the
+// key that signed it, and stops working when that key expires or is deleted.
+// POST-policy uploads are not supported.
+//
+// A header signature covers x-amz-content-sha256 as sent, which is only a
+// claim about the body: the body itself is checked against it while it streams
+// into staging (see payload.go), so nothing has to buffer a request body and a
+// body swapped under valid headers is refused. A presigned URL is signed before
+// its body exists, so it covers UNSIGNED-PAYLOAD, as on S3.
 //
 // When auth.enabled is false the check is skipped entirely, which is what lets
 // `aws s3 --no-sign-request` and the bundled PWA work against a dev instance.
@@ -19,7 +26,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +44,10 @@ const amzDateFormat = "20060102T150405Z"
 // maxClockSkew is how far x-amz-date may sit from the server's clock, as on
 // AWS. Without a bound, a captured signed request verifies forever.
 const maxClockSkew = 15 * time.Minute
+
+// maxPresignExpiry is the longest X-Amz-Expires a presigned URL may carry: a
+// week, as on S3.
+const maxPresignExpiry = 7 * 24 * time.Hour
 
 // now is the clock the skew check reads; tests replace it.
 var now = time.Now
@@ -76,18 +89,136 @@ func parseAuthHeader(value string) (authHeader, bool) {
 		return authHeader{}, false
 	}
 
+	parsed, ok := parseCredential(credential)
+	if !ok {
+		return authHeader{}, false
+	}
+	parsed.signedHeaders = signedHeaders
+	parsed.signature = signature
+	return parsed, true
+}
+
+// parseCredential splits a credential, AKID/date/region/service/aws4_request,
+// into the fields of an authHeader it fills.
+func parseCredential(credential string) (authHeader, bool) {
 	scope := strings.SplitN(credential, "/", 5)
 	if len(scope) != 5 || scope[4] != "aws4_request" {
 		return authHeader{}, false
 	}
 	return authHeader{
-		accessKeyID:   scope[0],
-		dateStamp:     scope[1],
-		region:        scope[2],
-		service:       scope[3],
-		signedHeaders: signedHeaders,
-		signature:     signature,
+		accessKeyID: scope[0],
+		dateStamp:   scope[1],
+		region:      scope[2],
+		service:     scope[3],
 	}, true
+}
+
+// signedRequest is what a request's signature declares about itself, read
+// from its Authorization header or, for a presigned URL, from its query.
+type signedRequest struct {
+	authHeader
+	amzDate       string
+	hashedPayload string
+	// presigned is set when the signature came in the query. expires is
+	// then how long after amzDate it verifies; a header-signed request is
+	// held to maxClockSkew instead.
+	presigned bool
+	expires   time.Duration
+	// query is the parsed query a presigned signature covers, less
+	// X-Amz-Signature itself; nil for a header-signed request.
+	query url.Values
+}
+
+// The query parameters that carry a presigned URL's signature.
+const (
+	amzAlgorithm     = "X-Amz-Algorithm"
+	amzCredential    = "X-Amz-Credential"
+	amzDate          = "X-Amz-Date"
+	amzExpires       = "X-Amz-Expires"
+	amzSignedHeaders = "X-Amz-SignedHeaders"
+	amzSignature     = "X-Amz-Signature"
+	amzSecurityToken = "X-Amz-Security-Token"
+)
+
+// parseSignedRequest reads a request's signature from wherever it was sent.
+// Signing a request both ways is refused, as on S3, rather than picking one.
+func parseSignedRequest(r *http.Request) (signedRequest, error) {
+	header := r.Header.Get("Authorization")
+	query := r.URL.Query()
+	if !query.Has(amzAlgorithm) && !query.Has(amzCredential) && !query.Has(amzSignature) {
+		parsed, ok := parseAuthHeader(header)
+		if !ok {
+			return signedRequest{}, apperr.ErrAccessDenied
+		}
+		return signedRequest{
+			authHeader:    parsed,
+			amzDate:       r.Header.Get("x-amz-date"),
+			hashedPayload: r.Header.Get("x-amz-content-sha256"),
+		}, nil
+	}
+	if header != "" {
+		return signedRequest{}, apperr.InvalidArgument("only one auth mechanism allowed: " +
+			"send either the Authorization header or the X-Amz-Signature query parameter")
+	}
+	return parsePresignedQuery(r.URL.RawQuery)
+}
+
+// parsePresignedQuery reads the signature of a presigned URL. Each of its
+// parameters must appear exactly once: url.Values would otherwise let a second
+// copy ride along in the canonical query while the first is the one checked.
+func parsePresignedQuery(rawQuery string) (signedRequest, error) {
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return signedRequest{}, apperr.AuthorizationQueryParametersError("the query string is malformed")
+	}
+	params := make(map[string]string, 6)
+	for _, name := range []string{amzAlgorithm, amzCredential, amzDate, amzExpires, amzSignedHeaders, amzSignature} {
+		values := query[name]
+		if len(values) != 1 || values[0] == "" {
+			return signedRequest{}, apperr.AuthorizationQueryParametersError(
+				"query-string authentication version 4 requires the X-Amz-Algorithm, X-Amz-Credential, " +
+					"X-Amz-Signature, X-Amz-Date, X-Amz-SignedHeaders, and X-Amz-Expires parameters, once each")
+		}
+		params[name] = values[0]
+	}
+	if params[amzAlgorithm] != sigV4Algorithm {
+		return signedRequest{}, apperr.AuthorizationQueryParametersError("X-Amz-Algorithm only supports %q", sigV4Algorithm)
+	}
+	parsed, ok := parseCredential(params[amzCredential])
+	if !ok {
+		return signedRequest{}, apperr.AuthorizationQueryParametersError("X-Amz-Credential is malformed")
+	}
+	seconds, err := strconv.Atoi(params[amzExpires])
+	if err != nil || seconds < 1 {
+		return signedRequest{}, apperr.AuthorizationQueryParametersError("X-Amz-Expires must be a positive number of seconds")
+	}
+	// Compared in seconds, before the conversion a huge value would overflow.
+	if maxSeconds := int(maxPresignExpiry / time.Second); seconds > maxSeconds {
+		return signedRequest{}, apperr.AuthorizationQueryParametersError(
+			"X-Amz-Expires must be less than a week (in seconds) that is %d", maxSeconds)
+	}
+	// A session token would come from STS, which this server does not run:
+	// no token here was ever issued, so none can be honoured.
+	if query.Has(amzSecurityToken) {
+		return signedRequest{}, apperr.ErrAccessDenied
+	}
+	// Host must be signed, or the URL would verify against any server that
+	// holds the same key.
+	if !slices.Contains(strings.Split(params[amzSignedHeaders], ";"), "host") {
+		return signedRequest{}, apperr.AuthorizationQueryParametersError("X-Amz-SignedHeaders must include host")
+	}
+
+	parsed.signedHeaders = params[amzSignedHeaders]
+	parsed.signature = params[amzSignature]
+	query.Del(amzSignature)
+	return signedRequest{
+		authHeader:    parsed,
+		amzDate:       params[amzDate],
+		hashedPayload: unsignedPayload,
+		presigned:     true,
+		expires:       time.Duration(seconds) * time.Second,
+		query:         query,
+	}, nil
 }
 
 // uriEncode applies RFC 3986 encoding per AWS's canonical rules: unreserved
@@ -122,7 +253,11 @@ func canonicalQueryString(rawQuery string) string {
 		// verbatim simply guarantees the comparison fails.
 		return rawQuery
 	}
+	return canonicalQuery(values)
+}
 
+// canonicalQuery is canonicalQueryString over an already parsed query.
+func canonicalQuery(values url.Values) string {
 	pairs := make([]string, 0, len(values))
 	for key, vs := range values {
 		for _, v := range vs {
@@ -279,86 +414,112 @@ func (s *chunkSigner) accept(expected, got string) bool {
 }
 
 // verify checks the request signature against the configured credential.
-// It is called at the top of every S3 handler, and returns the signing context
-// a streaming-signed body's chunks are then checked against (nil when auth is
-// disabled, as there is no secret to check them with).
-//
-// x-amz-content-sha256 is required, as on S3: it is the payload hash the
-// signature covers, and without it there is nothing to hold the body to.
-// The request must be fresh: x-amz-date within maxClockSkew of the server's
-// clock, and the credential scope's date equal to it, so a captured request
-// stops verifying after the window and cannot be re-scoped to another day.
-// The scope's service must be s3. Its region is taken from the request rather
-// than pinned to the server's configured region: the signature covers whatever
-// region the client declared, a mismatch does nothing for replay, and pinning
-// it would reject clients signing for their own default region.
+// It returns the signing context a streaming-signed body's chunks are then
+// checked against (nil when auth is disabled, as there is no secret to check
+// them with). See verifySigned for what is checked.
 func verify(r *http.Request, auth config.AuthConfig) (*chunkSigner, error) {
 	if !auth.Enabled {
 		return nil, nil
 	}
-
-	value := r.Header.Get("Authorization")
-	if !strings.HasPrefix(value, sigV4Algorithm) {
-		return nil, apperr.ErrAccessDenied
-	}
-	parsed, ok := parseAuthHeader(value)
-	if !ok {
-		return nil, apperr.ErrAccessDenied
-	}
-	if !hmac.Equal([]byte(parsed.accessKeyID), []byte(auth.AccessKeyID)) {
-		return nil, apperr.ErrAccessDenied
-	}
-
-	amzDate := r.Header.Get("x-amz-date")
-	if err := checkFreshness(amzDate, parsed); err != nil {
+	req, err := parseSignedRequest(r)
+	if err != nil {
 		return nil, err
 	}
-	hashedPayload := r.Header.Get("x-amz-content-sha256")
-	if hashedPayload == "" {
+	return verifySigned(r, req, auth.AccessKeyID, auth.SecretAccessKey)
+}
+
+// verifySigned checks req, parsed from r, against one credential.
+//
+// x-amz-content-sha256 is required on a header-signed request, as on S3: it is
+// the payload hash the signature covers, and without it there is nothing to
+// hold the body to.
+// The request must be fresh: x-amz-date within maxClockSkew of the server's
+// clock (for a presigned URL, no further ahead than that and no older than its
+// X-Amz-Expires), and the credential scope's date equal to it, so a captured
+// request stops verifying after the window and cannot be re-scoped to another
+// day. The scope's service must be s3. Its region is taken from the request
+// rather than pinned to the server's configured region: the signature covers
+// whatever region the client declared, a mismatch does nothing for replay, and
+// pinning it would reject clients signing for their own default region.
+//
+// A presigned request returns no signing context: its signature was made
+// before any body existed, so there is no chunk chain to seed, and a body
+// framed as signed chunks is refused rather than decoded unchecked.
+func verifySigned(r *http.Request, req signedRequest, accessKeyID, secret string) (*chunkSigner, error) {
+	if !hmac.Equal([]byte(req.accessKeyID), []byte(accessKeyID)) {
+		return nil, apperr.ErrAccessDenied
+	}
+	if err := checkFreshness(req); err != nil {
+		return nil, err
+	}
+	if req.hashedPayload == "" {
 		return nil, apperr.InvalidRequest("missing required header for this request: x-amz-content-sha256")
 	}
+	if req.presigned {
+		switch r.Header.Get("x-amz-content-sha256") {
+		case streamingSigned, streamingSignedTrailer:
+			return nil, apperr.InvalidRequest("a presigned request cannot carry a body signed in chunks")
+		}
+	}
 
-	canonicalHeaders, ok := buildCanonicalHeaders(r, parsed.signedHeaders)
+	canonicalHeaders, ok := buildCanonicalHeaders(r, req.signedHeaders)
 	if !ok {
 		return nil, apperr.ErrSignatureDoesNotMatch
+	}
+	query := canonicalQueryString(r.URL.RawQuery)
+	if req.presigned {
+		query = canonicalQuery(req.query)
 	}
 
 	expected := computeSignature(signatureInput{
-		secret:           auth.SecretAccessKey,
+		secret:           secret,
 		method:           r.Method,
 		canonicalURI:     r.URL.EscapedPath(),
-		canonicalQuery:   canonicalQueryString(r.URL.RawQuery),
-		signedHeaders:    parsed.signedHeaders,
+		canonicalQuery:   query,
+		signedHeaders:    req.signedHeaders,
 		canonicalHeaders: canonicalHeaders,
-		hashedPayload:    hashedPayload,
-		amzDate:          amzDate,
-		dateStamp:        parsed.dateStamp,
-		region:           parsed.region,
-		service:          parsed.service,
+		hashedPayload:    req.hashedPayload,
+		amzDate:          req.amzDate,
+		dateStamp:        req.dateStamp,
+		region:           req.region,
+		service:          req.service,
 	})
 
-	if !hmac.Equal([]byte(expected), []byte(parsed.signature)) {
+	if !hmac.Equal([]byte(expected), []byte(req.signature)) {
 		return nil, apperr.ErrSignatureDoesNotMatch
 	}
+	if req.presigned {
+		return nil, nil
+	}
 	return &chunkSigner{
-		key:     signingKey(auth.SecretAccessKey, parsed.dateStamp, parsed.region, parsed.service),
-		amzDate: amzDate,
-		scope:   strings.Join([]string{parsed.dateStamp, parsed.region, parsed.service, "aws4_request"}, "/"),
+		key:     signingKey(secret, req.dateStamp, req.region, req.service),
+		amzDate: req.amzDate,
+		scope:   strings.Join([]string{req.dateStamp, req.region, req.service, "aws4_request"}, "/"),
 		prev:    expected,
 	}, nil
 }
 
-// checkFreshness validates x-amz-date against the clock and the credential
-// scope. See verify.
-func checkFreshness(amzDate string, parsed authHeader) error {
-	signedAt, err := time.Parse(amzDateFormat, amzDate)
+// checkFreshness validates the signing time against the clock and the
+// credential scope. See verifySigned.
+func checkFreshness(req signedRequest) error {
+	signedAt, err := time.Parse(amzDateFormat, req.amzDate)
 	if err != nil {
 		return apperr.ErrAccessDenied
 	}
-	if parsed.dateStamp != signedAt.Format("20060102") || parsed.service != "s3" {
+	if req.dateStamp != signedAt.Format("20060102") || req.service != "s3" {
 		return apperr.ErrAccessDenied
 	}
 	skew := now().Sub(signedAt)
+	if req.presigned {
+		// S3 answers both as AccessDenied, with these messages.
+		if skew < -maxClockSkew {
+			return apperr.Forbidden("request is not valid yet")
+		}
+		if skew > req.expires {
+			return apperr.Forbidden("request has expired")
+		}
+		return nil
+	}
 	if skew > maxClockSkew || skew < -maxClockSkew {
 		return apperr.ErrRequestTimeTooSkewed
 	}
