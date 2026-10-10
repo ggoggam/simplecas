@@ -13,6 +13,7 @@ import (
 // read to find it.
 type ETagBackfill struct {
 	Hash string
+	Size int64
 	MD5  string
 }
 
@@ -21,7 +22,7 @@ type ETagBackfill struct {
 // once the backfill is done and the set is empty.
 func (d *DB) ETagsToBackfill(ctx context.Context, limit int) ([]ETagBackfill, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT p.blob_hash, COALESCE(b.md5, '')
+		SELECT p.blob_hash, b.size, COALESCE(b.md5, '')
 		FROM (SELECT DISTINCT blob_hash FROM objects WHERE etag IS NULL LIMIT $1) p
 		JOIN blobs b ON b.hash = p.blob_hash`, limit)
 	if err != nil {

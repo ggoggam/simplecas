@@ -157,6 +157,7 @@ func TestGCSweepCollectsUnreferencedBlobs(t *testing.T) {
 	kept := hashOf("kept")
 	putObject(t, d, nsID, "gone", dropped, 10)
 	putObject(t, d, nsID, "here", kept, 10)
+	wholeFile(t, d, dropped)
 	if _, err := d.DeleteObject(ctx, nsID, "gone"); err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +230,7 @@ func TestGCSweepSkipsRelinkedBlobs(t *testing.T) {
 
 	// A re-upload of the same content claims it back before GC runs.
 	err := d.InTx(ctx, func(tx pgx.Tx) error {
-		_, _, err := ClaimBlob(ctx, tx, hash, 10, "")
+		_, err := ClaimBlob(ctx, tx, hash, 10, "")
 		return err
 	})
 	if err != nil {
@@ -257,6 +258,7 @@ func TestGCSweepKeepsTheRowWhenByteDeletionFails(t *testing.T) {
 	hash := hashOf("stuck")
 
 	putObject(t, d, nsID, "k", hash, 10)
+	wholeFile(t, d, hash)
 	if _, err := d.DeleteObject(ctx, nsID, "k"); err != nil {
 		t.Fatal(err)
 	}
@@ -334,6 +336,8 @@ func TestGCSweepIgnoresADriftedRefcount(t *testing.T) {
 	garbage := hashOf("garbage")
 	putObject(t, d, nsID, "live", drifted, 10)
 	putObject(t, d, nsID, "gone", garbage, 10)
+	wholeFile(t, d, drifted)
+	wholeFile(t, d, garbage)
 	if _, err := d.DeleteObject(ctx, nsID, "gone"); err != nil {
 		t.Fatal(err)
 	}
@@ -375,6 +379,7 @@ func TestGCSweepCarriesOnPastAFailingBlob(t *testing.T) {
 	good := []string{hashOf("good1"), hashOf("good2")}
 	for i, h := range append([]string{bad}, good...) {
 		putObject(t, d, nsID, h, h, 10)
+		wholeFile(t, d, h)
 		if _, err := d.DeleteObject(ctx, nsID, h); err != nil {
 			t.Fatal(err)
 		}
@@ -499,7 +504,7 @@ func openClaim(t *testing.T, d *DB, hash string) (end func(commit bool)) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := ClaimBlob(ctx, tx, hash, 10, ""); err != nil {
+	if _, err := ClaimBlob(ctx, tx, hash, 10, ""); err != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatal(err)
 	}
@@ -617,8 +622,8 @@ func TestReclaimOrphanBlobHoldsOffANewClaim(t *testing.T) {
 		go func() {
 			var c claim
 			c.err = d.InTx(ctx, func(tx pgx.Tx) error {
-				var err error
-				c.needsBytes, _, err = ClaimBlob(ctx, tx, hash, 10, "")
+				claim, err := ClaimBlob(ctx, tx, hash, 10, "")
+				c.needsBytes = claim.NeedsBytes()
 				return err
 			})
 			claimed <- c

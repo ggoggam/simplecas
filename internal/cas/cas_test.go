@@ -1,6 +1,7 @@
 package cas
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -8,11 +9,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/zeebo/blake3"
 	"gocloud.dev/blob"
 
 	"github.com/ggoggam/simplecas/internal/apperr"
@@ -148,6 +152,99 @@ func (f *fixture) countUnder(t *testing.T, prefix string) int {
 	return n
 }
 
+// hashOf is the BLAKE3 address of content.
+func hashOf(content string) string {
+	sum := blake3.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+// putWholeFile stores content as key the way it was stored before chunking:
+// one file under blobs/ and a blob row with no terms. It returns the hash.
+func (f *fixture) putWholeFile(t *testing.T, nsID int64, key, content string) string {
+	t.Helper()
+	ctx := t.Context()
+	hash := hashOf(content)
+	sum := md5.Sum([]byte(content))
+	if err := f.bucket.WriteAll(ctx, storage.BlobPath(hash), []byte(content), nil); err != nil {
+		t.Fatal(err)
+	}
+	_, err := f.pool.Exec(ctx, `
+		INSERT INTO blobs (hash, size, refcount, md5, chunked) VALUES ($1, $2, 1, $3, false)
+		ON CONFLICT (hash) DO UPDATE SET refcount = blobs.refcount + 1`,
+		hash, len(content), hex.EncodeToString(sum[:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.pool.Exec(ctx, `
+		INSERT INTO objects (namespace_id, key, blob_hash, etag, size, content_type)
+		VALUES ($1, $2, $3, $4, $5, 'text/plain')`,
+		nsID, key, hash, hex.EncodeToString(sum[:]), len(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hash
+}
+
+// xorbABC is the xorb "abc" is stored in: content that short is one chunk,
+// and a one-chunk xorb is named by that chunk's hash.
+var xorbABC = chunkHash([]byte("abc"))
+
+// xorbRefcount reads a xorb's reference count, or ok=false if its row is gone.
+func (f *fixture) xorbRefcount(t *testing.T, hash string) (int64, bool) {
+	t.Helper()
+	var n int64
+	err := f.pool.QueryRow(t.Context(), "SELECT refcount FROM xorbs WHERE hash = $1", hash).Scan(&n)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// xorbsOf lists the xorbs a blob's terms use.
+func (f *fixture) xorbsOf(t *testing.T, blob string) []string {
+	t.Helper()
+	rows, err := f.pool.Query(t.Context(), "SELECT DISTINCT xorb_hash FROM blob_terms WHERE blob_hash = $1 ORDER BY 1", blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hashes, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hashes
+}
+
+// blobChunks lists the chunk hashes a blob's terms hold, in order.
+func (f *fixture) blobChunks(t *testing.T, blob string) []string {
+	t.Helper()
+	rows, err := f.pool.Query(t.Context(), `
+		SELECT xc.chunk_hash FROM blob_terms t
+		JOIN xorb_chunks xc ON xc.xorb_hash = t.xorb_hash AND xc.idx >= t.chunk_start AND xc.idx < t.chunk_end
+		WHERE t.blob_hash = $1 ORDER BY t.pos, xc.idx`, blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hashes, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hashes
+}
+
+// driftedXorbs counts xorbs whose refcount disagrees with the number of blobs
+// whose terms use them. Every write path and sweep must keep this at zero.
+func (f *fixture) driftedXorbs(t *testing.T) int {
+	t.Helper()
+	var n int
+	err := f.pool.QueryRow(t.Context(), `
+		SELECT COUNT(*) FROM xorbs x
+		WHERE x.refcount <> (SELECT COUNT(DISTINCT blob_hash) FROM blob_terms bt WHERE bt.xorb_hash = x.hash)`).Scan(&n)
+	if err != nil {
+		t.Fatalf("count drifted xorbs: %v", err)
+	}
+	return n
+}
+
 func (f *fixture) stage(t *testing.T, body string) StagedBlob {
 	t.Helper()
 	staged, err := f.store.Stage(t.Context(), strings.NewReader(body))
@@ -240,13 +337,16 @@ func TestCommitPublishesAndCleansUp(t *testing.T) {
 		t.Errorf("etag = %s, want the content MD5 %s", etag, md5ABC)
 	}
 
-	// The bytes live at their content-addressed home.
-	got, err := f.bucket.ReadAll(ctx, storage.BlobPath(hashABC))
-	if err != nil {
-		t.Fatalf("read blob: %v", err)
+	// The bytes live in a xorb at its content-addressed home.
+	if got := f.xorbsOf(t, hashABC); len(got) != 1 || got[0] != xorbABC {
+		t.Errorf("xorbs = %v, want [%s]", got, xorbABC)
 	}
-	if string(got) != "abc" {
-		t.Errorf("blob content = %q", got)
+	if ok, _ := f.bucket.Exists(ctx, storage.XorbPath(xorbABC)); !ok {
+		t.Error("the xorb is not in the backend")
+	}
+	got, err := f.readRange(t, hashABC, 0, 3)
+	if err != nil || string(got) != "abc" {
+		t.Errorf("read back %q, %v; want abc", got, err)
 	}
 	// Staging is cleared on the happy path.
 	if n := f.countUnder(t, storage.StagingPrefix); n != 0 {
@@ -280,8 +380,8 @@ func TestCommitDedupStoresBytesOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if n := f.countUnder(t, "blobs/"); n != 1 {
-		t.Errorf("%d stored blobs, want exactly 1 — the duplicate must cost no bytes", n)
+	if n := f.countUnder(t, storage.XorbPrefix); n != 1 {
+		t.Errorf("%d stored xorbs, want exactly 1 — the duplicate must cost no bytes", n)
 	}
 	if n, _ := f.refcount(t, hashABC); n != 2 {
 		t.Errorf("refcount = %d, want 2", n)
@@ -293,9 +393,8 @@ func TestCommitDedupStoresBytesOnce(t *testing.T) {
 
 // Dedup is global, so skipping the write for any stored blob would make an
 // upload of content another tenant holds come back faster than one of new
-// content. The bytes are written for any content new to the namespace; only a
-// namespace's own duplicates skip it. The test removes the stored bytes behind
-// the store's back so it can see whether a commit wrote them.
+// content. The bytes are written for any content new to the namespace, as a
+// decoy deleted after the commit; only a namespace's own duplicates skip it.
 func TestCommitWritesBytesForContentNewToTheNamespace(t *testing.T) {
 	f := newFixture(t, defaultGC())
 	ctx := t.Context()
@@ -305,24 +404,49 @@ func TestCommitWritesBytesForContentNewToTheNamespace(t *testing.T) {
 	if _, err := f.store.Commit(ctx, theirs, "k", "text/plain", f.stage(t, "abc")); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.bucket.Delete(ctx, storage.BlobPath(hashABC)); err != nil {
-		t.Fatal(err)
-	}
 
 	// A duplicate inside the namespace that holds the content writes nothing.
-	if _, err := f.store.Commit(ctx, theirs, "again", "text/plain", f.stage(t, "abc")); err != nil {
+	again := f.stage(t, "abc")
+	p, err := f.store.plan(ctx, again, theirs)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if ok, _ := f.bucket.Exists(ctx, storage.BlobPath(hashABC)); ok {
-		t.Fatal("a duplicate within the namespace rewrote the bytes")
+	if p.writes() {
+		t.Error("a duplicate within the namespace plans writes")
+	}
+	if _, err := f.store.Commit(ctx, theirs, "again", "text/plain", again); err != nil {
+		t.Fatal(err)
 	}
 
 	// The same content in another namespace is written as if it were new.
-	if _, err := f.store.Commit(ctx, mine, "k", "text/plain", f.stage(t, "abc")); err != nil {
+	staged := f.stage(t, "abc")
+	p, err = f.store.plan(ctx, staged, mine)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := f.bucket.ReadAll(ctx, storage.BlobPath(hashABC)); err != nil || string(got) != "abc" {
-		t.Errorf("blob = %q, %v; want the bytes written by the first upload into the namespace", got, err)
+	if len(p.xorbs) != 0 || len(p.decoys) != 1 || len(p.decoys[0]) != len(staged.Chunks) {
+		t.Fatalf("plan = %d new xorbs and decoys %v, want every chunk written as a decoy", len(p.xorbs), p.decoys)
+	}
+	w, err := f.store.carryOut(ctx, staged, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(w.decoys) != 1 {
+		t.Fatalf("wrote %d decoys, want 1", len(w.decoys))
+	}
+	if attrs, err := f.bucket.Attributes(ctx, w.decoys[0]); err != nil || attrs.Size < 3 {
+		t.Errorf("decoy = %+v, %v; want the content's bytes written", attrs, err)
+	}
+	f.store.discardDecoys(ctx, w.decoys)
+
+	if _, err := f.store.Commit(ctx, mine, "k", "text/plain", staged); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.countUnder(t, storage.StagingPrefix); n != 0 {
+		t.Errorf("%d staging files remain, want the decoy gone with the rest", n)
+	}
+	if n := f.countUnder(t, storage.XorbPrefix); n != 1 {
+		t.Errorf("%d xorbs, want 1 — still one shared copy", n)
 	}
 	if n, _ := f.refcount(t, hashABC); n != 3 {
 		t.Errorf("refcount = %d, want 3 — still one shared blob", n)
@@ -349,23 +473,22 @@ func TestCommitOverwriteReleasesTheOldBlob(t *testing.T) {
 	}
 	// The old bytes stay until GC's grace period expires, so a re-upload or a
 	// dedup link can still reuse them.
-	if ok, _ := f.bucket.Exists(ctx, storage.BlobPath(hashABC)); !ok {
+	if ok, _ := f.bucket.Exists(ctx, storage.XorbPath(xorbABC)); !ok {
 		t.Error("the superseded blob's bytes should survive until GC collects them")
 	}
 }
 
-// GC deletes a blob's bytes before its transaction commits the row's removal,
-// so a crash or failed commit in between leaves a zero-ref row with no bytes.
-// The next upload of that content revives the row, and must put the bytes back
-// rather than trust that a row means they are there.
+// GC deletes a whole-file blob's bytes before its transaction commits the
+// row's removal, so a crash or failed commit in between leaves a zero-ref row
+// with no bytes. The next upload of that content revives the row, and must put
+// the bytes back rather than trust that a row means they are there. (Chunked
+// blobs have no such window: their sweep deletes no bytes.)
 func TestCommitRestoresBytesAfterAnInterruptedSweep(t *testing.T) {
 	f := newFixture(t, collectNow())
 	ctx := t.Context()
 	nsID := f.namespace(t, "ns", nil)
 
-	if _, err := f.store.Commit(ctx, nsID, "k", "text/plain", f.stage(t, "abc")); err != nil {
-		t.Fatal(err)
-	}
+	f.putWholeFile(t, nsID, "k", "abc")
 	if _, err := f.db.DeleteObject(ctx, nsID, "k"); err != nil {
 		t.Fatal(err)
 	}
@@ -467,6 +590,7 @@ func TestCommitConcurrentPutsToANewKeyReleaseTheLosers(t *testing.T) {
 
 	// Every loser is now unreferenced and collectable; only the winners stay.
 	f.store.sweepBlobs(ctx)
+	f.store.sweepXorbs(ctx)
 
 	var rows int
 	if err := f.pool.QueryRow(ctx, "SELECT COUNT(*) FROM blobs").Scan(&rows); err != nil {
@@ -475,17 +599,20 @@ func TestCommitConcurrentPutsToANewKeyReleaseTheLosers(t *testing.T) {
 	if rows != rounds {
 		t.Errorf("%d blob rows after GC, want %d — one winner per key", rows, rounds)
 	}
-	if n := f.countUnder(t, "blobs/"); n != rounds {
-		t.Errorf("%d stored blobs after GC, want %d", n, rounds)
+	if n := f.countUnder(t, storage.XorbPrefix); n != rounds {
+		t.Errorf("%d stored xorbs after GC, want %d", n, rounds)
 	}
 	for round := range rounds {
 		obj, err := f.db.GetObject(ctx, nsID, fmt.Sprintf("contended-%d", round))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := f.bucket.ReadAll(ctx, storage.BlobPath(obj.BlobHash)); err != nil {
+		if _, err := f.readRange(t, obj.BlobHash, 0, obj.Size); err != nil {
 			t.Errorf("round %d: the winning object lost its bytes: %v", round, err)
 		}
+	}
+	if n := f.driftedXorbs(t); n != 0 {
+		t.Errorf("%d xorbs have a refcount that disagrees with their terms", n)
 	}
 }
 
@@ -514,8 +641,8 @@ func TestCopyObjectMovesNoBytes(t *testing.T) {
 	if etag != md5ABC {
 		t.Errorf("etag = %s, want %s", etag, md5ABC)
 	}
-	if n := f.countUnder(t, "blobs/"); n != 1 {
-		t.Errorf("%d stored blobs, want 1 — a copy must not duplicate bytes", n)
+	if n := f.countUnder(t, storage.XorbPrefix); n != 1 {
+		t.Errorf("%d stored xorbs, want 1 — a copy must not duplicate bytes", n)
 	}
 	if n, _ := f.refcount(t, hashABC); n != 2 {
 		t.Errorf("refcount = %d, want 2", n)
@@ -582,8 +709,8 @@ func TestLinkBlob(t *testing.T) {
 	if size != 3 {
 		t.Errorf("size = %d, want the stored 3", size)
 	}
-	if n := f.countUnder(t, "blobs/"); n != 1 {
-		t.Errorf("%d stored blobs, want 1", n)
+	if n := f.countUnder(t, storage.XorbPrefix); n != 1 {
+		t.Errorf("%d stored xorbs, want 1", n)
 	}
 	if n, _ := f.refcount(t, hashABC); n != 2 {
 		t.Errorf("refcount = %d, want 2", n)
@@ -674,7 +801,7 @@ func TestCompleteMultipartConcatenatesInOrder(t *testing.T) {
 		t.Errorf("etag = %s, want %s", etag, want)
 	}
 
-	got, err := f.bucket.ReadAll(ctx, storage.BlobPath(hashABC))
+	got, err := f.readRange(t, hashABC, 0, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -732,10 +859,232 @@ func TestMultipartDedupsAgainstWholeFileUpload(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if n := f.countUnder(t, "blobs/"); n != 1 {
-		t.Errorf("%d stored blobs, want 1", n)
+	if n := f.countUnder(t, storage.XorbPrefix); n != 1 {
+		t.Errorf("%d stored xorbs, want 1", n)
 	}
 	if n, _ := f.refcount(t, hashABC); n != 2 {
 		t.Errorf("refcount = %d, want 2", n)
+	}
+}
+
+// The assembled object is chunked as one stream, so where the client split
+// its parts moves no boundary: it dedups chunk for chunk against a single
+// upload of the same bytes.
+func TestCompleteMultipartChunksTheWholeObject(t *testing.T) {
+	f := newFixture(t, defaultGC())
+	ctx := t.Context()
+	nsID := f.namespace(t, "ns", nil)
+
+	data := pseudoRandom("multipart chunks", 3<<20)
+	uploadID, err := f.db.CreateMultipart(ctx, nsID, "k", "application/octet-stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upload, err := f.db.GetMultipart(ctx, nsID, "k", uploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parts []db.PartMeta
+	for i, cut := range [][2]int{{0, 1_000_003}, {1_000_003, 2_500_000}, {2_500_000, len(data)}} {
+		staged, err := f.store.PutPart(ctx, upload, int32(i+1), bytes.NewReader(data[cut[0]:cut[1]]), -1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(staged.Chunks) != 0 {
+			t.Errorf("part %d was chunked on its own", i+1)
+		}
+		if _, err := f.db.PutPart(ctx, uploadID, int32(i+1), staged.StagingKey, staged.Size, staged.ETag, 0); err != nil {
+			t.Fatal(err)
+		}
+		parts = append(parts, db.PartMeta{PartNumber: int32(i + 1), StagingKey: staged.StagingKey, Size: staged.Size, ETag: staged.ETag})
+	}
+	if _, err := f.store.CompleteMultipart(ctx, upload, parts); err != nil {
+		t.Fatal(err)
+	}
+
+	obj, err := f.db.GetObject(ctx, nsID, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want []string
+	for _, c := range chunkAll(data, len(data)) {
+		want = append(want, c.Hash)
+	}
+	if got := f.blobChunks(t, obj.BlobHash); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("the assembled object holds %d chunks, want the %d a single upload cuts, in order", len(got), len(want))
+	}
+	got, err := f.readRange(t, obj.BlobHash, 0, obj.Size)
+	if err != nil || !bytes.Equal(got, data) {
+		t.Errorf("read back %d bytes, %v; want the %d uploaded", len(got), err, len(data))
+	}
+}
+
+// Objects that share most of their bytes share most of their storage: an
+// edit stores only the chunks around it, and the new version's terms reuse
+// the old version's xorb for the rest.
+func TestCommitSharesChunksBetweenSimilarObjects(t *testing.T) {
+	f := newFixture(t, defaultGC())
+	ctx := t.Context()
+	nsID := f.namespace(t, "ns", nil)
+
+	data := pseudoRandom("similar", 4<<20)
+	edited := bytes.Clone(data)
+	copy(edited[2<<20:], "an edit in the middle")
+
+	first, err := f.store.Stage(ctx, bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.Commit(ctx, nsID, "v1", "application/octet-stream", first); err != nil {
+		t.Fatal(err)
+	}
+	second, err := f.store.Stage(ctx, bytes.NewReader(edited))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := f.store.plan(ctx, second, nsID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.decoys) != 0 {
+		t.Error("runs the namespace already holds should not be written again")
+	}
+	if len(p.xorbs) != 1 || len(p.xorbs[0].chunks) > 3 {
+		t.Errorf("planned %d new xorbs (%v), want one holding the few edited chunks", len(p.xorbs), p.xorbs)
+	}
+	if _, err := f.store.Commit(ctx, nsID, "v2", "application/octet-stream", second); err != nil {
+		t.Fatal(err)
+	}
+
+	v1 := f.xorbsOf(t, first.Hash)
+	v2 := f.xorbsOf(t, second.Hash)
+	if len(v1) != 1 || len(v2) != 2 || !slices.Contains(v2, v1[0]) {
+		t.Errorf("v1 uses %v and v2 %v, want v2 to reuse v1's xorb and add one", v1, v2)
+	}
+	if n, _ := f.xorbRefcount(t, v1[0]); n != 2 {
+		t.Errorf("v1's xorb refcount = %d, want 2: both versions use it", n)
+	}
+	if n := f.driftedXorbs(t); n != 0 {
+		t.Errorf("%d xorbs have a refcount that disagrees with their terms", n)
+	}
+	for key, want := range map[string][]byte{"v1": data, "v2": edited} {
+		obj, err := f.db.GetObject(ctx, nsID, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := f.readRange(t, obj.BlobHash, 0, obj.Size); err != nil || !bytes.Equal(got, want) {
+			t.Errorf("%s read back wrong: %v", key, err)
+		}
+	}
+}
+
+// A run of chunks only another namespace holds is reused, so it is stored
+// once, but written all the same as a decoy; and a run too short to be worth
+// a term is stored again rather than scattering the blob.
+func TestPlanDecoysRunsOnlyOthersHoldAndSkipsShortRuns(t *testing.T) {
+	f := newFixture(t, defaultGC())
+	ctx := t.Context()
+	mine := f.namespace(t, "mine", nil)
+	theirs := f.namespace(t, "theirs", nil)
+
+	data := pseudoRandom("theirs", 4<<20)
+	if _, err := f.store.Commit(ctx, theirs, "k", "application/octet-stream", mustStage(t, f, data)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Most of their file, with an edit in the middle.
+	edited := bytes.Clone(data)
+	copy(edited[2<<20:], "an edit in the middle")
+	staged := mustStage(t, f, edited)
+	p, err := f.store.plan(ctx, staged, mine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoyed, fresh int
+	for _, d := range p.decoys {
+		decoyed += len(d)
+	}
+	for _, x := range p.xorbs {
+		fresh += len(x.chunks)
+	}
+	if fresh > 3 || decoyed+fresh != len(staged.Chunks) {
+		t.Errorf("%d chunks new and %d decoys of %d, want all but the edited ones reused and written as decoys",
+			fresh, decoyed, len(staged.Chunks))
+	}
+
+	// Only a few chunks of theirs, fewer than a run.
+	short := bytes.Clone(edited[:4*minChunk])
+	short = append(short, pseudoRandom("mine", 1<<20)...)
+	staged = mustStage(t, f, short)
+	p, err = f.store.plan(ctx, staged, mine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.decoys) != 0 {
+		t.Errorf("a run shorter than %d chunks was reused", minDedupRun)
+	}
+	if _, err := f.store.Commit(ctx, mine, "short", "application/octet-stream", staged); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.readRange(t, staged.Hash, 0, staged.Size); err != nil || !bytes.Equal(got, short) {
+		t.Errorf("read back wrong: %v", err)
+	}
+}
+
+func mustStage(t *testing.T, f *fixture, data []byte) StagedBlob {
+	t.Helper()
+	staged, err := f.store.Stage(t.Context(), bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return staged
+}
+
+// Bytes at a xorb's address with no row are what a failed commit leaves, and
+// may be serialized differently from this commit's. The commit replaces them
+// rather than trusting its own offsets into them.
+func TestCommitReplacesAnOrphanedXorb(t *testing.T) {
+	f := newFixture(t, defaultGC())
+	ctx := t.Context()
+	nsID := f.namespace(t, "ns", nil)
+
+	if err := f.bucket.WriteAll(ctx, storage.XorbPath(xorbABC), []byte("not this commit's xorb"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.Commit(ctx, nsID, "k", "text/plain", f.stage(t, "abc")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.readRange(t, hashABC, 0, 3); err != nil || string(got) != "abc" {
+		t.Errorf("read %q, %v; want abc", got, err)
+	}
+}
+
+// Content stored before chunking keeps working: it copies, dedups and is
+// read as the one file it is.
+func TestWholeFileBlobsStillCopyAndDedup(t *testing.T) {
+	f := newFixture(t, defaultGC())
+	ctx := t.Context()
+	nsID := f.namespace(t, "ns", nil)
+
+	f.putWholeFile(t, nsID, "old", "abc")
+	src, err := f.db.GetObject(ctx, nsID, "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.CopyObject(ctx, src, nsID, "copy"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.Commit(ctx, nsID, "again", "text/plain", f.stage(t, "abc")); err != nil {
+		t.Fatal(err)
+	}
+
+	if n, _ := f.refcount(t, hashABC); n != 3 {
+		t.Errorf("refcount = %d, want 3 on the one whole-file blob", n)
+	}
+	if n := f.countUnder(t, storage.XorbPrefix); n != 0 {
+		t.Errorf("%d xorbs stored, want none: the content is already stored whole", n)
+	}
+	if got, err := f.readRange(t, hashABC, 0, 3); err != nil || string(got) != "abc" {
+		t.Errorf("read %q, %v; want abc", got, err)
 	}
 }

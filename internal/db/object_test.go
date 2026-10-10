@@ -35,8 +35,8 @@ func TestClaimBlobRefcounting(t *testing.T) {
 
 	var isNew bool
 	err := d.InTx(ctx, func(tx pgx.Tx) error {
-		var err error
-		isNew, _, err = ClaimBlob(ctx, tx, hash, 42, "")
+		claim, err := ClaimBlob(ctx, tx, hash, 42, "")
+		isNew = claim.Fresh
 		return err
 	})
 	if err != nil {
@@ -51,8 +51,8 @@ func TestClaimBlobRefcounting(t *testing.T) {
 
 	// A second claim is an update, not an insert.
 	err = d.InTx(ctx, func(tx pgx.Tx) error {
-		var err error
-		isNew, _, err = ClaimBlob(ctx, tx, hash, 42, "")
+		claim, err := ClaimBlob(ctx, tx, hash, 42, "")
+		isNew = claim.NeedsBytes()
 		return err
 	})
 	if err != nil {
@@ -66,34 +66,52 @@ func TestClaimBlobRefcounting(t *testing.T) {
 	}
 }
 
-// A row revived from refcount 0 may be one whose bytes GC deleted before
-// failing to commit the row's removal, so the claim has to ask for the bytes
-// again rather than trust them.
-func TestClaimBlobRevivalNeedsBytes(t *testing.T) {
+// A whole-file blob revived from refcount 0 may be one whose bytes GC deleted
+// before failing to commit the row's removal, so the claim has to ask for the
+// bytes again rather than trust them. A chunked blob's manifest outlives its
+// references and keeps its chunks, so its revival needs nothing.
+func TestClaimBlobRevivalNeedsBytesOnlyForWholeFiles(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
 	nsID := mustNamespace(t, d, "ns", nil)
-	hash := hashOf("revived")
 
-	putObject(t, d, nsID, "k", hash, 10)
-	if _, err := d.DeleteObject(ctx, nsID, "k"); err != nil {
-		t.Fatal(err)
-	}
+	for _, tc := range []struct {
+		name      string
+		wholeFile bool
+		want      bool
+	}{
+		{"whole file", true, true},
+		{"chunked", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hash := hashOf("revived " + tc.name)
+			putObject(t, d, nsID, tc.name, hash, 10)
+			if tc.wholeFile {
+				wholeFile(t, d, hash)
+			}
+			if _, err := d.DeleteObject(ctx, nsID, tc.name); err != nil {
+				t.Fatal(err)
+			}
 
-	var needsBytes bool
-	err := d.InTx(ctx, func(tx pgx.Tx) error {
-		var err error
-		needsBytes, _, err = ClaimBlob(ctx, tx, hash, 10, "")
-		return err
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !needsBytes {
-		t.Error("reviving a zero-ref blob must ask for its bytes to be rewritten")
-	}
-	if n, _ := refcount(t, d, hash); n != 1 {
-		t.Errorf("refcount = %d, want 1", n)
+			var claim BlobClaim
+			err := d.InTx(ctx, func(tx pgx.Tx) error {
+				var err error
+				claim, err = ClaimBlob(ctx, tx, hash, 10, "")
+				return err
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !claim.Revived || claim.Fresh {
+				t.Errorf("claim = %+v, want a revival", claim)
+			}
+			if got := claim.NeedsBytes(); got != tc.want {
+				t.Errorf("NeedsBytes() = %v, want %v", got, tc.want)
+			}
+			if n, _ := refcount(t, d, hash); n != 1 {
+				t.Errorf("refcount = %d, want 1", n)
+			}
+		})
 	}
 }
 
@@ -105,7 +123,7 @@ func TestReleaseBlobFloorsAtZero(t *testing.T) {
 	hash := hashOf("floor")
 
 	err := d.InTx(ctx, func(tx pgx.Tx) error {
-		if _, _, err := ClaimBlob(ctx, tx, hash, 1, ""); err != nil {
+		if _, err := ClaimBlob(ctx, tx, hash, 1, ""); err != nil {
 			return err
 		}
 		for range 3 {
@@ -145,7 +163,7 @@ func TestClaimExistingBlob(t *testing.T) {
 
 	// Present blob: returns the authoritative stored size, not a caller's claim.
 	err = d.InTx(ctx, func(tx pgx.Tx) error {
-		_, _, err := ClaimBlob(ctx, tx, hash, 4096, "")
+		_, err := ClaimBlob(ctx, tx, hash, 4096, "")
 		return err
 	})
 	if err != nil {

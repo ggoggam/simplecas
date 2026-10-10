@@ -21,38 +21,84 @@ import (
 // concurrent sweep — see GCSweep.
 // ---------------------------------------------------------------------------
 
-// ClaimBlob takes a reference to hash inside tx, creating the blob row if it is
-// new. It reports needsBytes when no live reference vouches for the bytes, in
-// which case the caller must (re)write them before committing — so a committed
+// BlobClaim is what a claim on a blob row found.
+type BlobClaim struct {
+	// Fresh means the claim created the row: it has no terms yet, and the
+	// caller attaches them (AttachTerms), with the xorbs they use already
+	// written, before committing.
+	Fresh bool
+	// Revived means the row existed at refcount 0, held by nothing and
+	// waiting for GC.
+	Revived bool
+	// Chunked means the blob's bytes are the xorb chunks its terms list;
+	// otherwise they are one file under blobs/, stored before chunking.
+	Chunked bool
+	// MD5 is the content's recorded hex MD5, or "" for a blob stored before
+	// MD5s were recorded that the backfill has not reached.
+	MD5 string
+}
+
+// NeedsBytes reports whether the claim leaves the blob without bytes it can
+// vouch for, so the caller must write them before committing — a committed
 // reference always has bytes behind it.
 //
-// md5 is the content's hex MD5 when the caller measured it, or "" when it did
-// not (a copy reads no bytes). It is recorded on a row that has none yet, and
-// the row's MD5 comes back as storedMD5, or "" for a blob stored before MD5s
-// were recorded that the backfill has not reached.
-//
-// needsBytes covers two cases. A fresh row obviously has no bytes yet. A row
-// revived from refcount 0 may not either: GCSweep deletes the bytes before its
-// transaction commits, so a crash or failed commit in that window leaves a
-// zero-ref row whose bytes are already gone. The claim cannot tell that row
-// apart from one still awaiting collection, so it treats both as missing. The
-// re-copy is idempotent — the content is addressed by its hash — and only costs
-// anything on the rare revival of a blob GC was about to collect.
+// A fresh row obviously has none yet. A chunked blob revived from zero does:
+// its terms live as long as its row and keep its xorbs referenced, so
+// GC cannot have taken them. A whole-file blob revived from zero may not:
+// GCSweep deletes its bytes before its transaction commits, so a crash or
+// failed commit in that window leaves a zero-ref row whose bytes are already
+// gone. The claim cannot tell that row apart from one still awaiting
+// collection, so it treats both as missing. The rewrite is idempotent — the
+// content is addressed by its hash — and only costs anything on the rare
+// revival of a blob GC was about to collect.
+func (c BlobClaim) NeedsBytes() bool {
+	return c.Fresh || (c.Revived && !c.Chunked)
+}
+
+// ClaimBlob takes a reference to hash inside tx, creating the blob row if it is
+// new; a new row is chunked. md5 is the content's hex MD5, recorded on a row
+// that has none yet.
 //
 // The ON CONFLICT row lock serialises against GC's SELECT ... FOR UPDATE, so a
-// blob being swept cannot be re-referenced underneath the sweep. After the
-// increment, a refcount of 1 means nothing else held a reference before.
-func ClaimBlob(ctx context.Context, tx pgx.Tx, hash string, size int64, md5 string) (needsBytes bool, storedMD5 string, err error) {
-	err = tx.QueryRow(ctx, `
-		INSERT INTO blobs (hash, size, refcount, md5) VALUES ($1, $2, 1, NULLIF($3, ''))
+// blob being swept cannot be re-referenced underneath the sweep. xmax is 0
+// only on a row this statement inserted, and after the increment a refcount of
+// 1 on an existing row means nothing held a reference before.
+func ClaimBlob(ctx context.Context, tx pgx.Tx, hash string, size int64, md5 string) (BlobClaim, error) {
+	var (
+		c        BlobClaim
+		refcount int64
+	)
+	err := tx.QueryRow(ctx, `
+		INSERT INTO blobs (hash, size, refcount, md5, chunked) VALUES ($1, $2, 1, NULLIF($3, ''), true)
 		ON CONFLICT (hash) DO UPDATE
 		    SET refcount = blobs.refcount + 1, updated_at = now(),
 		        md5 = COALESCE(blobs.md5, EXCLUDED.md5)
-		RETURNING refcount = 1, COALESCE(md5, '')`, hash, size, md5).Scan(&needsBytes, &storedMD5)
+		RETURNING xmax = 0, refcount, chunked, COALESCE(md5, '')`, hash, size, md5).
+		Scan(&c.Fresh, &refcount, &c.Chunked, &c.MD5)
 	if err != nil {
-		return false, "", apperr.Internal(err)
+		return BlobClaim{}, apperr.Internal(err)
 	}
-	return needsBytes, storedMD5, nil
+	c.Revived = !c.Fresh && refcount == 1
+	return c, nil
+}
+
+// ClaimStoredBlob takes a reference to hash only if its row exists, live or
+// waiting for GC; ok is false when it does not. A copy uses it: it has no
+// bytes of its own to create a blob from.
+func ClaimStoredBlob(ctx context.Context, tx pgx.Tx, hash string) (c BlobClaim, ok bool, err error) {
+	var refcount int64
+	err = tx.QueryRow(ctx, `
+		UPDATE blobs SET refcount = refcount + 1, updated_at = now()
+		WHERE hash = $1 RETURNING refcount, chunked, COALESCE(md5, '')`, hash).
+		Scan(&refcount, &c.Chunked, &c.MD5)
+	if notFound(err) {
+		return BlobClaim{}, false, nil
+	}
+	if err != nil {
+		return BlobClaim{}, false, apperr.Internal(err)
+	}
+	c.Revived = refcount == 1
+	return c, true, nil
 }
 
 // ClaimExistingBlob takes a reference to hash only if the blob is live — some

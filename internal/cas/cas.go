@@ -4,25 +4,34 @@
 // The upload protocol is written to be safe with N stateless servers and a
 // concurrent garbage collector:
 //
-//  1. Stream the body to staging/<uuid> while feeding a blake3 hasher. The S3
-//     gateway's body reader checks the client's own digests (payload hash,
-//     Content-MD5, checksums) in the same pass and fails the read at the end
-//     of a body that does not match them, which discards the staging file.
-//  2. In one Postgres transaction, claim a blob reference (which row-locks the
-//     blob: refcount++ or insert at 1). If no other reference existed — a new
-//     row, or one revived from refcount 0 — copy staging into blobs/… *before*
-//     the commit, so a committed reference always has bytes behind it. The
-//     copy also runs when the content is new to the namespace, even if the
-//     blob is stored for someone else: see commit.
-//  3. Point the object row at the blob, releasing any blob it overwrote, and commit.
+//  1. Stream the body to staging/<uuid> while feeding a blake3 hasher and the
+//     chunker, which cuts the content into chunks as the Xet protocol does
+//     (see chunker.go) and hashes each one. The S3 gateway's body reader
+//     checks the client's own digests (payload hash, Content-MD5, checksums)
+//     in the same pass and fails the read at the end of a body that does not
+//     match them, which discards the staging file.
+//  2. Plan the write as a Xet client would (see plan.go): reuse runs of
+//     chunks stored xorbs already hold, and pack the rest into new xorbs.
+//     Write the new xorbs from staging, each in one request, *before* the
+//     transaction, so no row lock is held while bytes move.
+//  3. In one Postgres transaction, claim a blob reference (which row-locks the
+//     blob: refcount++ or insert at 1). A new blob row gets its terms, which
+//     claim each xorb they use and check, under its row lock, that a xorb GC
+//     might have taken is still there; a committed reference always has
+//     bytes behind it. Point the object row at the blob, releasing any blob
+//     it overwrote, and commit.
 //  4. Delete the staging file. Best-effort — stale staging is swept later.
 //
-// Dedup is global: one copy of the bytes serves every tenant that stores
-// them. A dedup hit within a namespace costs one staging write plus one
-// delete; a hit on content only another namespace holds costs as much as a new
-// blob, so upload timing says nothing about other tenants' content. Simple
-// beats clever here: hashing before writing would need either full buffering
-// or a second client round trip.
+// Dedup is global, and works on two levels: identical content is one blob,
+// and blobs that share runs of chunks share the xorbs that hold them. A dedup
+// hit within a namespace costs one staging write plus one delete; a hit on
+// content only another namespace holds costs as much as a new blob, so upload
+// timing says nothing about other tenants' content. Simple beats clever here:
+// hashing before writing would need either full buffering or a second client
+// round trip.
+//
+// Content stored before chunking is one file under blobs/, and stays that
+// way: it is read, copied and collected as before.
 //
 // Clients see MD5 ETags, as S3 serves them, never the BLAKE3 digest: that
 // digest is the dedup key for every tenant's copy of some content.
@@ -79,6 +88,9 @@ type StagedBlob struct {
 	// MD5, or for an assembled multipart upload the MD5 of its parts' MD5s
 	// followed by "-" and the part count, as S3 computes it.
 	ETag string
+	// Chunks is the content cut into chunks, in order. A multipart part,
+	// which is chunked only as part of the assembled object, has none.
+	Chunks []db.ChunkRef
 }
 
 // taggedReader remembers whether a failure came from the source, so a client
@@ -133,7 +145,7 @@ func (s *Store) PutPart(ctx context.Context, upload db.MultipartUpload, partNumb
 			return StagedBlob{}, err
 		}
 	}
-	staged, err := s.stage(ctx, body, s.limits.MaxPartBytes, "part")
+	staged, err := s.stage(ctx, body, s.limits.MaxPartBytes, "part", false)
 	if err != nil {
 		return StagedBlob{}, err
 	}
@@ -167,14 +179,15 @@ func (s *Store) checkQuota(ctx context.Context, c db.QuotaCheck) error {
 	})
 }
 
-// Stage streams r into a fresh staging file, hashing as it goes. The staging
-// file is removed if anything fails, so a failed upload leaves nothing behind.
-// A body longer than the object size limit fails with EntityTooLarge.
+// Stage streams r into a fresh staging file, hashing and chunking it as it
+// goes. The staging file is removed if anything fails, so a failed upload
+// leaves nothing behind. A body longer than the object size limit fails with
+// EntityTooLarge.
 func (s *Store) Stage(ctx context.Context, r io.Reader) (StagedBlob, error) {
-	return s.stage(ctx, r, s.limits.MaxObjectBytes, "object")
+	return s.stage(ctx, r, s.limits.MaxObjectBytes, "object", true)
 }
 
-func (s *Store) stage(ctx context.Context, r io.Reader, limit int64, what string) (StagedBlob, error) {
+func (s *Store) stage(ctx context.Context, r io.Reader, limit int64, what string, chunk bool) (StagedBlob, error) {
 	key := storage.StagingPath(uuid.NewString())
 
 	w, err := s.blob.NewWriter(ctx, key, nil)
@@ -186,7 +199,13 @@ func (s *Store) stage(ctx context.Context, r io.Reader, limit int64, what string
 	// stops the copy there rather than staging the rest.
 	src := &taggedReader{r: io.LimitReader(r, limit+1)}
 	hasher, md5er := blake3.New(), md5.New()
-	size, copyErr := io.Copy(io.MultiWriter(w, hasher, md5er), src)
+	sinks := []io.Writer{w, hasher, md5er}
+	var chunks *chunker
+	if chunk {
+		chunks = newChunker()
+		sinks = append(sinks, chunks)
+	}
+	size, copyErr := io.Copy(io.MultiWriter(sinks...), src)
 
 	// Close finalises the write (and, on object stores, completes the upload),
 	// so its error matters as much as the copy's.
@@ -218,13 +237,17 @@ func (s *Store) stage(ctx context.Context, r io.Reader, limit int64, what string
 	}
 
 	sum := hexSum(md5er)
-	return StagedBlob{
+	staged := StagedBlob{
 		StagingKey: key,
 		Hash:       hex.EncodeToString(hasher.Sum(nil)),
 		Size:       size,
 		MD5:        sum,
 		ETag:       sum,
-	}, nil
+	}
+	if chunks != nil {
+		staged.Chunks = chunks.finish()
+	}
+	return staged, nil
 }
 
 // hexSum is h's digest in hex.
@@ -238,62 +261,109 @@ func (s *Store) Commit(ctx context.Context, namespaceID int64, key, contentType 
 // commit is Commit, with the parts of a multipart upload being completed left
 // out of the quota check: they are dropped once the object is committed.
 //
-// The quota is checked twice. The first check, before the claim, refuses an
-// upload that is plainly over quota before its bytes are promoted; a refusal
-// after the copy would roll back the blob row and strand the bytes with no row
-// for GC to find. The second, after the object row is written, is the
-// authoritative one under the team lock, and only loses bytes that way when
-// two writers race past the first check together.
+// The quota is checked twice. The first check, before anything is written,
+// refuses an upload that is plainly over quota; a refusal after the write
+// would roll back the rows and strand the bytes until the orphan sweep finds
+// them. The second, after the object row is written, is the authoritative
+// one under the team lock, and only loses bytes that way when two writers
+// race past the first check together.
 //
-// The bytes are written whenever the namespace holds no other reference to the
-// blob, not only when the blob is new. Dedup is global, so skipping the write
-// for any stored blob would make an upload of content another tenant holds
+// The bytes are written whenever the namespace holds no other reference to
+// them, not only when they are new. Dedup is global, so skipping the write
+// for anything stored would make an upload of content another tenant holds
 // measurably faster than one of new content, and that difference would tell
-// anyone who can upload whether some other tenant stores a given file. With
-// the write, the only uploads that come back faster are of content the same
-// namespace already holds, which tells the uploader nothing new. Rewriting a
-// stored blob is safe: every backend replaces an object atomically, and the
-// claim's row lock keeps GC away until the commit.
+// anyone who can upload whether some other tenant stores a given file, or
+// part of one. Content the namespace already holds is skipped, which tells
+// the uploader nothing new; any other content a commit can reuse is written
+// anyway, to a scratch object deleted once the commit is done (see plan).
+//
+// The plan is made outside the transaction and can go stale before the
+// claim: a xorb it meant to reuse may be collected, or the blob may be
+// created or collected meanwhile. The claim notices, and the commit plans
+// and writes again, a few times at most.
 func (s *Store) commit(ctx context.Context, namespaceID int64, key, contentType string, staged StagedBlob, upload uuid.UUID) (string, error) {
 	quota := s.limits.TenantQuotaBytes
-	err := s.db.InTx(ctx, func(tx pgx.Tx) error {
-		check := db.QuotaCheck{NamespaceID: namespaceID, Bytes: staged.Size, Key: key, Upload: upload}
-		if err := db.CheckQuota(ctx, tx, quota, check); err != nil {
-			return err
-		}
-		needsBytes, _, err := db.ClaimBlob(ctx, tx, staged.Hash, staged.Size, staged.MD5)
+	if err := s.checkQuota(ctx, db.QuotaCheck{NamespaceID: namespaceID, Bytes: staged.Size, Key: key, Upload: upload}); err != nil {
+		return "", err
+	}
+
+	var err error
+	for attempt := 0; attempt < commitAttempts; attempt++ {
+		var (
+			p *commitPlan
+			w written
+		)
+		p, err = s.plan(ctx, staged, namespaceID)
 		if err != nil {
-			return err
+			return "", err
 		}
-		// Asked whether or not the blob is new, so the two cases do the same
-		// work up to the copy.
-		held, err := db.BlobReferencedInNamespace(ctx, tx, staged.Hash, namespaceID)
+		w, err = s.carryOut(ctx, staged, p)
 		if err != nil {
-			return err
+			return "", err
 		}
-		if needsBytes || !held {
-			// The bytes have to land before the commit: a committed blob row
-			// with no bytes behind it would be handed out to readers. That
-			// holds for a row revived from refcount 0 too, whose bytes GC may
-			// already have deleted — rewriting them is idempotent.
-			if err := s.blob.Copy(ctx, storage.BlobPath(staged.Hash), staged.StagingKey, nil); err != nil {
-				return apperr.Internalf("promote staged blob: %w", err)
+		err = s.db.InTx(ctx, func(tx pgx.Tx) error {
+			check := db.QuotaCheck{NamespaceID: namespaceID, Bytes: staged.Size, Key: key, Upload: upload}
+			if err := db.CheckQuota(ctx, tx, quota, check); err != nil {
+				return err
 			}
+			claim, err := db.ClaimBlob(ctx, tx, staged.Hash, staged.Size, staged.MD5)
+			if err != nil {
+				return err
+			}
+			if claim.Fresh && !p.attach {
+				// Planned for a blob that was stored, and has since been
+				// collected. (One planned as new that someone else stored
+				// meanwhile needs nothing: it has terms of its own, and
+				// the xorbs written for it are left to the orphan sweep.)
+				return errStale
+			}
+			if claim.Fresh {
+				if err := db.AttachTerms(ctx, tx, staged.Hash, w.xorbs, p.terms, xorbBytes{s}); err != nil {
+					return err
+				}
+			}
+			if !claim.Chunked {
+				// Stored whole before chunking. A blob revived from zero,
+				// whose bytes GC may already have deleted, is rewritten
+				// from staging, which is idempotent; and as above, so is
+				// one new to the namespace.
+				held, err := db.BlobReferencedInNamespace(ctx, tx, staged.Hash, namespaceID)
+				if err != nil {
+					return err
+				}
+				if claim.NeedsBytes() || !held {
+					if err := s.blob.Copy(ctx, storage.BlobPath(staged.Hash), staged.StagingKey, nil); err != nil {
+						return apperr.Internalf("promote staged blob: %w", err)
+					}
+				}
+			}
+			if err := db.UpsertObject(ctx, tx, namespaceID, key, staged.Hash, staged.ETag, staged.Size, contentType); err != nil {
+				return err
+			}
+			return db.EnforceQuota(ctx, tx, quota, namespaceID, upload)
+		})
+		s.discardDecoys(context.WithoutCancel(ctx), w.decoys)
+		if !isStale(err) {
+			break
 		}
-		if err := db.UpsertObject(ctx, tx, namespaceID, key, staged.Hash, staged.ETag, staged.Size, contentType); err != nil {
-			return err
-		}
-		return db.EnforceQuota(ctx, tx, quota, namespaceID, upload)
-	})
+	}
 	if err != nil {
+		if isStale(err) {
+			return "", apperr.Internalf("commit kept going stale: %w", err)
+		}
 		// Leave the staging file for the sweeper: on a lost race it may be the
-		// only copy of bytes a retry can reuse.
+		// only copy of bytes a retry can reuse. New xorbs a failed commit
+		// wrote have no row, and the orphan sweep reclaims them.
 		return "", err
 	}
 
 	s.DiscardStaging(ctx, staged.StagingKey)
 	return staged.ETag, nil
 }
+
+// commitAttempts is how many times a commit plans and writes before giving
+// up on a plan that keeps going stale.
+const commitAttempts = 3
 
 // CopyObject implements copy semantics under content addressing: no bytes move,
 // the destination simply claims another reference to the source blob. It
@@ -305,15 +375,18 @@ func (s *Store) commit(ctx context.Context, namespaceID int64, key, contentType 
 func (s *Store) CopyObject(ctx context.Context, src db.ObjectMeta, dstNamespaceID int64, dstKey string) (string, error) {
 	var etag string
 	err := s.db.InTx(ctx, func(tx pgx.Tx) error {
-		needsBytes, md5, err := db.ClaimBlob(ctx, tx, src.BlobHash, src.Size, "")
+		claim, ok, err := db.ClaimStoredBlob(ctx, tx, src.BlobHash)
 		if err != nil {
 			return err
 		}
-		if needsBytes {
-			// Nothing else held a reference: the source was deleted after it
-			// was read, and the blob row is either brand new (GC already took
-			// it) or revived from zero (GC may have taken its bytes and
-			// crashed before the row). There is no staged copy to restore
+		if !ok {
+			// The source was deleted after it was read, and GC has already
+			// taken its blob. There is nothing to copy.
+			return apperr.ErrNoSuchKey
+		}
+		if claim.NeedsBytes() {
+			// A whole-file blob revived from zero: GC may have taken its bytes
+			// and crashed before the row. There is no staged copy to restore
 			// from, so the copy goes ahead only if the bytes are really there.
 			// The claim's row lock keeps GC off them until the commit.
 			present, err := s.blob.Exists(ctx, storage.BlobPath(src.BlobHash))
@@ -324,10 +397,10 @@ func (s *Store) CopyObject(ctx context.Context, src db.ObjectMeta, dstNamespaceI
 				return apperr.ErrNoSuchKey
 			}
 		}
-		if err := db.UpsertObject(ctx, tx, dstNamespaceID, dstKey, src.BlobHash, md5, src.Size, src.ContentType); err != nil {
+		if err := db.UpsertObject(ctx, tx, dstNamespaceID, dstKey, src.BlobHash, claim.MD5, src.Size, src.ContentType); err != nil {
 			return err
 		}
-		etag = db.ObjectMeta{BlobHash: src.BlobHash, StoredETag: md5}.ETag()
+		etag = db.ObjectMeta{BlobHash: src.BlobHash, StoredETag: claim.MD5}.ETag()
 		// A copy moves no bytes, but the destination team is charged for it
 		// all the same.
 		return db.EnforceQuota(ctx, tx, s.limits.TenantQuotaBytes, dstNamespaceID, uuid.Nil)
@@ -425,8 +498,9 @@ func (s *Store) CompleteMultipart(ctx context.Context, upload db.MultipartUpload
 	return etag, nil
 }
 
-// stageParts streams every part into a single staging file, hashing the
-// concatenation. Each part's MD5 is measured on the way through too, rather
+// stageParts streams every part into a single staging file, hashing and
+// chunking the concatenation, so chunk boundaries do not depend on where the
+// client split its parts. Each part's MD5 is measured on the way through too, rather
 // than trusted from the part's row, to give the multipart ETag.
 func (s *Store) stageParts(ctx context.Context, parts []db.PartMeta) (StagedBlob, error) {
 	key := storage.StagingPath(uuid.NewString())
@@ -436,12 +510,12 @@ func (s *Store) stageParts(ctx context.Context, parts []db.PartMeta) (StagedBlob
 		return StagedBlob{}, apperr.Internal(err)
 	}
 
-	hasher, md5er, partMD5s := blake3.New(), md5.New(), md5.New()
+	hasher, md5er, partMD5s, chunks := blake3.New(), md5.New(), md5.New(), newChunker()
 	var size int64
 
 	for _, part := range parts {
 		partMD5 := md5.New()
-		sink := io.MultiWriter(w, hasher, md5er, partMD5)
+		sink := io.MultiWriter(w, hasher, md5er, chunks, partMD5)
 		r, err := s.blob.NewReader(ctx, part.StagingKey, nil)
 		if err != nil {
 			_ = w.Close()
@@ -473,6 +547,7 @@ func (s *Store) stageParts(ctx context.Context, parts []db.PartMeta) (StagedBlob
 		Size:       size,
 		MD5:        hexSum(md5er),
 		ETag:       fmt.Sprintf("%s-%d", hexSum(partMD5s), len(parts)),
+		Chunks:     chunks.finish(),
 	}, nil
 }
 
