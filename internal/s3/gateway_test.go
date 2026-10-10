@@ -1,6 +1,8 @@
 package s3
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -17,9 +19,38 @@ import (
 	"github.com/ggoggam/simplecas/internal/testdb"
 )
 
-// Published BLAKE3 digest of "abc", which is the ETag every upload of that
-// content must produce.
+// Published BLAKE3 digest of "abc", which every upload of that content is
+// stored under.
 const abcHash = "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+
+// abcETag is the ETag S3 gives "abc": its MD5, quoted.
+const abcETag = `"900150983cd24fb0d6963f7d28e17f72"`
+
+// multipartETag is the quoted ETag S3 gives a multipart upload of these parts:
+// the MD5 of the parts' MD5s, then "-" and the part count.
+func multipartETag(parts ...string) string {
+	all := md5.New()
+	for _, p := range parts {
+		sum := md5.Sum([]byte(p))
+		all.Write(sum[:])
+	}
+	return fmt.Sprintf(`"%s-%d"`, hex.EncodeToString(all.Sum(nil)), len(parts))
+}
+
+// storedHash is the BLAKE3 digest an object's content is stored under, which
+// clients never see, for the tests that check dedup.
+func storedHash(t *testing.T, g *Gateway, namespace, key string) string {
+	t.Helper()
+	ns, err := g.db.GetNamespace(t.Context(), namespace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj, err := g.db.GetObject(t.Context(), ns.ID, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return obj.BlobHash
+}
 
 // newGateway builds a gateway over a scratch database and a scratch bucket
 // (testblob).
@@ -226,8 +257,8 @@ func TestPutGetHeadDeleteObject(t *testing.T) {
 	createNS(t, g, "photos")
 
 	etag := putObj(t, g, "photos", "cat.jpg", "abc", "image/jpeg")
-	if etag != `"`+abcHash+`"` {
-		t.Errorf("ETag = %s, want the quoted content hash", etag)
+	if etag != abcETag {
+		t.Errorf("ETag = %s, want the quoted content MD5 %s", etag, abcETag)
 	}
 
 	w := do(t, g, http.MethodGet, "/photos/cat.jpg", "")
@@ -237,7 +268,7 @@ func TestPutGetHeadDeleteObject(t *testing.T) {
 	}
 	for header, want := range map[string]string{
 		"Content-Type":   "image/jpeg",
-		"ETag":           `"` + abcHash + `"`,
+		"ETag":           abcETag,
 		"Accept-Ranges":  "bytes",
 		"Content-Length": "3",
 	} {
@@ -245,11 +276,14 @@ func TestPutGetHeadDeleteObject(t *testing.T) {
 			t.Errorf("%s = %q, want %q", header, got, want)
 		}
 	}
-	// Indexed by its exact spelling: S3 sends user metadata names in
-	// lowercase, and clients report them as they arrive.
-	//nolint:staticcheck // SA1008: the non-canonical key is the point.
-	if got := w.Header()[metaBlake3Header]; len(got) != 1 || got[0] != abcHash {
-		t.Errorf("x-amz-meta-blake3 = %q, want %q", got, abcHash)
+	// With global dedup the BLAKE3 digest names every tenant's copy of the
+	// content, so it is never sent, as metadata or as the ETag.
+	for name, values := range w.Header() {
+		for _, v := range values {
+			if strings.Contains(v, abcHash) {
+				t.Errorf("%s = %q exposes the BLAKE3 digest", name, v)
+			}
+		}
 	}
 	if w.Header().Get("Last-Modified") == "" {
 		t.Error("Last-Modified was not set")
@@ -411,7 +445,7 @@ func TestListObjectsV2(t *testing.T) {
 		if len(l.Contents) != 4 {
 			t.Fatalf("contents = %+v", l.Contents)
 		}
-		if l.Contents[0].Key != "a.txt" || l.Contents[0].ETag != `"`+abcHash+`"` {
+		if l.Contents[0].Key != "a.txt" || l.Contents[0].ETag != abcETag {
 			t.Errorf("first entry = %+v", l.Contents[0])
 		}
 		if l.Contents[0].StorageClass != "STANDARD" {
@@ -546,8 +580,8 @@ func TestCopyObjectOverHTTP(t *testing.T) {
 	mustStatus(t, w, http.StatusOK)
 	var result copyObjectResult
 	decode(t, w, &result)
-	if result.ETag != `"`+abcHash+`"` {
-		t.Errorf("ETag = %s", result.ETag)
+	if result.ETag != abcETag {
+		t.Errorf("ETag = %s, want %s", result.ETag, abcETag)
 	}
 	if result.LastModified == "" {
 		t.Error("LastModified was not set")
@@ -591,7 +625,7 @@ func TestUploadPartCopyOverHTTP(t *testing.T) {
 	createNS(t, g, "src")
 	createNS(t, g, "dst")
 	putObj(t, g, "src", "orig.txt", "abcdef", "text/plain")
-	wantETag := putObj(t, g, "src", "reference.txt", "abcdef", "text/plain")
+	putObj(t, g, "src", "reference.txt", "abcdef", "text/plain")
 
 	w := do(t, g, http.MethodPost, "/dst/copy.txt?uploads", "")
 	mustStatus(t, w, http.StatusOK)
@@ -626,8 +660,11 @@ func TestUploadPartCopyOverHTTP(t *testing.T) {
 	if w.Body.String() != "abcdef" {
 		t.Errorf("assembled copy = %q, want abcdef", w.Body.String())
 	}
-	if got := w.Header().Get("ETag"); got != wantETag {
-		t.Errorf("ETag = %s, want %s: the copy must dedup against the source", got, wantETag)
+	if got := w.Header().Get("ETag"); got != multipartETag("abcd", "ef") {
+		t.Errorf("ETag = %s, want %s", got, multipartETag("abcd", "ef"))
+	}
+	if got, want := storedHash(t, g, "dst", "copy.txt"), storedHash(t, g, "src", "reference.txt"); got != want {
+		t.Errorf("stored as %s, want %s: the copy must dedup against the source", got, want)
 	}
 
 	// Failure modes.
@@ -809,9 +846,12 @@ func TestMultipartRoundTrip(t *testing.T) {
 	mustStatus(t, w, http.StatusOK)
 	var completed completeMultipartUploadResult
 	decode(t, w, &completed)
-	// The assembled object hashes as the whole content.
-	if completed.ETag != `"`+abcHash+`"` {
-		t.Errorf("ETag = %s, want the hash of the assembled object", completed.ETag)
+	if completed.ETag != multipartETag("ab", "c") {
+		t.Errorf("ETag = %s, want %s", completed.ETag, multipartETag("ab", "c"))
+	}
+	// The assembled object is stored as the whole content.
+	if got := storedHash(t, g, "files", "big.bin"); got != abcHash {
+		t.Errorf("stored as %s, want the hash of the assembled object %s", got, abcHash)
 	}
 	if completed.Location != "/files/big.bin" {
 		t.Errorf("Location = %q", completed.Location)
@@ -934,8 +974,8 @@ func TestMultipartPartReplacement(t *testing.T) {
 	mustStatus(t, w, http.StatusOK)
 	var completed completeMultipartUploadResult
 	decode(t, w, &completed)
-	if completed.ETag != `"`+abcHash+`"` {
-		t.Errorf("ETag = %s, want the replacement's content", completed.ETag)
+	if completed.ETag != multipartETag("abc") {
+		t.Errorf("ETag = %s, want the replacement's %s", completed.ETag, multipartETag("abc"))
 	}
 }
 

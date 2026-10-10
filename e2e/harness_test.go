@@ -16,6 +16,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -32,8 +33,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/zeebo/blake3"
 
 	"github.com/ggoggam/simplecas/internal/api"
 	"github.com/ggoggam/simplecas/internal/cas"
@@ -308,11 +307,22 @@ func readFile(t *testing.T, path string) []byte {
 	return data
 }
 
-// etagOf is the ETag the gateway must report for content: its quoted BLAKE3
-// digest, however the object was uploaded.
+// etagOf is the ETag S3 gives content the CLI uploads as configured here: its
+// quoted MD5, or from partSize up, the multipart form over partSize parts —
+// the MD5 of the parts' MD5s, then "-" and the part count.
 func etagOf(data []byte) string {
-	sum := blake3.Sum256(data)
-	return `"` + hex.EncodeToString(sum[:]) + `"`
+	if len(data) < partSize {
+		sum := md5.Sum(data)
+		return `"` + hex.EncodeToString(sum[:]) + `"`
+	}
+	all, n := md5.New(), 0
+	for rest := data; len(rest) > 0; n++ {
+		part := rest[:min(partSize, len(rest))]
+		sum := md5.Sum(part)
+		all.Write(sum[:])
+		rest = rest[len(part):]
+	}
+	return fmt.Sprintf(`"%s-%d"`, hex.EncodeToString(all.Sum(nil)), n)
 }
 
 // sameBytes fails the test when got differs from want, without dumping

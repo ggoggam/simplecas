@@ -2,6 +2,8 @@ package cas
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"testing"
 	"time"
 
@@ -89,7 +91,7 @@ func TestSweepStagingRemovesOrphansAndSparesLiveParts(t *testing.T) {
 		t.Fatal(err)
 	}
 	part := f.stage(t, "part bytes")
-	if _, err := f.db.PutPart(ctx, uploadID, 1, part.StagingKey, part.Size, part.Hash, 0); err != nil {
+	if _, err := f.db.PutPart(ctx, uploadID, 1, part.StagingKey, part.Size, part.ETag, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -127,7 +129,7 @@ func TestSweepMultipartReclaimsAbandonedParts(t *testing.T) {
 		t.Fatal(err)
 	}
 	part := f.stage(t, "abandoned part")
-	if _, err := f.db.PutPart(ctx, uploadID, 1, part.StagingKey, part.Size, part.Hash, 0); err != nil {
+	if _, err := f.db.PutPart(ctx, uploadID, 1, part.StagingKey, part.Size, part.ETag, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -253,6 +255,56 @@ func TestReuploadAfterOrphanSweepRewritesTheBytes(t *testing.T) {
 }
 
 // The sweeps run in sequence, and each has to survive the others' leftovers.
+// Objects stored before ETags were recorded are served with their BLAKE3
+// digest until the backfill reads the blob and records its MD5.
+func TestBackfillETagsRecordsMD5s(t *testing.T) {
+	f := newFixture(t, defaultGC())
+	ctx := t.Context()
+	read := f.namespace(t, "read", nil)
+	known := f.namespace(t, "known", nil)
+
+	if _, err := f.store.Commit(ctx, read, "k", "text/plain", f.stage(t, "abc")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.Commit(ctx, known, "k", "text/plain", f.stage(t, "xyz")); err != nil {
+		t.Fatal(err)
+	}
+	// "abc" as stored before the migration: no MD5 anywhere. "xyz" has its
+	// blob MD5 (a later upload recorded it) but an object still without one,
+	// so its bytes need not be read: they are removed to prove it.
+	if _, err := f.pool.Exec(ctx, "UPDATE objects SET etag = NULL"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(ctx, "UPDATE blobs SET md5 = NULL WHERE hash = $1", hashABC); err != nil {
+		t.Fatal(err)
+	}
+	xyz, err := f.db.GetObject(ctx, known, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.bucket.Delete(ctx, storage.BlobPath(xyz.BlobHash)); err != nil {
+		t.Fatal(err)
+	}
+
+	if obj, _ := f.db.GetObject(ctx, read, "k"); obj.ETag() != hashABC {
+		t.Fatalf("before the backfill ETag = %s, want the BLAKE3 digest it was served with", obj.ETag())
+	}
+
+	f.store.backfillETags(ctx)
+
+	if obj, _ := f.db.GetObject(ctx, read, "k"); obj.ETag() != md5ABC {
+		t.Errorf("ETag = %s, want the MD5 %s read from the blob", obj.ETag(), md5ABC)
+	}
+	want := md5.Sum([]byte("xyz"))
+	if obj, _ := f.db.GetObject(ctx, known, "k"); obj.ETag() != hex.EncodeToString(want[:]) {
+		t.Errorf("ETag = %s, want the recorded blob MD5", obj.ETag())
+	}
+	pending, err := f.db.ETagsToBackfill(ctx, 10)
+	if err != nil || len(pending) != 0 {
+		t.Errorf("still to backfill = %v, %v; want none", pending, err)
+	}
+}
+
 func TestRunGCStopsOnContextCancel(t *testing.T) {
 	f := newFixture(t, config.GcConfig{IntervalSecs: 1, GraceSecs: 0, MultipartExpirySecs: 0})
 

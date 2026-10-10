@@ -69,10 +69,10 @@ func TestCopyUpAndDown(t *testing.T) {
 	if h.ContentType != "text/plain" {
 		t.Errorf("content type = %q, want text/plain", h.ContentType)
 	}
-	// The CLI reports metadata names as they arrive, so this also checks the
-	// header is sent in S3's lowercase rather than Go's canonical case.
-	if want := strings.Trim(etagOf(content), `"`); h.Metadata["blake3"] != want {
-		t.Errorf("metadata = %v, want blake3 = %s", h.Metadata, want)
+	// The BLAKE3 digest content is stored under names every tenant's copy of
+	// it, so it is not handed out as metadata.
+	if len(h.Metadata) != 0 {
+		t.Errorf("metadata = %v, want none", h.Metadata)
 	}
 
 	out := filepath.Join(dir, "out.txt")
@@ -86,7 +86,7 @@ func TestCopyUpAndDown(t *testing.T) {
 		t.Errorf("content type = %q, want application/json", h.ContentType)
 	}
 
-	// Identical content dedups to the same blob, so the ETag repeats.
+	// Identical content gets the same ETag.
 	aws.run("s3", "cp", writeFile(t, dir, "again.txt", content), "s3://docs/copies/again.txt")
 	if h := aws.head("docs", "copies/again.txt"); h.ETag != etagOf(content) {
 		t.Errorf("duplicate etag = %s, want %s", h.ETag, etagOf(content))

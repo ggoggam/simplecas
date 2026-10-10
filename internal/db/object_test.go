@@ -36,7 +36,7 @@ func TestClaimBlobRefcounting(t *testing.T) {
 	var isNew bool
 	err := d.InTx(ctx, func(tx pgx.Tx) error {
 		var err error
-		isNew, err = ClaimBlob(ctx, tx, hash, 42)
+		isNew, _, err = ClaimBlob(ctx, tx, hash, 42, "")
 		return err
 	})
 	if err != nil {
@@ -52,7 +52,7 @@ func TestClaimBlobRefcounting(t *testing.T) {
 	// A second claim is an update, not an insert.
 	err = d.InTx(ctx, func(tx pgx.Tx) error {
 		var err error
-		isNew, err = ClaimBlob(ctx, tx, hash, 42)
+		isNew, _, err = ClaimBlob(ctx, tx, hash, 42, "")
 		return err
 	})
 	if err != nil {
@@ -83,7 +83,7 @@ func TestClaimBlobRevivalNeedsBytes(t *testing.T) {
 	var needsBytes bool
 	err := d.InTx(ctx, func(tx pgx.Tx) error {
 		var err error
-		needsBytes, err = ClaimBlob(ctx, tx, hash, 10)
+		needsBytes, _, err = ClaimBlob(ctx, tx, hash, 10, "")
 		return err
 	})
 	if err != nil {
@@ -105,7 +105,7 @@ func TestReleaseBlobFloorsAtZero(t *testing.T) {
 	hash := hashOf("floor")
 
 	err := d.InTx(ctx, func(tx pgx.Tx) error {
-		if _, err := ClaimBlob(ctx, tx, hash, 1); err != nil {
+		if _, _, err := ClaimBlob(ctx, tx, hash, 1, ""); err != nil {
 			return err
 		}
 		for range 3 {
@@ -130,7 +130,7 @@ func TestClaimExistingBlob(t *testing.T) {
 
 	// Absent blob: the link fast path must decline rather than dangle.
 	err := d.InTx(ctx, func(tx pgx.Tx) error {
-		_, ok, err := ClaimExistingBlob(ctx, tx, hash)
+		_, _, ok, err := ClaimExistingBlob(ctx, tx, hash)
 		if err != nil {
 			return err
 		}
@@ -145,14 +145,14 @@ func TestClaimExistingBlob(t *testing.T) {
 
 	// Present blob: returns the authoritative stored size, not a caller's claim.
 	err = d.InTx(ctx, func(tx pgx.Tx) error {
-		_, err := ClaimBlob(ctx, tx, hash, 4096)
+		_, _, err := ClaimBlob(ctx, tx, hash, 4096, "")
 		return err
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	err = d.InTx(ctx, func(tx pgx.Tx) error {
-		size, ok, err := ClaimExistingBlob(ctx, tx, hash)
+		size, _, ok, err := ClaimExistingBlob(ctx, tx, hash)
 		if err != nil {
 			return err
 		}
@@ -179,7 +179,7 @@ func TestClaimExistingBlob(t *testing.T) {
 				return err
 			}
 		}
-		_, ok, err := ClaimExistingBlob(ctx, tx, hash)
+		_, _, ok, err := ClaimExistingBlob(ctx, tx, hash)
 		if err != nil {
 			return err
 		}

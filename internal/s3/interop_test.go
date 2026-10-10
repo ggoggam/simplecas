@@ -131,8 +131,8 @@ func TestAWSSDKObjectLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PutObject: %v", err)
 	}
-	if got := aws.ToString(put.ETag); got != `"`+abcHash+`"` {
-		t.Errorf("ETag = %s, want the content hash", got)
+	if got := aws.ToString(put.ETag); got != abcETag {
+		t.Errorf("ETag = %s, want the content MD5 %s", got, abcETag)
 	}
 
 	// The bytes must round-trip exactly. If the SDK framed the body (aws-chunked
@@ -341,10 +341,8 @@ func TestAWSSDKMultipart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CompleteMultipartUpload: %v", err)
 	}
-	// The assembled object hashes as the whole content, so it dedups against a
-	// single-shot upload of the same bytes.
-	if got := aws.ToString(done.ETag); got != `"`+abcHash+`"` {
-		t.Errorf("ETag = %s, want %s", got, `"`+abcHash+`"`)
+	if got, want := aws.ToString(done.ETag), multipartETag("ab", "c"); got != want {
+		t.Errorf("ETag = %s, want %s", got, want)
 	}
 
 	get, err := client.GetObject(ctx, &awss3.GetObjectInput{

@@ -429,8 +429,8 @@ func TestAWSSDKStreamingUploadIsDecoded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PutObject with an unseekable body: %v", err)
 	}
-	if got := aws.ToString(put.ETag); got != `"`+abcHash+`"` {
-		t.Errorf("ETag = %s, want the hash of the payload alone", got)
+	if got := aws.ToString(put.ETag); got != abcETag {
+		t.Errorf("ETag = %s, want the MD5 of the payload alone", got)
 	}
 
 	get, err := client.GetObject(ctx, &awss3.GetObjectInput{
@@ -483,9 +483,9 @@ func TestAWSSDKStreamingMultipartPartIsDecoded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UploadPart with an unseekable body: %v", err)
 	}
-	// The part's own ETag is the hash of its payload, framing excluded.
-	if got := aws.ToString(uploaded.ETag); got != `"`+abcHash+`"` {
-		t.Errorf("part ETag = %s, want %s", got, `"`+abcHash+`"`)
+	// The part's own ETag is the MD5 of its payload, framing excluded.
+	if got := aws.ToString(uploaded.ETag); got != abcETag {
+		t.Errorf("part ETag = %s, want %s", got, abcETag)
 	}
 }
 

@@ -11,19 +11,30 @@
 //  2. In one Postgres transaction, claim a blob reference (which row-locks the
 //     blob: refcount++ or insert at 1). If no other reference existed — a new
 //     row, or one revived from refcount 0 — copy staging into blobs/… *before*
-//     the commit, so a committed reference always has bytes behind it.
+//     the commit, so a committed reference always has bytes behind it. The
+//     copy also runs when the content is new to the namespace, even if the
+//     blob is stored for someone else: see commit.
 //  3. Point the object row at the blob, releasing any blob it overwrote, and commit.
 //  4. Delete the staging file. Best-effort — stale staging is swept later.
 //
-// A dedup hit therefore costs one staging write plus one delete. Simple beats
-// clever here: hashing before writing would need either full buffering or a
-// second client round trip.
+// Dedup is global: one copy of the bytes serves every tenant that stores
+// them. A dedup hit within a namespace costs one staging write plus one
+// delete; a hit on content only another namespace holds costs as much as a new
+// blob, so upload timing says nothing about other tenants' content. Simple
+// beats clever here: hashing before writing would need either full buffering
+// or a second client round trip.
+//
+// Clients see MD5 ETags, as S3 serves them, never the BLAKE3 digest: that
+// digest is the dedup key for every tenant's copy of some content.
 package cas
 
 import (
 	"context"
+	"crypto/md5"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"hash"
 	"io"
 	"log/slog"
 	"os"
@@ -55,12 +66,19 @@ func New(database *db.DB, bucket *storage.Bucket, gc config.GcConfig, limits con
 	return &Store{db: database, blob: bucket, gc: gc, limits: limits, log: log}
 }
 
-// StagedBlob is an upload buffered in staging, with the hash and size measured
-// while it streamed past.
+// StagedBlob is an upload buffered in staging, with the hashes and size
+// measured while it streamed past.
 type StagedBlob struct {
 	StagingKey string
-	Hash       string
-	Size       int64
+	// Hash is the BLAKE3 digest the content is stored under.
+	Hash string
+	Size int64
+	// MD5 is the hex MD5 of the content.
+	MD5 string
+	// ETag is what the content is served under once committed, unquoted: its
+	// MD5, or for an assembled multipart upload the MD5 of its parts' MD5s
+	// followed by "-" and the part count, as S3 computes it.
+	ETag string
 }
 
 // taggedReader remembers whether a failure came from the source, so a client
@@ -120,7 +138,7 @@ func (s *Store) PutPart(ctx context.Context, upload db.MultipartUpload, partNumb
 		return StagedBlob{}, err
 	}
 	replaced, err := s.db.PutPart(ctx, upload.ID, partNumber,
-		staged.StagingKey, staged.Size, staged.Hash, s.limits.TenantQuotaBytes)
+		staged.StagingKey, staged.Size, staged.ETag, s.limits.TenantQuotaBytes)
 	if err != nil {
 		s.DiscardStaging(ctx, staged.StagingKey)
 		return StagedBlob{}, err
@@ -167,8 +185,8 @@ func (s *Store) stage(ctx context.Context, r io.Reader, limit int64, what string
 	// One byte past the limit is enough to know the body is too long, and
 	// stops the copy there rather than staging the rest.
 	src := &taggedReader{r: io.LimitReader(r, limit+1)}
-	hasher := blake3.New()
-	size, copyErr := io.Copy(io.MultiWriter(w, hasher), src)
+	hasher, md5er := blake3.New(), md5.New()
+	size, copyErr := io.Copy(io.MultiWriter(w, hasher, md5er), src)
 
 	// Close finalises the write (and, on object stores, completes the upload),
 	// so its error matters as much as the copy's.
@@ -199,15 +217,20 @@ func (s *Store) stage(ctx context.Context, r io.Reader, limit int64, what string
 		return StagedBlob{}, apperr.Internalf("finalise staged upload: %w", closeErr)
 	}
 
+	sum := hexSum(md5er)
 	return StagedBlob{
 		StagingKey: key,
 		Hash:       hex.EncodeToString(hasher.Sum(nil)),
 		Size:       size,
+		MD5:        sum,
+		ETag:       sum,
 	}, nil
 }
 
-// Commit publishes a staged blob as namespace/key and returns the blob hash,
-// which is the object's ETag.
+// hexSum is h's digest in hex.
+func hexSum(h hash.Hash) string { return hex.EncodeToString(h.Sum(nil)) }
+
+// Commit publishes a staged blob as namespace/key and returns its ETag.
 func (s *Store) Commit(ctx context.Context, namespaceID int64, key, contentType string, staged StagedBlob) (string, error) {
 	return s.commit(ctx, namespaceID, key, contentType, staged, uuid.Nil)
 }
@@ -221,6 +244,16 @@ func (s *Store) Commit(ctx context.Context, namespaceID int64, key, contentType 
 // for GC to find. The second, after the object row is written, is the
 // authoritative one under the team lock, and only loses bytes that way when
 // two writers race past the first check together.
+//
+// The bytes are written whenever the namespace holds no other reference to the
+// blob, not only when the blob is new. Dedup is global, so skipping the write
+// for any stored blob would make an upload of content another tenant holds
+// measurably faster than one of new content, and that difference would tell
+// anyone who can upload whether some other tenant stores a given file. With
+// the write, the only uploads that come back faster are of content the same
+// namespace already holds, which tells the uploader nothing new. Rewriting a
+// stored blob is safe: every backend replaces an object atomically, and the
+// claim's row lock keeps GC away until the commit.
 func (s *Store) commit(ctx context.Context, namespaceID int64, key, contentType string, staged StagedBlob, upload uuid.UUID) (string, error) {
 	quota := s.limits.TenantQuotaBytes
 	err := s.db.InTx(ctx, func(tx pgx.Tx) error {
@@ -228,11 +261,17 @@ func (s *Store) commit(ctx context.Context, namespaceID int64, key, contentType 
 		if err := db.CheckQuota(ctx, tx, quota, check); err != nil {
 			return err
 		}
-		needsBytes, err := db.ClaimBlob(ctx, tx, staged.Hash, staged.Size)
+		needsBytes, _, err := db.ClaimBlob(ctx, tx, staged.Hash, staged.Size, staged.MD5)
 		if err != nil {
 			return err
 		}
-		if needsBytes {
+		// Asked whether or not the blob is new, so the two cases do the same
+		// work up to the copy.
+		held, err := db.BlobReferencedInNamespace(ctx, tx, staged.Hash, namespaceID)
+		if err != nil {
+			return err
+		}
+		if needsBytes || !held {
 			// The bytes have to land before the commit: a committed blob row
 			// with no bytes behind it would be handed out to readers. That
 			// holds for a row revived from refcount 0 too, whose bytes GC may
@@ -241,7 +280,7 @@ func (s *Store) commit(ctx context.Context, namespaceID int64, key, contentType 
 				return apperr.Internalf("promote staged blob: %w", err)
 			}
 		}
-		if err := db.UpsertObject(ctx, tx, namespaceID, key, staged.Hash, staged.Size, contentType); err != nil {
+		if err := db.UpsertObject(ctx, tx, namespaceID, key, staged.Hash, staged.ETag, staged.Size, contentType); err != nil {
 			return err
 		}
 		return db.EnforceQuota(ctx, tx, quota, namespaceID, upload)
@@ -253,14 +292,20 @@ func (s *Store) commit(ctx context.Context, namespaceID int64, key, contentType 
 	}
 
 	s.DiscardStaging(ctx, staged.StagingKey)
-	return staged.Hash, nil
+	return staged.ETag, nil
 }
 
 // CopyObject implements copy semantics under content addressing: no bytes move,
-// the destination simply claims another reference to the source blob.
+// the destination simply claims another reference to the source blob. It
+// returns the copy's ETag.
+//
+// The copy is a single-part object, so like S3 it gets the content's MD5 as its
+// ETag even when the source was a multipart upload. The caller can already
+// read the source, so writing no bytes reveals nothing.
 func (s *Store) CopyObject(ctx context.Context, src db.ObjectMeta, dstNamespaceID int64, dstKey string) (string, error) {
+	var etag string
 	err := s.db.InTx(ctx, func(tx pgx.Tx) error {
-		needsBytes, err := db.ClaimBlob(ctx, tx, src.BlobHash, src.Size)
+		needsBytes, md5, err := db.ClaimBlob(ctx, tx, src.BlobHash, src.Size, "")
 		if err != nil {
 			return err
 		}
@@ -279,9 +324,10 @@ func (s *Store) CopyObject(ctx context.Context, src db.ObjectMeta, dstNamespaceI
 				return apperr.ErrNoSuchKey
 			}
 		}
-		if err := db.UpsertObject(ctx, tx, dstNamespaceID, dstKey, src.BlobHash, src.Size, src.ContentType); err != nil {
+		if err := db.UpsertObject(ctx, tx, dstNamespaceID, dstKey, src.BlobHash, md5, src.Size, src.ContentType); err != nil {
 			return err
 		}
+		etag = db.ObjectMeta{BlobHash: src.BlobHash, StoredETag: md5}.ETag()
 		// A copy moves no bytes, but the destination team is charged for it
 		// all the same.
 		return db.EnforceQuota(ctx, tx, s.limits.TenantQuotaBytes, dstNamespaceID, uuid.Nil)
@@ -289,11 +335,11 @@ func (s *Store) CopyObject(ctx context.Context, src db.ObjectMeta, dstNamespaceI
 	if err != nil {
 		return "", err
 	}
-	return src.BlobHash, nil
+	return etag, nil
 }
 
-// LinkBlob points key at content that is already stored, transferring no bytes.
-// It reports linked=false when the blob is not present — or not visible to this
+// LinkBlob points key at content that is already stored, transferring no bytes,
+// and returns the new object's size and ETag. It reports linked=false when the blob is not present — or not visible to this
 // tenant — so the caller can fall back to a real upload. This is what turns a
 // client-side hash match into a zero-byte upload.
 //
@@ -302,7 +348,7 @@ func (s *Store) CopyObject(ctx context.Context, src db.ObjectMeta, dstNamespaceI
 // to confirm the existence of another tenant's content. A nil scope links
 // against any stored blob, which is correct only for a superuser caller or an
 // unowned namespace — pass the namespace's own TenantID and it is always right.
-func (s *Store) LinkBlob(ctx context.Context, namespaceID int64, key, hash, contentType string, tenantScope *int64) (size int64, linked bool, err error) {
+func (s *Store) LinkBlob(ctx context.Context, namespaceID int64, key, hash, contentType string, tenantScope *int64) (size int64, etag string, linked bool, err error) {
 	err = s.db.InTx(ctx, func(tx pgx.Tx) error {
 		if tenantScope != nil {
 			visible, err := db.BlobReferencedInTenant(ctx, tx, hash, *tenantScope)
@@ -314,7 +360,7 @@ func (s *Store) LinkBlob(ctx context.Context, namespaceID int64, key, hash, cont
 			}
 		}
 
-		stored, ok, err := db.ClaimExistingBlob(ctx, tx, hash)
+		stored, md5, ok, err := db.ClaimExistingBlob(ctx, tx, hash)
 		if err != nil {
 			return err
 		}
@@ -323,15 +369,16 @@ func (s *Store) LinkBlob(ctx context.Context, namespaceID int64, key, hash, cont
 		}
 
 		size, linked = stored, true
-		if err := db.UpsertObject(ctx, tx, namespaceID, key, hash, stored, contentType); err != nil {
+		etag = db.ObjectMeta{BlobHash: hash, StoredETag: md5}.ETag()
+		if err := db.UpsertObject(ctx, tx, namespaceID, key, hash, md5, stored, contentType); err != nil {
 			return err
 		}
 		return db.EnforceQuota(ctx, tx, s.limits.TenantQuotaBytes, namespaceID, uuid.Nil)
 	})
 	if err != nil {
-		return 0, false, err
+		return 0, "", false, err
 	}
-	return size, linked, nil
+	return size, etag, linked, nil
 }
 
 // CompleteMultipart concatenates the parts into one staged blob, hashing the
@@ -379,7 +426,8 @@ func (s *Store) CompleteMultipart(ctx context.Context, upload db.MultipartUpload
 }
 
 // stageParts streams every part into a single staging file, hashing the
-// concatenation.
+// concatenation. Each part's MD5 is measured on the way through too, rather
+// than trusted from the part's row, to give the multipart ETag.
 func (s *Store) stageParts(ctx context.Context, parts []db.PartMeta) (StagedBlob, error) {
 	key := storage.StagingPath(uuid.NewString())
 
@@ -388,11 +436,12 @@ func (s *Store) stageParts(ctx context.Context, parts []db.PartMeta) (StagedBlob
 		return StagedBlob{}, apperr.Internal(err)
 	}
 
-	hasher := blake3.New()
-	sink := io.MultiWriter(w, hasher)
+	hasher, md5er, partMD5s := blake3.New(), md5.New(), md5.New()
 	var size int64
 
 	for _, part := range parts {
+		partMD5 := md5.New()
+		sink := io.MultiWriter(w, hasher, md5er, partMD5)
 		r, err := s.blob.NewReader(ctx, part.StagingKey, nil)
 		if err != nil {
 			_ = w.Close()
@@ -410,6 +459,7 @@ func (s *Store) stageParts(ctx context.Context, parts []db.PartMeta) (StagedBlob
 			}
 			return StagedBlob{}, apperr.Internalf("read part %d: %w", part.PartNumber, copyErr)
 		}
+		partMD5s.Write(partMD5.Sum(nil))
 	}
 
 	if err := w.Close(); err != nil {
@@ -421,6 +471,8 @@ func (s *Store) stageParts(ctx context.Context, parts []db.PartMeta) (StagedBlob
 		StagingKey: key,
 		Hash:       hex.EncodeToString(hasher.Sum(nil)),
 		Size:       size,
+		MD5:        hexSum(md5er),
+		ETag:       fmt.Sprintf("%s-%d", hexSum(partMD5s), len(parts)),
 	}, nil
 }
 

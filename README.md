@@ -16,8 +16,8 @@ a bundled **PWA** for managing objects.
 
 ## How deduplication works
 
-Every object's bytes are hashed with BLAKE3. The digest is the object's ETag and
-the key into a global `blobs` table shared across **all namespaces**. Two objects
+Every object's bytes are hashed with BLAKE3. The digest is the key into a global
+`blobs` table shared across **all namespaces**. Two objects
 with identical content — in the same namespace or different ones — reference one
 physical blob. A `refcount` tracks how many objects point at each blob; deleting
 the last reference marks the blob for garbage collection, which removes the bytes
@@ -28,9 +28,31 @@ objects (namespace, key) ──blob_hash──▶ blobs (hash, size, refcount) �
 ```
 
 The write path streams uploads to a `staging/<uuid>` file while hashing, then in
-one transaction claims a blob reference (creating the blob row + copying bytes
-only if the content is new) and points the key at it. Uploading duplicate
-content costs a staging write + delete and **zero** additional stored bytes.
+one transaction claims a blob reference (creating the blob row if the content is
+new) and points the key at it. Uploading duplicate content stores **zero**
+additional bytes.
+
+### What global dedup reveals
+
+Dedup is global by design, so the same bytes stored by two teams are one blob.
+Two things keep that from telling one team what another stores:
+
+- **Uniform write cost.** The bytes are written into `blobs/` for any content
+  new to the namespace, even when the blob is already stored for someone else.
+  An upload of content another team holds takes as long as one of new content;
+  only a namespace's own duplicates skip the write (a staging write + delete).
+- **No BLAKE3 digest on the wire.** S3 ETags are MD5s as S3 computes them (the
+  content's MD5, or `<md5 of part md5s>-<parts>` for a multipart upload), and
+  no `x-amz-meta-blake3` header is sent. Objects stored before ETags were
+  recorded keep their BLAKE3 ETag until the GC loop's backfill reads them and
+  records their MD5.
+
+What remains: the global `blobs` table is shared, so an operator, or anyone
+with read access to the database or the blob store, can see which teams store
+identical content. Per-team storage and quota statistics count only the team's
+own objects, and the PWA's zero-byte link only links content the caller's own
+team already holds (see [Teams](#teams-multi-tenancy)). Encryption at rest with
+per-team keys would need per-team dedup and is not offered.
 
 ### Client-side dedup (PWA)
 
@@ -643,8 +665,7 @@ message plus that ID (`<RequestId>` in XML, `request_id` in JSON); the cause is
 logged server-side under the same ID.
 
 **Deliberately unsupported:** versioning, ACLs/bucket policies,
-POST-policy uploads, virtual-host-style addressing. ETags are BLAKE3 digests,
-not MD5.
+POST-policy uploads, virtual-host-style addressing.
 
 ### Example with the AWS CLI
 

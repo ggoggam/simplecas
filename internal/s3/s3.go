@@ -6,7 +6,10 @@
 // (initiate, upload part, upload part copy, list parts, list uploads,
 // complete, abort), and GetObjectTagging, which always answers an empty tag set.
 //
-// Divergence from AWS: ETags are blake3 digests of the content, not MD5.
+// ETags are MD5s as S3 computes them: the content's MD5, or for a multipart
+// upload the MD5 of its parts' MD5s and "-N". The BLAKE3 digest content is
+// stored under is never sent; with global dedup it would identify every
+// tenant's copy of the same bytes (see package cas).
 // Deliberately unsupported: versioning, ACLs and policies, POST-policy
 // uploads, virtual-host addressing, and storing tags.
 //
@@ -55,11 +58,6 @@ import (
 // maxXMLBody caps the request bodies the gateway parses as XML (the batch
 // delete and multipart completion manifests).
 const maxXMLBody = 8 << 20
-
-// metaBlake3Header carries an object's BLAKE3 digest as user metadata. It is
-// lowercase because S3 sends user metadata names that way, and the header map
-// is written to directly so net/http does not canonicalize it.
-const metaBlake3Header = "x-amz-meta-blake3"
 
 // maxKeysLimit and related caps mirror S3's documented maxima.
 const (
@@ -601,7 +599,7 @@ func (g *Gateway) listObjects(w http.ResponseWriter, r *http.Request, namespace 
 		result.Contents = append(result.Contents, contents{
 			Key:          o.Key,
 			LastModified: iso8601(o.UpdatedAt),
-			ETag:         quotedETag(o.BlobHash),
+			ETag:         quotedETag(o.ETag()),
 			Size:         o.Size,
 			StorageClass: "STANDARD",
 		})
@@ -900,14 +898,9 @@ func (g *Gateway) serveResolvedObject(w http.ResponseWriter, r *http.Request, ns
 
 	w.Header().Set("Content-Type", meta.ContentType)
 	setContentSafetyHeaders(w.Header(), meta.ContentType)
-	w.Header().Set("ETag", quotedETag(meta.BlobHash))
+	w.Header().Set("ETag", quotedETag(meta.ETag()))
 	w.Header().Set("Last-Modified", httpDate(meta.UpdatedAt))
 	w.Header().Set("Accept-Ranges", "bytes")
-	// Assigned rather than Set: Set would canonicalize the name to
-	// X-Amz-Meta-Blake3, and the AWS CLI and SDKs report user metadata keys
-	// exactly as they arrive, so clients would see "Blake3" where S3 always
-	// answers in lowercase.
-	w.Header()[metaBlake3Header] = []string{meta.BlobHash}
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 
 	if headOnly || length == 0 {
@@ -977,15 +970,15 @@ func (g *Gateway) uploadPart(w http.ResponseWriter, r *http.Request, namespace, 
 		return
 	}
 
-	// Parts stay in staging under their own part-level digest; dedup happens
-	// once at completion, when the hash of the whole object is known.
+	// Parts stay in staging, answered with their own MD5; dedup happens once
+	// at completion, when the hash of the whole object is known.
 	staged, err := g.cas.PutPart(r.Context(), upload, int32(partNumber), r.Body, declaredLength(r))
 	if err != nil {
 		g.writeError(w, r, err)
 		return
 	}
 
-	w.Header().Set("ETag", quotedETag(staged.Hash))
+	w.Header().Set("ETag", quotedETag(staged.ETag))
 	setChecksumHeaders(w, r)
 	w.WriteHeader(http.StatusOK)
 }
@@ -1053,7 +1046,7 @@ func (g *Gateway) uploadPartCopy(w http.ResponseWriter, r *http.Request, namespa
 	g.writeXML(w, r, http.StatusOK, copyPartResult{
 		Xmlns:        xmlns,
 		LastModified: iso8601(time.Now()),
-		ETag:         quotedETag(staged.Hash),
+		ETag:         quotedETag(staged.ETag),
 	})
 }
 

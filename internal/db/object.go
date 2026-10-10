@@ -26,6 +26,11 @@ import (
 // which case the caller must (re)write them before committing — so a committed
 // reference always has bytes behind it.
 //
+// md5 is the content's hex MD5 when the caller measured it, or "" when it did
+// not (a copy reads no bytes). It is recorded on a row that has none yet, and
+// the row's MD5 comes back as storedMD5, or "" for a blob stored before MD5s
+// were recorded that the backfill has not reached.
+//
 // needsBytes covers two cases. A fresh row obviously has no bytes yet. A row
 // revived from refcount 0 may not either: GCSweep deletes the bytes before its
 // transaction commits, so a crash or failed commit in that window leaves a
@@ -37,38 +42,40 @@ import (
 // The ON CONFLICT row lock serialises against GC's SELECT ... FOR UPDATE, so a
 // blob being swept cannot be re-referenced underneath the sweep. After the
 // increment, a refcount of 1 means nothing else held a reference before.
-func ClaimBlob(ctx context.Context, tx pgx.Tx, hash string, size int64) (needsBytes bool, err error) {
+func ClaimBlob(ctx context.Context, tx pgx.Tx, hash string, size int64, md5 string) (needsBytes bool, storedMD5 string, err error) {
 	err = tx.QueryRow(ctx, `
-		INSERT INTO blobs (hash, size, refcount) VALUES ($1, $2, 1)
+		INSERT INTO blobs (hash, size, refcount, md5) VALUES ($1, $2, 1, NULLIF($3, ''))
 		ON CONFLICT (hash) DO UPDATE
-		    SET refcount = blobs.refcount + 1, updated_at = now()
-		RETURNING refcount = 1`, hash, size).Scan(&needsBytes)
+		    SET refcount = blobs.refcount + 1, updated_at = now(),
+		        md5 = COALESCE(blobs.md5, EXCLUDED.md5)
+		RETURNING refcount = 1, COALESCE(md5, '')`, hash, size, md5).Scan(&needsBytes, &storedMD5)
 	if err != nil {
-		return false, apperr.Internal(err)
+		return false, "", apperr.Internal(err)
 	}
-	return needsBytes, nil
+	return needsBytes, storedMD5, nil
 }
 
 // ClaimExistingBlob takes a reference to hash only if the blob is live — some
 // object already references it — returning its authoritative size. ok is false
 // otherwise, which tells the dedup "link" path to fall back to a real upload
-// rather than create a dangling reference.
+// rather than create a dangling reference. md5 is the blob's recorded MD5, or ""
+// when the backfill has not reached it yet.
 //
 // A blob at refcount 0 is declined even though its row exists: GC may have
 // deleted its bytes and crashed before removing the row (see ClaimBlob), and
 // the link path has no staged copy to restore them from. The fallback upload
 // goes through ClaimBlob, which revives the row and rewrites the bytes.
-func ClaimExistingBlob(ctx context.Context, tx pgx.Tx, hash string) (size int64, ok bool, err error) {
+func ClaimExistingBlob(ctx context.Context, tx pgx.Tx, hash string) (size int64, md5 string, ok bool, err error) {
 	err = tx.QueryRow(ctx, `
 		UPDATE blobs SET refcount = refcount + 1, updated_at = now()
-		WHERE hash = $1 AND refcount > 0 RETURNING size`, hash).Scan(&size)
+		WHERE hash = $1 AND refcount > 0 RETURNING size, COALESCE(md5, '')`, hash).Scan(&size, &md5)
 	if notFound(err) {
-		return 0, false, nil
+		return 0, "", false, nil
 	}
 	if err != nil {
-		return 0, false, apperr.Internal(err)
+		return 0, "", false, apperr.Internal(err)
 	}
-	return size, true, nil
+	return size, md5, true, nil
 }
 
 // ReleaseBlob drops one reference. It never takes the count below zero, so a
@@ -115,12 +122,32 @@ func BlobReferencedInTenant(ctx context.Context, tx pgx.Tx, hash string, tenantI
 	return referenced, nil
 }
 
+// BlobReferencedInNamespace reports whether any object in namespaceID already
+// references hash. A commit writes the bytes of any content new to its
+// namespace, even when the blob is already stored for someone else, so that an
+// upload takes as long whether or not another tenant holds the same content;
+// only content the namespace itself already holds skips the write. See
+// cas.Store.commit.
+func BlobReferencedInNamespace(ctx context.Context, tx pgx.Tx, hash string, namespaceID int64) (bool, error) {
+	var referenced bool
+	err := tx.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM objects WHERE blob_hash = $1 AND namespace_id = $2)`,
+		hash, namespaceID).Scan(&referenced)
+	if err != nil {
+		return false, apperr.Internal(err)
+	}
+	return referenced, nil
+}
+
 // ---------------------------------------------------------------------------
 // Objects
 // ---------------------------------------------------------------------------
 
 // UpsertObject points key at hash, releasing whatever blob it referenced
 // before. It assumes ClaimBlob has already run for hash in this transaction.
+// etag is the object's ETag, unquoted, or "" when it is not known yet (a copy
+// or link of a blob stored before MD5s were recorded), for the backfill to
+// fill in.
 //
 // Releasing the old hash also nets out the double count when an object is
 // overwritten with byte-identical content: the claim incremented, this
@@ -135,7 +162,7 @@ func BlobReferencedInTenant(ctx context.Context, tx pgx.Tx, hash string, tenantI
 // select runs after the lock is granted, so under READ COMMITTED it sees
 // whatever the previous holder committed. Two keys whose hashes collide merely
 // serialise against each other, which is harmless.
-func UpsertObject(ctx context.Context, tx pgx.Tx, namespaceID int64, key, hash string, size int64, contentType string) error {
+func UpsertObject(ctx context.Context, tx pgx.Tx, namespaceID int64, key, hash, etag string, size int64, contentType string) error {
 	_, err := tx.Exec(ctx,
 		"SELECT pg_advisory_xact_lock(hashtextextended($2, $1))", namespaceID, key)
 	if err != nil {
@@ -154,11 +181,11 @@ func UpsertObject(ctx context.Context, tx pgx.Tx, namespaceID int64, key, hash s
 	}
 
 	_, err = tx.Exec(ctx, `
-		INSERT INTO objects (namespace_id, key, blob_hash, size, content_type)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO objects (namespace_id, key, blob_hash, etag, size, content_type)
+		VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6)
 		ON CONFLICT (namespace_id, key) DO UPDATE
-		    SET blob_hash = $3, size = $4, content_type = $5, updated_at = now()`,
-		namespaceID, key, hash, size, contentType)
+		    SET blob_hash = $3, etag = NULLIF($4, ''), size = $5, content_type = $6, updated_at = now()`,
+		namespaceID, key, hash, etag, size, contentType)
 	if err != nil {
 		return apperr.Internal(err)
 	}
@@ -172,7 +199,7 @@ func UpsertObject(ctx context.Context, tx pgx.Tx, namespaceID int64, key, hash s
 // GetObject reads one object's metadata.
 func (d *DB) GetObject(ctx context.Context, namespaceID int64, key string) (ObjectMeta, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT key, blob_hash, size, content_type, updated_at
+		SELECT key, blob_hash, COALESCE(etag, ''), size, content_type, updated_at
 		FROM objects WHERE namespace_id = $1 AND key = $2`, namespaceID, key)
 	if err != nil {
 		return ObjectMeta{}, apperr.Internal(err)
@@ -255,7 +282,7 @@ func (d *DB) ListObjects(ctx context.Context, namespaceID int64, prefix string, 
 outer:
 	for {
 		rows, err := d.pool.Query(ctx, `
-			SELECT key, blob_hash, size, content_type, updated_at
+			SELECT key, blob_hash, COALESCE(etag, ''), size, content_type, updated_at
 			FROM objects
 			WHERE namespace_id = $1 AND key LIKE $2 AND key > $3
 			ORDER BY key

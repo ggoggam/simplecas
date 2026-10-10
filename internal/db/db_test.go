@@ -54,10 +54,10 @@ func mustNamespace(t *testing.T, d *DB, name string, tenantID *int64) int64 {
 func putObject(t *testing.T, d *DB, nsID int64, key, hash string, size int64) {
 	t.Helper()
 	err := d.InTx(t.Context(), func(tx pgx.Tx) error {
-		if _, err := ClaimBlob(t.Context(), tx, hash, size); err != nil {
+		if _, _, err := ClaimBlob(t.Context(), tx, hash, size, ""); err != nil {
 			return err
 		}
-		return UpsertObject(t.Context(), tx, nsID, key, hash, size, "application/octet-stream")
+		return UpsertObject(t.Context(), tx, nsID, key, hash, "", size, "application/octet-stream")
 	})
 	if err != nil {
 		t.Fatalf("put object %s: %v", key, err)

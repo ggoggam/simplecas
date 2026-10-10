@@ -22,8 +22,11 @@ import (
 	"github.com/ggoggam/simplecas/internal/testdb"
 )
 
-// Published BLAKE3 digest of "abc".
+// Published BLAKE3 digest of "abc", the address the PWA links content by.
 const abcHash = "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+
+// abcMD5 is the MD5 of "abc", its ETag.
+const abcMD5 = "900150983cd24fb0d6963f7d28e17f72"
 
 type fixture struct {
 	handler http.Handler
@@ -416,7 +419,7 @@ func TestObjectUploadDownloadDelete(t *testing.T) {
 		"Content-Type", "text/plain")
 	mustStatus(t, w, http.StatusOK)
 	body := decodeObject(t, w)
-	if body["key"] != "cat.txt" || body["etag"] != abcHash || body["size"] != float64(3) {
+	if body["key"] != "cat.txt" || body["etag"] != abcMD5 || body["size"] != float64(3) {
 		t.Errorf("upload response = %#v", body)
 	}
 
@@ -429,7 +432,7 @@ func TestObjectUploadDownloadDelete(t *testing.T) {
 	if got := w.Header().Get("Content-Type"); got != "text/plain" {
 		t.Errorf("Content-Type = %q", got)
 	}
-	if got := w.Header().Get("ETag"); got != `"`+abcHash+`"` {
+	if got := w.Header().Get("ETag"); got != `"`+abcMD5+`"` {
 		t.Errorf("ETag = %q", got)
 	}
 
@@ -536,9 +539,9 @@ func TestListObjectsContract(t *testing.T) {
 				t.Errorf("missing field %q — the PWA reads it: %#v", field, entry)
 			}
 		}
-		// The API reports the bare digest; only the S3 gateway quotes it.
-		if entry["etag"] != abcHash {
-			t.Errorf("etag = %v, want the unquoted digest", entry["etag"])
+		// The API reports the bare ETag; only the S3 gateway quotes it.
+		if entry["etag"] != abcMD5 {
+			t.Errorf("etag = %v, want the unquoted MD5", entry["etag"])
 		}
 	})
 
@@ -620,7 +623,7 @@ func TestLinkEndpoint(t *testing.T) {
 	if body["linked"] != true {
 		t.Fatalf("link = %#v, want linked:true", body)
 	}
-	if body["etag"] != abcHash || body["size"] != float64(3) || body["key"] != "copy.txt" {
+	if body["etag"] != abcMD5 || body["size"] != float64(3) || body["key"] != "copy.txt" {
 		t.Errorf("link response = %#v", body)
 	}
 
@@ -688,10 +691,9 @@ func TestMultipartOverAPI(t *testing.T) {
 		"Content-Type", "application/json")
 	mustStatus(t, w, http.StatusOK)
 	body := decodeObject(t, w)
-	// The assembled object hashes as the whole content, so it dedups against a
-	// single-shot upload of the same bytes.
-	if body["etag"] != abcHash {
-		t.Errorf("etag = %v, want %s", body["etag"], abcHash)
+	// S3's multipart ETag: the MD5 of the parts' MD5s, then the part count.
+	if want := "d833159094d1d7ad96ffcc78414e3682-2"; body["etag"] != want {
+		t.Errorf("etag = %v, want %s", body["etag"], want)
 	}
 	if body["size"] != float64(3) || body["key"] != "big.bin" {
 		t.Errorf("complete response = %#v", body)

@@ -96,13 +96,26 @@ type Namespace struct {
 	TenantID *int64
 }
 
-// ObjectMeta is one stored object's metadata. BlobHash doubles as the ETag.
+// ObjectMeta is one stored object's metadata.
 type ObjectMeta struct {
-	Key         string
-	BlobHash    string
+	Key      string
+	BlobHash string
+	// StoredETag is the recorded S3 ETag, unquoted, or "" for an object
+	// stored before ETags were recorded and not yet backfilled. Clients are
+	// shown ETag(), never this field directly.
+	StoredETag  string
 	Size        int64
 	ContentType string
 	UpdatedAt   time.Time
+}
+
+// ETag is the ETag to serve: the recorded MD5-based one, or for an object the
+// backfill has not reached yet, its BLAKE3 digest as before.
+func (o ObjectMeta) ETag() string {
+	if o.StoredETag != "" {
+		return o.StoredETag
+	}
+	return o.BlobHash
 }
 
 // PartMeta is one staged multipart part.

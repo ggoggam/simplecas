@@ -600,7 +600,7 @@ func (h *Handler) listObjects(w http.ResponseWriter, r *http.Request) {
 		out.Objects = append(out.Objects, objectJSON{
 			Key:          o.Key,
 			Size:         o.Size,
-			ETag:         o.BlobHash,
+			ETag:         o.ETag(),
 			ContentType:  o.ContentType,
 			LastModified: o.UpdatedAt,
 		})
@@ -732,7 +732,7 @@ func (h *Handler) putObject(w http.ResponseWriter, r *http.Request) {
 // in any way, this endpoint would tell a caller what other teams have stored.
 func (h *Handler) linkObject(w http.ResponseWriter, r *http.Request, ns db.Namespace, key, hash string) {
 	contentType := resolveContentType(r, key)
-	size, linked, err := h.cas.LinkBlob(r.Context(), ns.ID, key, hash, contentType, ns.TenantID)
+	size, etag, linked, err := h.cas.LinkBlob(r.Context(), ns.ID, key, hash, contentType, ns.TenantID)
 	if err != nil {
 		h.writeError(w, r, err)
 		return
@@ -742,7 +742,7 @@ func (h *Handler) linkObject(w http.ResponseWriter, r *http.Request, ns db.Names
 		return
 	}
 	h.writeJSON(w, http.StatusOK, map[string]any{
-		"linked": true, "key": key, "etag": hash, "size": size,
+		"linked": true, "key": key, "etag": etag, "size": size,
 	})
 }
 
@@ -769,7 +769,7 @@ func (h *Handler) uploadPart(w http.ResponseWriter, r *http.Request, ns db.Names
 		return
 	}
 	h.writeJSON(w, http.StatusOK, map[string]any{
-		"part_number": partNumber, "etag": staged.Hash,
+		"part_number": partNumber, "etag": staged.ETag,
 	})
 }
 
