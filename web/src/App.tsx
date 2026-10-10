@@ -1079,7 +1079,7 @@ export function BrowserPage() {
             <Field label="Content-Type" value={selected.entry.content_type} />
             <div>
               <div className="mb-1 text-xs text-muted-foreground">
-                blake3 (ETag)
+                ETag
               </div>
               <code className="block rounded-md bg-secondary px-2 py-1 font-mono text-[10px] break-all text-secondary-foreground">
                 {selected.entry.etag}

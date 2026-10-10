@@ -46,7 +46,6 @@ import (
 
 // Tracker rows the known gaps belong to.
 const (
-	gapETag        = "BLAKE3 ETag, no MD5"
 	gapMetadata    = "Metadata dropped; CopyObject ignores REPLACE"
 	gapConditional = "Conditional headers ignored"
 	gapProtocol    = "Listing and protocol details"
@@ -60,7 +59,7 @@ type conformanceCase struct {
 
 var conformanceCases = []conformanceCase{
 	{name: "put get head", run: testPutGetHead},
-	{name: "etag of a single-part object is its MD5", gap: gapETag, run: testSinglePartETag},
+	{name: "etag of a single-part object is its MD5", run: testSinglePartETag},
 	{name: "a wrong Content-MD5 is refused", run: testBadContentMD5},
 	{name: "user metadata round trips", gap: gapMetadata, run: testUserMetadata},
 	{name: "missing key", run: testMissingKey},
@@ -76,7 +75,7 @@ var conformanceCases = []conformanceCase{
 	{name: "copy keeps the content type", run: testCopyKeepsContentType},
 	{name: "copy with REPLACE sets the content type", run: testCopyReplace},
 	{name: "multipart", run: testMultipart},
-	{name: "multipart etag counts its parts", gap: gapETag, run: testMultipartETag},
+	{name: "multipart etag counts its parts", run: testMultipartETag},
 	{name: "a small middle part is refused", gap: gapProtocol, run: testMultipartSmallPart},
 	{name: "a wrong part etag is refused", run: testMultipartWrongETag},
 	{name: "an aborted upload is gone", run: testMultipartAbort},

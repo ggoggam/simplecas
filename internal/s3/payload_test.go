@@ -215,8 +215,8 @@ func TestSwappedBodyUnderSignedHeadersIsRefused(t *testing.T) {
 	// The same request with the bytes it was signed over goes through.
 	w = f.asA(t, http.MethodPut, "/ns-a/doc.txt", "abc", "x-amz-content-sha256", sha256Of("abc"))
 	mustCode(t, w, http.StatusOK, "")
-	if got := w.Header().Get("ETag"); got != quotedETag(abcHash) {
-		t.Errorf("ETag = %s, want %s", got, quotedETag(abcHash))
+	if got := w.Header().Get("ETag"); got != abcETag {
+		t.Errorf("ETag = %s, want %s", got, abcETag)
 	}
 }
 
@@ -329,8 +329,8 @@ func TestSignedStreamingUploadIsVerifiedChunkByChunk(t *testing.T) {
 
 	w = f.signedStream(t, "/ns-a/doc.txt", []string{"ab", "c"}, nil)
 	mustCode(t, w, http.StatusOK, "")
-	if got := w.Header().Get("ETag"); got != quotedETag(abcHash) {
-		t.Errorf("ETag = %s, want %s", got, quotedETag(abcHash))
+	if got := w.Header().Get("ETag"); got != abcETag {
+		t.Errorf("ETag = %s, want %s", got, abcETag)
 	}
 }
 

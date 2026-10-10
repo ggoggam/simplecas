@@ -250,7 +250,7 @@ func TestQuotaAppliesToCopyAndLink(t *testing.T) {
 	if _, err := f.store.CopyObject(ctx, src, nsID, "copy"); !isKind(err, apperr.KindQuotaExceeded) {
 		t.Errorf("copy: err = %v, want QuotaExceeded", err)
 	}
-	if _, _, err := f.store.LinkBlob(ctx, nsID, "link", hashABC, "text/plain", &team); !isKind(err, apperr.KindQuotaExceeded) {
+	if _, _, _, err := f.store.LinkBlob(ctx, nsID, "link", hashABC, "text/plain", &team); !isKind(err, apperr.KindQuotaExceeded) {
 		t.Errorf("link: err = %v, want QuotaExceeded", err)
 	}
 	if got := f.usage(t, team); got != 3 {

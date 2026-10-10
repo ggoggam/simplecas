@@ -229,7 +229,7 @@ func TestGCSweepSkipsRelinkedBlobs(t *testing.T) {
 
 	// A re-upload of the same content claims it back before GC runs.
 	err := d.InTx(ctx, func(tx pgx.Tx) error {
-		_, err := ClaimBlob(ctx, tx, hash, 10)
+		_, _, err := ClaimBlob(ctx, tx, hash, 10, "")
 		return err
 	})
 	if err != nil {
@@ -499,7 +499,7 @@ func openClaim(t *testing.T, d *DB, hash string) (end func(commit bool)) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ClaimBlob(ctx, tx, hash, 10); err != nil {
+	if _, _, err := ClaimBlob(ctx, tx, hash, 10, ""); err != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatal(err)
 	}
@@ -618,7 +618,7 @@ func TestReclaimOrphanBlobHoldsOffANewClaim(t *testing.T) {
 			var c claim
 			c.err = d.InTx(ctx, func(tx pgx.Tx) error {
 				var err error
-				c.needsBytes, err = ClaimBlob(ctx, tx, hash, 10)
+				c.needsBytes, _, err = ClaimBlob(ctx, tx, hash, 10, "")
 				return err
 			})
 			claimed <- c

@@ -2,6 +2,8 @@ package cas
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -22,11 +24,25 @@ import (
 )
 
 // Published BLAKE3 digests, which are also what the PWA's hash-wasm produces —
-// so these pin the ETag contract the client-side dedup path depends on.
+// so these pin the content addresses the client-side dedup path depends on.
 const (
 	hashEmpty = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
 	hashABC   = "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
 )
+
+// md5ABC is the MD5 of "abc", the ETag S3 gives it.
+const md5ABC = "900150983cd24fb0d6963f7d28e17f72"
+
+// multipartETag is the ETag S3 gives a multipart upload of these parts: the
+// MD5 of the parts' MD5s, then "-" and the part count.
+func multipartETag(parts ...string) string {
+	all := md5.New()
+	for _, p := range parts {
+		sum := md5.Sum([]byte(p))
+		all.Write(sum[:])
+	}
+	return fmt.Sprintf("%s-%d", hex.EncodeToString(all.Sum(nil)), len(parts))
+}
 
 // fixture is a Store wired to a scratch database and a scratch bucket
 // (testblob), plus a raw pool for the assertions that need to look behind the
@@ -220,8 +236,8 @@ func TestCommitPublishesAndCleansUp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	if etag != hashABC {
-		t.Errorf("etag = %s, want the content hash %s", etag, hashABC)
+	if etag != md5ABC {
+		t.Errorf("etag = %s, want the content MD5 %s", etag, md5ABC)
 	}
 
 	// The bytes live at their content-addressed home.
@@ -241,7 +257,7 @@ func TestCommitPublishesAndCleansUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if obj.BlobHash != hashABC || obj.Size != 3 || obj.ContentType != "text/plain" {
+	if obj.BlobHash != hashABC || obj.ETag() != md5ABC || obj.Size != 3 || obj.ContentType != "text/plain" {
 		t.Errorf("object = %+v", obj)
 	}
 	if n, _ := f.refcount(t, hashABC); n != 1 {
@@ -272,6 +288,44 @@ func TestCommitDedupStoresBytesOnce(t *testing.T) {
 	}
 	if n := f.countUnder(t, storage.StagingPrefix); n != 0 {
 		t.Errorf("%d staging files remain, want none", n)
+	}
+}
+
+// Dedup is global, so skipping the write for any stored blob would make an
+// upload of content another tenant holds come back faster than one of new
+// content. The bytes are written for any content new to the namespace; only a
+// namespace's own duplicates skip it. The test removes the stored bytes behind
+// the store's back so it can see whether a commit wrote them.
+func TestCommitWritesBytesForContentNewToTheNamespace(t *testing.T) {
+	f := newFixture(t, defaultGC())
+	ctx := t.Context()
+	mine := f.namespace(t, "mine", nil)
+	theirs := f.namespace(t, "theirs", nil)
+
+	if _, err := f.store.Commit(ctx, theirs, "k", "text/plain", f.stage(t, "abc")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.bucket.Delete(ctx, storage.BlobPath(hashABC)); err != nil {
+		t.Fatal(err)
+	}
+
+	// A duplicate inside the namespace that holds the content writes nothing.
+	if _, err := f.store.Commit(ctx, theirs, "again", "text/plain", f.stage(t, "abc")); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := f.bucket.Exists(ctx, storage.BlobPath(hashABC)); ok {
+		t.Fatal("a duplicate within the namespace rewrote the bytes")
+	}
+
+	// The same content in another namespace is written as if it were new.
+	if _, err := f.store.Commit(ctx, mine, "k", "text/plain", f.stage(t, "abc")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.bucket.ReadAll(ctx, storage.BlobPath(hashABC)); err != nil || string(got) != "abc" {
+		t.Errorf("blob = %q, %v; want the bytes written by the first upload into the namespace", got, err)
+	}
+	if n, _ := f.refcount(t, hashABC); n != 3 {
+		t.Errorf("refcount = %d, want 3 — still one shared blob", n)
 	}
 }
 
@@ -336,7 +390,7 @@ func TestCommitRestoresBytesAfterAnInterruptedSweep(t *testing.T) {
 
 	// The link fast path has no bytes to offer and must send the client to
 	// a real upload instead of linking to nothing.
-	_, linked, err := f.store.LinkBlob(ctx, nsID, "linked", hashABC, "text/plain", nil)
+	_, _, linked, err := f.store.LinkBlob(ctx, nsID, "linked", hashABC, "text/plain", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,8 +511,8 @@ func TestCopyObjectMovesNoBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("copy: %v", err)
 	}
-	if etag != hashABC {
-		t.Errorf("etag = %s, want %s", etag, hashABC)
+	if etag != md5ABC {
+		t.Errorf("etag = %s, want %s", etag, md5ABC)
 	}
 	if n := f.countUnder(t, "blobs/"); n != 1 {
 		t.Errorf("%d stored blobs, want 1 — a copy must not duplicate bytes", n)
@@ -505,7 +559,7 @@ func TestLinkBlob(t *testing.T) {
 	nsID := f.namespace(t, "ns", nil)
 
 	// Miss: nothing stored yet, so the client must upload for real.
-	_, linked, err := f.store.LinkBlob(ctx, nsID, "k", hashABC, "text/plain", nil)
+	_, _, linked, err := f.store.LinkBlob(ctx, nsID, "k", hashABC, "text/plain", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +572,7 @@ func TestLinkBlob(t *testing.T) {
 	}
 
 	// Hit: zero bytes transferred, and the size comes from the store.
-	size, linked, err := f.store.LinkBlob(ctx, nsID, "k", hashABC, "text/plain", nil)
+	size, _, linked, err := f.store.LinkBlob(ctx, nsID, "k", hashABC, "text/plain", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -551,7 +605,7 @@ func TestLinkBlobIsTenantScoped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, linked, err := f.store.LinkBlob(ctx, myNS, "guess", hashABC, "text/plain", &mine)
+	_, _, linked, err := f.store.LinkBlob(ctx, myNS, "guess", hashABC, "text/plain", &mine)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -564,7 +618,7 @@ func TestLinkBlobIsTenantScoped(t *testing.T) {
 	}
 
 	// The owning tenant links fine.
-	_, linked, err = f.store.LinkBlob(ctx, theirNS, "again", hashABC, "text/plain", &theirs)
+	_, _, linked, err = f.store.LinkBlob(ctx, theirNS, "again", hashABC, "text/plain", &theirs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -597,7 +651,7 @@ func TestCompleteMultipartConcatenatesInOrder(t *testing.T) {
 	var parts []db.PartMeta
 	for i, body := range []string{"a", "b", "c"} {
 		staged := f.stage(t, body)
-		replaced, err := f.db.PutPart(ctx, uploadID, int32(i+1), staged.StagingKey, staged.Size, staged.Hash, 0)
+		replaced, err := f.db.PutPart(ctx, uploadID, int32(i+1), staged.StagingKey, staged.Size, staged.ETag, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -608,7 +662,7 @@ func TestCompleteMultipartConcatenatesInOrder(t *testing.T) {
 			PartNumber: int32(i + 1),
 			StagingKey: staged.StagingKey,
 			Size:       staged.Size,
-			ETag:       staged.Hash,
+			ETag:       staged.ETag,
 		})
 	}
 
@@ -616,8 +670,8 @@ func TestCompleteMultipartConcatenatesInOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("complete: %v", err)
 	}
-	if etag != hashABC {
-		t.Errorf("etag = %s, want the hash of the whole object %s", etag, hashABC)
+	if want := multipartETag("a", "b", "c"); etag != want {
+		t.Errorf("etag = %s, want %s", etag, want)
 	}
 
 	got, err := f.bucket.ReadAll(ctx, storage.BlobPath(hashABC))
@@ -631,8 +685,8 @@ func TestCompleteMultipartConcatenatesInOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if obj.Size != 3 {
-		t.Errorf("size = %d, want 3", obj.Size)
+	if obj.Size != 3 || obj.BlobHash != hashABC {
+		t.Errorf("object = %+v, want 3 bytes stored as the hash of the whole object %s", obj, hashABC)
 	}
 
 	// The parts and the assembly scratch file are all cleaned up.
@@ -666,12 +720,12 @@ func TestMultipartDedupsAgainstWholeFileUpload(t *testing.T) {
 	var parts []db.PartMeta
 	for i, body := range []string{"ab", "c"} {
 		staged := f.stage(t, body)
-		if _, err := f.db.PutPart(ctx, uploadID, int32(i+1), staged.StagingKey, staged.Size, staged.Hash, 0); err != nil {
+		if _, err := f.db.PutPart(ctx, uploadID, int32(i+1), staged.StagingKey, staged.Size, staged.ETag, 0); err != nil {
 			t.Fatal(err)
 		}
 		parts = append(parts, db.PartMeta{
 			PartNumber: int32(i + 1), StagingKey: staged.StagingKey,
-			Size: staged.Size, ETag: staged.Hash,
+			Size: staged.Size, ETag: staged.ETag,
 		})
 	}
 	if _, err := f.store.CompleteMultipart(ctx, upload, parts); err != nil {

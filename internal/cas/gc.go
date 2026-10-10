@@ -2,6 +2,7 @@ package cas
 
 import (
 	"context"
+	"crypto/md5"
 	"errors"
 	"io"
 	"time"
@@ -23,9 +24,14 @@ const minGCInterval = 5 * time.Second
 // blobs table in one query.
 const orphanPage = 1000
 
+// etagBatch caps how many blobs one ETag backfill pass reads, so a large
+// store stored before ETags were recorded is worked through over many ticks.
+const etagBatch = 16
+
 // RunGC reclaims space until ctx is cancelled: unreferenced blobs, orphaned
 // staging files, abandoned multipart uploads, and expired sign-in sessions on
 // every tick, and stored bytes no blob row accounts for every orphan interval.
+// Each tick also records ETags for some objects stored before they were.
 // Every pass is best-effort — a failure is logged and retried on the next tick
 // rather than ending the loop, because a transient database or backend blip
 // must not silently stop reclamation for the lifetime of the process.
@@ -54,6 +60,7 @@ func (s *Store) RunGC(ctx context.Context) {
 		s.sweepStaging(ctx)
 		s.sweepMultipart(ctx)
 		s.sweepSessions(ctx)
+		s.backfillETags(ctx)
 		if time.Since(lastOrphanSweep) >= orphanInterval {
 			s.sweepOrphanBlobs(ctx)
 			lastOrphanSweep = time.Now()
@@ -75,6 +82,58 @@ func (s *Store) sweepBlobs(ctx context.Context) {
 	if swept > 0 {
 		s.log.Info("gc: removed unreferenced blobs", "swept", swept)
 	}
+}
+
+// backfillETags gives objects stored before ETags were recorded their MD5
+// ETag, reading each blob whose MD5 is not known yet. Until then such an
+// object is served with its BLAKE3 digest, which global dedup makes worth
+// hiding (see the package comment).
+func (s *Store) backfillETags(ctx context.Context) {
+	pending, err := s.db.ETagsToBackfill(ctx, etagBatch)
+	if err != nil {
+		if ctx.Err() == nil {
+			s.log.Warn("etag backfill failed", "err", err)
+		}
+		return
+	}
+
+	var filled int
+	for _, p := range pending {
+		sum := p.MD5
+		if sum == "" {
+			if sum, err = s.blobMD5(ctx, p.Hash); err != nil {
+				if ctx.Err() == nil {
+					s.log.Warn("etag backfill could not read blob", "hash", p.Hash, "err", err)
+				}
+				continue
+			}
+		}
+		if err := s.db.RecordBlobMD5(ctx, p.Hash, sum); err != nil {
+			if ctx.Err() == nil {
+				s.log.Warn("etag backfill could not record md5", "hash", p.Hash, "err", err)
+			}
+			continue
+		}
+		filled++
+	}
+
+	if filled > 0 {
+		s.log.Info("gc: recorded etags for blobs stored before them", "blobs", filled)
+	}
+}
+
+// blobMD5 reads a stored blob and returns its hex MD5.
+func (s *Store) blobMD5(ctx context.Context, hash string) (string, error) {
+	r, err := s.blob.NewReader(ctx, storage.BlobPath(hash), nil)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = r.Close() }()
+	h := md5.New()
+	if _, err := io.Copy(h, r); err != nil {
+		return "", err
+	}
+	return hexSum(h), nil
 }
 
 // sweepStaging deletes staging files older than the grace period that no live
