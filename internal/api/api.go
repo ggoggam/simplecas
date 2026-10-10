@@ -104,6 +104,8 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("POST /api/tenants/{tenant}/credentials", h.createCredential)
 	mux.HandleFunc("DELETE /api/tenants/{tenant}/credentials/{accessKeyId}", h.deleteCredential)
 
+	mux.HandleFunc("GET /api/tenants/{tenant}/audit", h.listAuditEvents)
+
 	mux.HandleFunc("GET /api/namespaces", h.listNamespaces)
 	mux.HandleFunc("POST /api/namespaces", h.createNamespace)
 	mux.HandleFunc("DELETE /api/namespaces/{namespace}", h.deleteNamespace)
@@ -169,9 +171,11 @@ type userContextKey struct{}
 // identity, creating the user on first sight.
 func (h *Handler) identify(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestID := w.Header().Get(apperr.RequestIDHeader)
 		session := auth.FromContext(r.Context())
 		if session == nil {
-			next.ServeHTTP(w, r)
+			// The open plane: changes are recorded with no actor.
+			next.ServeHTTP(w, r.WithContext(db.WithActor(r.Context(), db.Actor{RequestID: requestID})))
 			return
 		}
 		if session.Issuer == "" || session.Subject == "" {
@@ -188,7 +192,9 @@ func (h *Handler) identify(next http.Handler) http.Handler {
 				return
 			}
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userContextKey{}, user)))
+		ctx := context.WithValue(r.Context(), userContextKey{}, user)
+		ctx = db.WithActor(ctx, db.Actor{UserID: &user.ID, Email: user.Email, RequestID: requestID})
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 

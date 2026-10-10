@@ -30,23 +30,30 @@ const invitationColumns = `t.name, i.email, i.role, COALESCE(u.email, ''), i.cre
 // address that already has a pending invitation replaces it — new role, new
 // inviter, a fresh expiry — so re-sending is how an owner extends one.
 func (d *DB) Invite(ctx context.Context, tenantID int64, email, role string, invitedBy int64, ttl time.Duration) error {
-	return d.InTx(ctx, func(tx pgx.Tx) error {
+	return d.audited(ctx, func(tx pgx.Tx, record recordFunc) error {
 		_, err := tx.Exec(ctx, `
 			DELETE FROM tenant_invitations
 			WHERE tenant_id = $1 AND expires_at <= now()`, tenantID)
 		if err != nil {
 			return apperr.Internal(err)
 		}
-		_, err = tx.Exec(ctx, `
+		var expiresAt time.Time
+		err = tx.QueryRow(ctx, `
 			INSERT INTO tenant_invitations (tenant_id, email, role, invited_by, expires_at)
 			VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))
 			ON CONFLICT (tenant_id, email) DO UPDATE SET
 			    role       = EXCLUDED.role,
 			    invited_by = EXCLUDED.invited_by,
 			    created_at = now(),
-			    expires_at = EXCLUDED.expires_at`,
-			tenantID, email, role, invitedBy, ttl.Seconds())
-		return apperr.Internal(err)
+			    expires_at = EXCLUDED.expires_at
+			RETURNING expires_at`,
+			tenantID, email, role, invitedBy, ttl.Seconds()).Scan(&expiresAt)
+		if err != nil {
+			return apperr.Internal(err)
+		}
+		return record(&tenantID, EventInvitationCreate, email, map[string]any{
+			"role": role, "expires_at": expiresAt.UTC(),
+		})
 	})
 }
 
@@ -79,10 +86,19 @@ func (d *DB) PendingInvitations(ctx context.Context, email string) ([]Invitation
 // RevokeInvitation withdraws a pending invitation. Withdrawing one that does
 // not exist succeeds, so the call is idempotent.
 func (d *DB) RevokeInvitation(ctx context.Context, tenantID int64, email string) error {
-	_, err := d.pool.Exec(ctx,
-		"DELETE FROM tenant_invitations WHERE tenant_id = $1 AND email = $2",
-		tenantID, email)
-	return apperr.Internal(err)
+	return d.audited(ctx, func(tx pgx.Tx, record recordFunc) error {
+		var role string
+		err := tx.QueryRow(ctx,
+			"DELETE FROM tenant_invitations WHERE tenant_id = $1 AND email = $2 RETURNING role",
+			tenantID, email).Scan(&role)
+		if notFound(err) {
+			return nil
+		}
+		if err != nil {
+			return apperr.Internal(err)
+		}
+		return record(&tenantID, EventInvitationRevoke, email, map[string]any{"role": role})
+	})
 }
 
 // AcceptInvitation turns the live invitation of email to tenantName into a
@@ -93,7 +109,7 @@ func (d *DB) RevokeInvitation(ctx context.Context, tenantID int64, email string)
 // people, and changing a member's role is SetMemberRole's job, with its
 // last-owner check.
 func (d *DB) AcceptInvitation(ctx context.Context, tenantName, email string, userID int64) error {
-	return d.InTx(ctx, func(tx pgx.Tx) error {
+	return d.audited(ctx, func(tx pgx.Tx, record recordFunc) error {
 		var (
 			tenantID int64
 			role     string
@@ -113,7 +129,7 @@ func (d *DB) AcceptInvitation(ctx context.Context, tenantName, email string, use
 			return apperr.Internal(err)
 		}
 
-		_, err = tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO tenant_members (tenant_id, user_id, role) VALUES ($1, $2, $3)
 			ON CONFLICT (tenant_id, user_id) DO NOTHING`,
 			tenantID, userID, role)
@@ -123,22 +139,36 @@ func (d *DB) AcceptInvitation(ctx context.Context, tenantName, email string, use
 		_, err = tx.Exec(ctx,
 			"DELETE FROM tenant_invitations WHERE tenant_id = $1 AND email = $2",
 			tenantID, email)
-		return apperr.Internal(err)
+		if err != nil {
+			return apperr.Internal(err)
+		}
+		// joined is false for someone who was already a member, whose role
+		// the invitation did not change.
+		return record(&tenantID, EventInvitationAccept, email, map[string]any{
+			"user_id": userID, "role": role, "joined": tag.RowsAffected() == 1,
+		})
 	})
 }
 
 // DeclineInvitation discards the live invitation of email to tenantName.
 func (d *DB) DeclineInvitation(ctx context.Context, tenantName, email string) error {
-	tag, err := d.pool.Exec(ctx, `
-		DELETE FROM tenant_invitations i
-		USING tenants t
-		WHERE t.id = i.tenant_id AND t.name = $1 AND i.email = $2 AND `+unexpired,
-		tenantName, email)
-	if err != nil {
-		return apperr.Internal(err)
-	}
-	if tag.RowsAffected() == 0 {
-		return apperr.ErrNoSuchInvitation
-	}
-	return nil
+	return d.audited(ctx, func(tx pgx.Tx, record recordFunc) error {
+		var (
+			tenantID int64
+			role     string
+		)
+		err := tx.QueryRow(ctx, `
+			DELETE FROM tenant_invitations i
+			USING tenants t
+			WHERE t.id = i.tenant_id AND t.name = $1 AND i.email = $2 AND `+unexpired+`
+			RETURNING i.tenant_id, i.role`,
+			tenantName, email).Scan(&tenantID, &role)
+		if notFound(err) {
+			return apperr.ErrNoSuchInvitation
+		}
+		if err != nil {
+			return apperr.Internal(err)
+		}
+		return record(&tenantID, EventInvitationDecline, email, map[string]any{"role": role})
+	})
 }

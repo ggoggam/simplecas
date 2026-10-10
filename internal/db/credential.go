@@ -95,14 +95,26 @@ func (d *DB) LookupS3Credential(ctx context.Context, accessKeyID string) (S3Cred
 // CreateS3Credential stores a freshly minted key. Its scope arrives already
 // checked against the team's namespaces; the table only holds it to shape.
 func (d *DB) CreateS3Credential(ctx context.Context, c NewS3Credential) error {
-	_, err := d.pool.Exec(ctx, `
-		INSERT INTO tenant_credentials
-		    (access_key_id, tenant_id, secret_key_id, secret_sealed, description, created_by, expires_at,
-		     permissions, namespaces)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		c.AccessKeyID, c.TenantID, c.KeyID, c.Sealed, c.Description, c.CreatedBy, c.ExpiresAt,
-		c.Scope.Permissions, c.Scope.Namespaces)
-	return apperr.Internal(err)
+	return d.audited(ctx, func(tx pgx.Tx, record recordFunc) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO tenant_credentials
+			    (access_key_id, tenant_id, secret_key_id, secret_sealed, description, created_by, expires_at,
+			     permissions, namespaces)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			c.AccessKeyID, c.TenantID, c.KeyID, c.Sealed, c.Description, c.CreatedBy, c.ExpiresAt,
+			c.Scope.Permissions, c.Scope.Namespaces)
+		if err != nil {
+			return apperr.Internal(err)
+		}
+		// The scope as stored: null namespaces reach every one the team owns,
+		// and a null expires_at never expires.
+		return record(&c.TenantID, EventCredentialCreate, c.AccessKeyID, map[string]any{
+			"description": c.Description,
+			"permissions": c.Scope.Permissions,
+			"namespaces":  c.Scope.Namespaces,
+			"expires_at":  c.ExpiresAt,
+		})
+	})
 }
 
 // ListS3Credentials returns tenantID's keys, newest first, without secrets.
@@ -140,16 +152,18 @@ func (d *DB) TouchS3Credential(ctx context.Context, accessKeyID string, touchAft
 // Revoking a key that is not theirs (or not there) reports NotFound rather than
 // succeeding silently, so the UI can tell a real revocation from a no-op.
 func (d *DB) DeleteS3Credential(ctx context.Context, tenantID int64, accessKeyID string) error {
-	tag, err := d.pool.Exec(ctx,
-		"DELETE FROM tenant_credentials WHERE tenant_id = $1 AND access_key_id = $2",
-		tenantID, accessKeyID)
-	if err != nil {
-		return apperr.Internal(err)
-	}
-	if tag.RowsAffected() == 0 {
-		return apperr.ErrNoSuchCredential
-	}
-	return nil
+	return d.audited(ctx, func(tx pgx.Tx, record recordFunc) error {
+		tag, err := tx.Exec(ctx,
+			"DELETE FROM tenant_credentials WHERE tenant_id = $1 AND access_key_id = $2",
+			tenantID, accessKeyID)
+		if err != nil {
+			return apperr.Internal(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return apperr.ErrNoSuchCredential
+		}
+		return record(&tenantID, EventCredentialRevoke, accessKeyID, nil)
+	})
 }
 
 // S3CredentialsToSeal returns every key whose secret is not sealed under

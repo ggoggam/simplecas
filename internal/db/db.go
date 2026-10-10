@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -23,6 +24,8 @@ import (
 // DB is a handle on the metadata store.
 type DB struct {
 	pool *pgxpool.Pool
+	// auditLog, when set, receives each committed audit event (see audit.go).
+	auditLog *slog.Logger
 }
 
 // Connect opens the pool and brings the schema up to date. It fails fast on an

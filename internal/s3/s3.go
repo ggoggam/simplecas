@@ -110,7 +110,11 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.writeError(w, r, err)
 		return
 	}
-	r = r.WithContext(withPrincipal(r.Context(), p))
+	ctx := db.WithActor(withPrincipal(r.Context(), p), db.Actor{
+		AccessKeyID: p.accessKeyID,
+		RequestID:   w.Header().Get(apperr.RequestIDHeader),
+	})
+	r = r.WithContext(ctx)
 	r.Body = body
 
 	namespace, key, err := splitPath(r.URL.EscapedPath())

@@ -100,26 +100,31 @@ func (d *DB) GetNamespaceForTenant(ctx context.Context, name string, tenantID in
 // the name; the caller decides, through its own scoping, whether to tell its
 // principal the namespace is theirs.
 func (d *DB) CreateNamespace(ctx context.Context, name string, tenantID *int64) error {
-	tag, err := d.pool.Exec(ctx,
-		"INSERT INTO namespaces (name, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-		name, tenantID)
-	if err != nil {
-		return apperr.Internal(err)
-	}
-	if tag.RowsAffected() == 0 {
-		return apperr.ErrNamespaceAlreadyExists
-	}
-	return nil
+	return d.audited(ctx, func(tx pgx.Tx, record recordFunc) error {
+		tag, err := tx.Exec(ctx,
+			"INSERT INTO namespaces (name, tenant_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+			name, tenantID)
+		if err != nil {
+			return apperr.Internal(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return apperr.ErrNamespaceAlreadyExists
+		}
+		return record(tenantID, EventNamespaceCreate, name, nil)
+	})
 }
 
 // DeleteNamespace removes an empty namespace. S3 semantics: deleting one that
 // still holds objects is a conflict, not a cascade. The row is locked first so
 // a concurrent upload cannot slip an object in between the check and the delete.
 func (d *DB) DeleteNamespace(ctx context.Context, name string) error {
-	return d.InTx(ctx, func(tx pgx.Tx) error {
-		var id int64
+	return d.audited(ctx, func(tx pgx.Tx, record recordFunc) error {
+		var (
+			id       int64
+			tenantID *int64
+		)
 		err := tx.QueryRow(ctx,
-			"SELECT id FROM namespaces WHERE name = $1 FOR UPDATE", name).Scan(&id)
+			"SELECT id, tenant_id FROM namespaces WHERE name = $1 FOR UPDATE", name).Scan(&id, &tenantID)
 		if notFound(err) {
 			return apperr.ErrNoSuchNamespace
 		}
@@ -138,6 +143,9 @@ func (d *DB) DeleteNamespace(ctx context.Context, name string) error {
 		}
 
 		_, err = tx.Exec(ctx, "DELETE FROM namespaces WHERE id = $1", id)
-		return apperr.Internal(err)
+		if err != nil {
+			return apperr.Internal(err)
+		}
+		return record(tenantID, EventNamespaceDelete, name, nil)
 	})
 }

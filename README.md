@@ -353,6 +353,7 @@ API (JSON, cookie-authenticated):
 | `DELETE /api/tenants/{team}/invitations/{email}` | owners | withdraw |
 | `GET /api/invitations` | any user | invitations addressed to your verified email |
 | `POST /api/invitations/{team}/accept`, `…/decline` | the invitee | answer one |
+| `GET /api/tenants/{team}/audit` | owners | the team's [audit log](#audit-log), newest first |
 
 Creating a namespace (`POST /api/namespaces`) takes a `tenant` field naming the
 owning team.
@@ -475,6 +476,75 @@ Tenanted S3 access requires `[auth] enabled = true`, and with OIDC on the server
 will not start without it. With auth off (and OIDC off) there are no credentials
 to tell apart, so the gateway is the open admin plane it has always been
 (`aws s3 --no-sign-request`).
+
+### Audit log
+
+Every change to who can reach a team's data is recorded: creating or deleting
+the team, role changes and removals, invitations sent, withdrawn, accepted and
+declined, S3 keys minted and revoked, and namespaces created or deleted from
+`/api` or over S3. Each event is written in the same transaction as the change,
+so it exists exactly when the change committed; a call that changes nothing
+(setting a role someone already has) records nothing. Object reads and writes
+are not recorded.
+
+Owners read it from **Activity** in the team dialog, or as JSON:
+
+```
+GET /api/tenants/{team}/audit?limit=50&before=<id>
+```
+
+```json
+{
+  "events": [
+    {
+      "id": 812,
+      "at": "2026-10-10T09:12:44.103Z",
+      "action": "member.role",
+      "actor_user_id": 3,
+      "actor_email": "boss@example.com",
+      "actor_access_key_id": "",
+      "request_id": "C20D46457CD0121B",
+      "target": "7",
+      "details": {"email": "dev@example.com", "from": "member", "to": "owner"}
+    }
+  ],
+  "next_before": 811
+}
+```
+
+`limit` is 1–500 (default 50); pass `next_before` back as `before` for the next,
+older page (`null` on the last). Every event has the same keys:
+
+| Action | `target` | `details` |
+| --- | --- | --- |
+| `tenant.create`, `tenant.delete` | team name | `owner_user_id` on create |
+| `member.role` | member's user id | `email`, `from`, `to` |
+| `member.remove` | member's user id | `email`, `role` (actor = target: they left) |
+| `invitation.create` | invited address | `role`, `expires_at` |
+| `invitation.revoke`, `invitation.decline` | invited address | `role` |
+| `invitation.accept` | invited address | `user_id`, `role`, `joined` (false if already a member) |
+| `credential.create` | access key id | `description`, `permissions`, `namespaces`, `expires_at` |
+| `credential.revoke` | access key id | |
+| `namespace.create`, `namespace.delete` | namespace name | |
+
+The actor is a signed-in user (`actor_user_id`, `actor_email`), or the S3 key
+that signed the request (`actor_access_key_id`, the admin credential's id
+included), or neither for a change through an open plane. `request_id` matches
+the `X-Amz-Request-Id` the response carried. A team's events outlive it, so
+deleting a team keeps the record of who deleted it; a new team with the same
+name starts with an empty log. Changes to unowned namespaces are recorded with
+no team.
+
+The server also logs each committed event as one line with message `audit` and
+the same keys under `audit.`, for shipping to a log pipeline. The default is
+logfmt; set `LOG_FORMAT=json` for one JSON object per line:
+
+```
+level=INFO msg=audit audit.id=812 audit.action=member.role audit.tenant_id=2 audit.actor_user_id=3 audit.actor_email=boss@example.com audit.actor_access_key_id="" audit.request_id=C20D46457CD0121B audit.target=7 audit.details="{\"email\":\"dev@example.com\",\"from\":\"member\",\"to\":\"owner\"}"
+```
+
+`audit.tenant_id` and `audit.actor_user_id` are left out when null. Events are
+kept indefinitely; there is no retention setting yet.
 
 ## S3 gateway
 
@@ -637,7 +707,7 @@ internal/
   apperr/            error type carrying an S3 code + HTTP status; XML and JSON rendering
   config/            layered TOML + SIMPLECAS__ env config; backend selection
   storage/           blob backend construction + the blobs/ and staging/ layout
-  db/                all SQL: namespaces, users, sessions, tenants + invitations, blobs/refcounts, objects, multipart, GC
+  db/                all SQL: namespaces, users, sessions, tenants + invitations, audit log, blobs/refcounts, objects, multipart, GC
   db/migrations/     embedded SQL migrations (run automatically on boot)
   cas/               content-addressed write path (stage → claim → commit) and the GC loop
   s3/                S3 gateway: handlers, XML wire types, SigV4 verification

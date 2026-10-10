@@ -114,6 +114,32 @@ export interface CreatedCredential {
   namespaces: string[] | null;
 }
 
+/**
+ * One change to a team, from its audit log. Every event has the same keys; what
+ * `details` holds depends on `action`.
+ */
+export interface AuditEvent {
+  id: number;
+  at: string;
+  /** e.g. "member.role", "credential.create", "namespace.delete". */
+  action: string;
+  /** Null for a change made with an S3 key or with sign-in off. */
+  actor_user_id: number | null;
+  actor_email: string;
+  /** The S3 key that made the change, or "" for a signed-in user. */
+  actor_access_key_id: string;
+  request_id: string;
+  /** A team or namespace name, an address, a key id, or a member's id. */
+  target: string;
+  details: Record<string, unknown>;
+}
+
+export interface AuditPage {
+  events: AuditEvent[];
+  /** Pass as `before` for the next, older page; null on the last one. */
+  next_before: number | null;
+}
+
 export interface ObjectEntry {
   key: string;
   size: number;
@@ -368,6 +394,14 @@ export const api = {
       `/api/tenants/${encodeURIComponent(tenant)}/credentials/${encodeURIComponent(accessKeyId)}`,
       { method: "DELETE" },
     );
+  },
+
+  // A team's audit log, newest first. Owner-only, like the key listing.
+  async listAuditEvents(tenant: string, before?: number): Promise<AuditPage> {
+    const q = before ? `?before=${before}` : "";
+    return (
+      await req(`/api/tenants/${encodeURIComponent(tenant)}/audit${q}`)
+    ).json();
   },
 
   // `tenant` scopes the listing to one team; omit for the untenanted view.
