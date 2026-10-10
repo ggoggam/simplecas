@@ -80,7 +80,7 @@ func (d *DB) TenantRole(ctx context.Context, tenantID, userID int64) (role strin
 // together, so a tenant never exists without an owner.
 func (d *DB) CreateTenant(ctx context.Context, name string, ownerID int64) (int64, error) {
 	var id int64
-	err := d.InTx(ctx, func(tx pgx.Tx) error {
+	err := d.audited(ctx, func(tx pgx.Tx, record recordFunc) error {
 		err := tx.QueryRow(ctx,
 			"INSERT INTO tenants (name) VALUES ($1) ON CONFLICT DO NOTHING RETURNING id",
 			name).Scan(&id)
@@ -93,7 +93,10 @@ func (d *DB) CreateTenant(ctx context.Context, name string, ownerID int64) (int6
 		_, err = tx.Exec(ctx,
 			"INSERT INTO tenant_members (tenant_id, user_id, role) VALUES ($1, $2, 'owner')",
 			id, ownerID)
-		return apperr.Internal(err)
+		if err != nil {
+			return apperr.Internal(err)
+		}
+		return record(&id, EventTenantCreate, name, map[string]any{"owner_user_id": ownerID})
 	})
 	if err != nil {
 		return 0, err
@@ -151,14 +154,15 @@ func otherOwners(ctx context.Context, tx pgx.Tx, tenantID, userID int64) (int64,
 // SetMemberRole changes an existing member's role, refusing to demote a
 // tenant's last owner — which would leave it unmanageable.
 func (d *DB) SetMemberRole(ctx context.Context, tenantID, userID int64, role string) error {
-	return d.InTx(ctx, func(tx pgx.Tx) error {
+	return d.audited(ctx, func(tx pgx.Tx, record recordFunc) error {
 		if err := lockTenant(ctx, tx, tenantID); err != nil {
 			return err
 		}
-		var current string
-		err := tx.QueryRow(ctx,
-			"SELECT role FROM tenant_members WHERE tenant_id = $1 AND user_id = $2",
-			tenantID, userID).Scan(&current)
+		var current, email string
+		err := tx.QueryRow(ctx, `
+			SELECT m.role, u.email FROM tenant_members m JOIN users u ON u.id = m.user_id
+			WHERE m.tenant_id = $1 AND m.user_id = $2`,
+			tenantID, userID).Scan(&current, &email)
 		if notFound(err) {
 			return apperr.ErrNoSuchMember
 		}
@@ -182,21 +186,27 @@ func (d *DB) SetMemberRole(ctx context.Context, tenantID, userID int64, role str
 		_, err = tx.Exec(ctx,
 			"UPDATE tenant_members SET role = $3 WHERE tenant_id = $1 AND user_id = $2",
 			tenantID, userID, role)
-		return apperr.Internal(err)
+		if err != nil {
+			return apperr.Internal(err)
+		}
+		return record(&tenantID, EventMemberRole, userTarget(userID), map[string]any{
+			"email": email, "from": current, "to": role,
+		})
 	})
 }
 
 // RemoveMember removes a member, refusing to strip a tenant of its last owner.
 // Removing someone who is not a member succeeds, so the call is idempotent.
 func (d *DB) RemoveMember(ctx context.Context, tenantID, userID int64) error {
-	return d.InTx(ctx, func(tx pgx.Tx) error {
+	return d.audited(ctx, func(tx pgx.Tx, record recordFunc) error {
 		if err := lockTenant(ctx, tx, tenantID); err != nil {
 			return err
 		}
-		var role string
-		err := tx.QueryRow(ctx,
-			"SELECT role FROM tenant_members WHERE tenant_id = $1 AND user_id = $2",
-			tenantID, userID).Scan(&role)
+		var role, email string
+		err := tx.QueryRow(ctx, `
+			SELECT m.role, u.email FROM tenant_members m JOIN users u ON u.id = m.user_id
+			WHERE m.tenant_id = $1 AND m.user_id = $2`,
+			tenantID, userID).Scan(&role, &email)
 		if notFound(err) {
 			return nil
 		}
@@ -217,7 +227,12 @@ func (d *DB) RemoveMember(ctx context.Context, tenantID, userID int64) error {
 		_, err = tx.Exec(ctx,
 			"DELETE FROM tenant_members WHERE tenant_id = $1 AND user_id = $2",
 			tenantID, userID)
-		return apperr.Internal(err)
+		if err != nil {
+			return apperr.Internal(err)
+		}
+		return record(&tenantID, EventMemberRemove, userTarget(userID), map[string]any{
+			"email": email, "role": role,
+		})
 	})
 }
 
@@ -225,7 +240,7 @@ func (d *DB) RemoveMember(ctx context.Context, tenantID, userID int64) error {
 // credentials cascade. A tenant that still owns namespaces is a conflict,
 // mirroring non-empty namespace deletion.
 func (d *DB) DeleteTenant(ctx context.Context, tenantID int64) error {
-	return d.InTx(ctx, func(tx pgx.Tx) error {
+	return d.audited(ctx, func(tx pgx.Tx, record recordFunc) error {
 		var occupied bool
 		err := tx.QueryRow(ctx,
 			"SELECT EXISTS(SELECT 1 FROM namespaces WHERE tenant_id = $1)",
@@ -236,7 +251,14 @@ func (d *DB) DeleteTenant(ctx context.Context, tenantID int64) error {
 		if occupied {
 			return apperr.ErrTenantNotEmpty
 		}
-		_, err = tx.Exec(ctx, "DELETE FROM tenants WHERE id = $1", tenantID)
-		return apperr.Internal(err)
+		var name string
+		err = tx.QueryRow(ctx, "DELETE FROM tenants WHERE id = $1 RETURNING name", tenantID).Scan(&name)
+		if notFound(err) {
+			return apperr.ErrNoSuchTenant
+		}
+		if err != nil {
+			return apperr.Internal(err)
+		}
+		return record(&tenantID, EventTenantDelete, name, nil)
 	})
 }

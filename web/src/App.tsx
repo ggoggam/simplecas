@@ -7,6 +7,7 @@ import { useTheme } from "@/lib/theme";
 import {
   api,
   formatBytes,
+  type AuditEvent,
   type CreatedCredential,
   type Credential,
   type Permission,
@@ -50,6 +51,7 @@ import {
   Folder,
   FolderOpen,
   HardDrive,
+  History,
   Key,
   Layers,
   Eye,
@@ -175,6 +177,50 @@ function credentialStatus(c: Credential): string {
   return parts.join(" · ");
 }
 
+/** One audit event as a line: what happened, to what. */
+function auditSummary(e: AuditEvent): string {
+  const d = e.details;
+  const who = typeof d.email === "string" && d.email ? d.email : e.target;
+  switch (e.action) {
+    case "tenant.create":
+      return `created team ${e.target}`;
+    case "tenant.delete":
+      return `deleted team ${e.target}`;
+    case "member.role":
+      return `changed ${who} from ${d.from} to ${d.to}`;
+    case "member.remove":
+      return e.actor_user_id !== null && String(e.actor_user_id) === e.target
+        ? "left the team"
+        : `removed ${who}`;
+    case "invitation.create":
+      return `invited ${e.target} as ${d.role}`;
+    case "invitation.revoke":
+      return `withdrew the invitation to ${e.target}`;
+    case "invitation.accept":
+      return d.joined ? `joined as ${d.role}` : "accepted an invitation";
+    case "invitation.decline":
+      return `declined the invitation to ${e.target}`;
+    case "credential.create":
+      return `created S3 key ${e.target}`;
+    case "credential.revoke":
+      return `revoked S3 key ${e.target}`;
+    case "namespace.create":
+      return `created namespace ${e.target}`;
+    case "namespace.delete":
+      return `deleted namespace ${e.target}`;
+    default:
+      return `${e.action} ${e.target}`;
+  }
+}
+
+/** Who made an audited change, for its row in the activity list. */
+function auditActor(e: AuditEvent): string {
+  if (e.actor_access_key_id) return `key ${e.actor_access_key_id}`;
+  if (e.actor_email) return e.actor_email;
+  if (e.actor_user_id !== null) return `user ${e.actor_user_id}`;
+  return "someone";
+}
+
 /** Track a CSS media query, re-rendering on change. */
 function useMediaQuery(query: string): boolean {
   const [matches, setMatches] = useState(
@@ -283,6 +329,10 @@ export function BrowserPage() {
   // stores the secret but never returns it again, so losing this means minting
   // a replacement.
   const [freshKey, setFreshKey] = useState<CreatedCredential | null>(null);
+  // The active team's audit log (owners only), newest first, a page at a time.
+  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+  const [auditNext, setAuditNext] = useState<number | null>(null);
+  const [auditLoading, setAuditLoading] = useState(false);
 
   const activeRole = useMemo(
     () => teams.find((t) => t.name === activeTeam)?.role ?? null,
@@ -520,6 +570,26 @@ export function BrowserPage() {
     }
   }, [activeTeam]);
 
+  // Loads the newest page, or with `before`, appends the next older one.
+  const loadAudit = useCallback(
+    async (before?: number) => {
+      if (!activeTeam) return;
+      setAuditLoading(true);
+      try {
+        const page = await api.listAuditEvents(activeTeam, before);
+        setAuditEvents((prev) =>
+          before ? [...prev, ...page.events] : page.events,
+        );
+        setAuditNext(page.next_before);
+      } catch (e) {
+        toast.error(`activity: ${(e as Error).message}`);
+      } finally {
+        setAuditLoading(false);
+      }
+    },
+    [activeTeam],
+  );
+
   const openTeamDialog = () => {
     if (!activeTeam) return;
     setInviteEmail("");
@@ -530,11 +600,14 @@ export function BrowserPage() {
     setKeyNamespace("");
     setFreshKey(null);
     setSentInvitations([]);
+    setAuditEvents([]);
+    setAuditNext(null);
     setTeamDialogOpen(true);
     loadMembers();
     if (activeRole === "owner") {
       loadSentInvitations();
       loadCredentials();
+      loadAudit();
     }
   };
 
@@ -1927,6 +2000,54 @@ export function BrowserPage() {
                     <option value="365">1 year</option>
                     <option value="">No expiry</option>
                   </select>
+                </div>
+              </div>
+            )}
+
+            {activeRole === "owner" && (
+              <div className="space-y-2 border-t pt-3">
+                <div>
+                  <h4 className="flex items-center gap-1.5 text-sm font-medium">
+                    <History className="size-3.5" /> Activity
+                  </h4>
+                  <p className="text-xs text-muted-foreground">
+                    Changes to this team’s members, invitations, keys and
+                    namespaces, newest first.
+                  </p>
+                </div>
+                <div className="max-h-48 overflow-y-auto rounded-md border">
+                  {auditEvents.length === 0 ? (
+                    <p className="py-4 text-center text-xs text-muted-foreground">
+                      {auditLoading ? "Loading…" : "No activity"}
+                    </p>
+                  ) : (
+                    <>
+                      {auditEvents.map((e) => (
+                        <div
+                          key={e.id}
+                          className="border-b px-3 py-1.5 text-xs last:border-b-0"
+                          title={e.request_id ? `request ${e.request_id}` : undefined}
+                        >
+                          <div className="truncate">
+                            <span className="font-medium">{auditActor(e)}</span>{" "}
+                            {auditSummary(e)}
+                          </div>
+                          <div className="text-muted-foreground">
+                            {new Date(e.at).toLocaleString()}
+                          </div>
+                        </div>
+                      ))}
+                      {auditNext !== null && (
+                        <button
+                          className="w-full py-1.5 text-xs text-muted-foreground hover:text-foreground"
+                          disabled={auditLoading}
+                          onClick={() => loadAudit(auditNext)}
+                        >
+                          {auditLoading ? "Loading…" : "Load older"}
+                        </button>
+                      )}
+                    </>
+                  )}
                 </div>
               </div>
             )}

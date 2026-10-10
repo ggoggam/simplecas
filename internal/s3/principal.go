@@ -20,8 +20,11 @@ import (
 // holds no permissions, so a principal is only ever as capable as the code
 // that built it said.
 type principal struct {
-	tenantID *int64
-	perms    permSet
+	// accessKeyID is the key that signed the request, which the audit log
+	// attributes changes to. It is empty only with auth disabled.
+	accessKeyID string
+	tenantID    *int64
+	perms       permSet
 	// namespaces is nil when the principal reaches every namespace it
 	// could address at all; otherwise the names of the only ones it reaches.
 	namespaces map[string]struct{}
@@ -38,7 +41,7 @@ func tenantPrincipal(c db.S3Credential) principal {
 	for i, perm := range c.Scope.Permissions {
 		perms[i] = Permission(perm)
 	}
-	p := principal{tenantID: &c.TenantID, perms: permSetOf(perms)}
+	p := principal{accessKeyID: c.AccessKeyID, tenantID: &c.TenantID, perms: permSetOf(perms)}
 	if c.Scope.Namespaces != nil {
 		p.namespaces = make(map[string]struct{}, len(c.Scope.Namespaces))
 		for _, name := range c.Scope.Namespaces {
@@ -98,7 +101,9 @@ func (g *Gateway) authenticate(r *http.Request) (principal, *chunkSigner, error)
 		if err != nil {
 			return principal{}, nil, err
 		}
-		return adminPrincipal(), signer, nil
+		p := adminPrincipal()
+		p.accessKeyID = adminKey
+		return p, signer, nil
 	}
 
 	// The lookup leaves out expired keys, and a deleted key has no row, so

@@ -40,7 +40,7 @@ const startupTimeout = 2 * time.Minute
 const shutdownTimeout = 30 * time.Second
 
 func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel()}))
+	logger := slog.New(logHandler(&slog.HandlerOptions{Level: logLevel()}))
 	slog.SetDefault(logger)
 
 	if err := run(logger); err != nil {
@@ -64,6 +64,16 @@ func logLevel() slog.Level {
 	}
 }
 
+// logHandler reads LOG_FORMAT: "json" writes one JSON object per line;
+// anything else, the default, writes logfmt key=value lines. Either is meant to
+// be parsed, the audit lines especially (see db.SetAuditLogger).
+func logHandler(opts *slog.HandlerOptions) slog.Handler {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("LOG_FORMAT")), "json") {
+		return slog.NewJSONHandler(os.Stdout, opts)
+	}
+	return slog.NewTextHandler(os.Stdout, opts)
+}
+
 func run(logger *slog.Logger) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -82,6 +92,7 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	defer database.Close()
+	database.SetAuditLogger(logger)
 
 	bucket, err := storage.Open(startupCtx, cfg.Storage)
 	if err != nil {
