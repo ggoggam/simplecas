@@ -3,6 +3,8 @@ package s3
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -162,13 +164,6 @@ func TestVerifyRejects(t *testing.T) {
 			name:    "no Authorization header",
 			prepare: func(*http.Request) {},
 			want:    apperr.ErrAccessDenied,
-		},
-		{
-			name: "presigned query auth is not supported",
-			prepare: func(r *http.Request) {
-				r.URL.RawQuery = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=deadbeef"
-			},
-			want: apperr.ErrAccessDenied,
 		},
 		{
 			name: "unknown access key",
@@ -339,5 +334,178 @@ func TestVerifyRejectsMismatchedScopeDate(t *testing.T) {
 	r.Header.Set("x-amz-date", "not-a-date")
 	if _, err := verify(r, testAuth); err != apperr.ErrAccessDenied {
 		t.Errorf("verify with a malformed x-amz-date = %v, want AccessDenied", err)
+	}
+}
+
+// presignAt presigns r as keyID/secret at the given time, valid for expires,
+// the way a client builds a presigned URL: the signing parameters go in the
+// query, the canonical request covers them and UNSIGNED-PAYLOAD, and the
+// signature is appended last.
+func presignAt(r *http.Request, keyID, secret string, at time.Time, expires time.Duration) {
+	date := at.UTC().Format(amzDateFormat)
+	dateStamp := date[:8]
+	query := r.URL.Query()
+	query.Set(amzAlgorithm, sigV4Algorithm)
+	query.Set(amzCredential, keyID+"/"+dateStamp+"/us-east-1/s3/aws4_request")
+	query.Set(amzDate, date)
+	query.Set(amzExpires, strconv.Itoa(int(expires/time.Second)))
+	query.Set(amzSignedHeaders, "host")
+
+	sig := computeSignature(signatureInput{
+		secret:           secret,
+		method:           r.Method,
+		canonicalURI:     r.URL.EscapedPath(),
+		canonicalQuery:   canonicalQuery(query),
+		signedHeaders:    "host",
+		canonicalHeaders: "host:" + r.Host + "\n",
+		hashedPayload:    unsignedPayload,
+		amzDate:          date,
+		dateStamp:        dateStamp,
+		region:           "us-east-1",
+		service:          "s3",
+	})
+	query.Set(amzSignature, sig)
+	r.URL.RawQuery = query.Encode()
+}
+
+func presignedRequest(method, target string, at time.Time, expires time.Duration) *http.Request {
+	r := httptest.NewRequest(method, target, nil)
+	r.Host = "cas.example.com"
+	presignAt(r, "AKID", "secret", at, expires)
+	return r
+}
+
+// A presigned URL verifies like a header-signed request, with no headers at
+// all beyond Host, and its own query parameters still covered by it.
+func TestVerifyAcceptsAPresignedRequest(t *testing.T) {
+	r := presignedRequest(http.MethodGet, "/ns/some%20key?x-id=GetObject&response-cache-control=no-store", now(), time.Hour)
+	signer, err := verify(r, testAuth)
+	if err != nil {
+		t.Fatalf("a correctly presigned request was rejected: %v", err)
+	}
+	if signer != nil {
+		t.Error("a presigned request returned a chunk signing context")
+	}
+}
+
+// A presigned URL is good from its X-Amz-Date (less the clock skew S3
+// allows) until X-Amz-Expires after it, and not outside that.
+func TestPresignedRequestsExpire(t *testing.T) {
+	tests := []struct {
+		name    string
+		at      time.Duration
+		expires time.Duration
+		want    string
+	}{
+		{"fresh", 0, time.Hour, ""},
+		{"near the end of its life", -59 * time.Minute, time.Hour, ""},
+		{"a week old with a week's expiry", -maxPresignExpiry + time.Minute, maxPresignExpiry, ""},
+		{"expired", -61 * time.Minute, time.Hour, "AccessDenied"},
+		{"expired, though within the header skew", -2 * time.Minute, time.Minute, "AccessDenied"},
+		{"signed slightly ahead of the clock", 14 * time.Minute, time.Hour, ""},
+		{"not valid yet", 16 * time.Minute, time.Hour, "AccessDenied"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := presignedRequest(http.MethodGet, "/ns/key", now().Add(tc.at), tc.expires)
+			_, err := verify(r, testAuth)
+			if got := s3Code(err); got != tc.want {
+				t.Errorf("verify = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func s3Code(err error) string {
+	if err == nil {
+		return ""
+	}
+	return apperr.From(err).S3Code()
+}
+
+// A presigned URL whose parameters are missing, repeated, malformed or out of
+// range is refused before any signature is computed.
+func TestPresignedQueryParameters(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(q url.Values)
+		want   string
+	}{
+		{"no signature", func(q url.Values) { q.Del(amzSignature) }, "AuthorizationQueryParametersError"},
+		{"no credential", func(q url.Values) { q.Del(amzCredential) }, "AuthorizationQueryParametersError"},
+		{"no date", func(q url.Values) { q.Del(amzDate) }, "AuthorizationQueryParametersError"},
+		{"no expiry", func(q url.Values) { q.Del(amzExpires) }, "AuthorizationQueryParametersError"},
+		{"no signed headers", func(q url.Values) { q.Del(amzSignedHeaders) }, "AuthorizationQueryParametersError"},
+		{"a second signature", func(q url.Values) { q.Add(amzSignature, "00") }, "AuthorizationQueryParametersError"},
+		{"a second expiry", func(q url.Values) { q.Add(amzExpires, "604800") }, "AuthorizationQueryParametersError"},
+		{"another algorithm", func(q url.Values) { q.Set(amzAlgorithm, "AWS4-ECDSA-P256-SHA256") }, "AuthorizationQueryParametersError"},
+		{"a malformed credential", func(q url.Values) { q.Set(amzCredential, "AKID/x/y") }, "AuthorizationQueryParametersError"},
+		{"zero expiry", func(q url.Values) { q.Set(amzExpires, "0") }, "AuthorizationQueryParametersError"},
+		{"negative expiry", func(q url.Values) { q.Set(amzExpires, "-5") }, "AuthorizationQueryParametersError"},
+		{"expiry past a week", func(q url.Values) { q.Set(amzExpires, "604801") }, "AuthorizationQueryParametersError"},
+		{"an expiry that overflows a duration", func(q url.Values) { q.Set(amzExpires, "9223372037") }, "AuthorizationQueryParametersError"},
+		{"non-numeric expiry", func(q url.Values) { q.Set(amzExpires, "1h") }, "AuthorizationQueryParametersError"},
+		{"host not signed", func(q url.Values) { q.Set(amzSignedHeaders, "x-amz-date") }, "AuthorizationQueryParametersError"},
+		{"a session token", func(q url.Values) { q.Set(amzSecurityToken, "token") }, "AccessDenied"},
+		{"a longer expiry than was signed", func(q url.Values) { q.Set(amzExpires, "7200") }, "SignatureDoesNotMatch"},
+		{"another key", func(q url.Values) { q.Set("prefix", "elsewhere/") }, "SignatureDoesNotMatch"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := presignedRequest(http.MethodGet, "/ns/key", now(), time.Hour)
+			q := r.URL.Query()
+			tc.mutate(q)
+			r.URL.RawQuery = q.Encode()
+			_, err := verify(r, testAuth)
+			if got := s3Code(err); got != tc.want {
+				t.Errorf("verify = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// The signature binds the method, path and host: a URL presigned for one
+// object cannot be pointed at another, used to write, or replayed elsewhere.
+func TestPresignedRequestCannotBeRetargeted(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(r *http.Request)
+	}{
+		{"another key", func(r *http.Request) { r.URL.Path, r.URL.RawPath = "/ns/other", "" }},
+		{"another namespace", func(r *http.Request) { r.URL.Path, r.URL.RawPath = "/other/key", "" }},
+		{"another method", func(r *http.Request) { r.Method = http.MethodPut }},
+		{"another host", func(r *http.Request) { r.Host = "evil.example.com" }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := presignedRequest(http.MethodGet, "/ns/key", now(), time.Hour)
+			tc.mutate(r)
+			if _, err := verify(r, testAuth); err != apperr.ErrSignatureDoesNotMatch {
+				t.Errorf("verify = %v, want SignatureDoesNotMatch", err)
+			}
+		})
+	}
+}
+
+// A presigned URL with an Authorization header too is refused, as on S3,
+// rather than checked one way and trusted the other.
+func TestPresignedAndHeaderAuthTogetherAreRefused(t *testing.T) {
+	r := presignedRequest(http.MethodGet, "/ns/key", now(), time.Hour)
+	r.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/s3/aws4_request, "+
+		"SignedHeaders=host, Signature=abc")
+	if _, err := verify(r, testAuth); s3Code(err) != "InvalidArgument" {
+		t.Errorf("verify = %v, want InvalidArgument", err)
+	}
+}
+
+// A presigned signature has no chunk chain to seed, so a body that claims to
+// be signed chunk by chunk is refused instead of decoded without checks.
+func TestPresignedRequestRefusesASignedChunkedBody(t *testing.T) {
+	for _, mode := range []string{streamingSigned, streamingSignedTrailer} {
+		r := presignedRequest(http.MethodPut, "/ns/key", now(), time.Hour)
+		r.Header.Set("x-amz-content-sha256", mode)
+		if _, err := verify(r, testAuth); s3Code(err) != "InvalidRequest" {
+			t.Errorf("%s: verify = %v, want InvalidRequest", mode, err)
+		}
 	}
 }

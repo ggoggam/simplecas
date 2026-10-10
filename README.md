@@ -425,7 +425,8 @@ delete, and a backup reader gets `["read","list"]` on one namespace.
 `expires_in_days` (1–3650) gives a key a lifetime; leave it out for one that
 never expires. An expired key is refused like an unknown one (`403
 AccessDenied`) and stays listed until an owner revokes it. `last_used_at` moves
-when a request signed with the key verifies, at most once every 5 minutes, so
+when a request signed with the key verifies (a presigned URL's included), at
+most once every 5 minutes, so
 an owner can tell a key in use from one that is safe to revoke.
 
 Buckets created with a team key are **owned by that team**, so they show up in
@@ -495,7 +496,8 @@ JSON API and PWA call the same thing a namespace. Supported:
 - Tagging: `GetObjectTagging` answers an empty tag set. Tags are not stored, but
   the AWS CLI reads them before every `aws s3 cp` between buckets.
 
-Auth is AWS **SigV4** (header-signed), toggled by `[auth] enabled`. When
+Auth is AWS **SigV4**, header-signed or as a presigned URL, toggled by
+`[auth] enabled`. When
 disabled, anonymous access works (`aws s3 --no-sign-request`, or put the server
 behind your own ingress auth). Two kinds of credential verify here: the
 superuser key from `simplecas.toml`, and per-team keys that see only their own
@@ -505,6 +507,31 @@ A signed request is good for **15 minutes** either side of the server's clock
 (`RequestTimeTooSkewed` past that), and its credential scope must carry the same
 date as `x-amz-date` and the `s3` service, so a captured request cannot be
 replayed later. Keep server clocks synced.
+
+**Presigned URLs** (`aws s3 presign`, or any SDK's presigner) carry the
+signature in the query instead, so whoever holds the URL can make that one
+request with no credentials: a download link, or an upload slot for a browser
+or a CI job. The gateway checks them with the same code and the same key as a
+header-signed request, so a URL can do only what its key's
+[scope](#per-team-s3-credentials) allows, and stops working when the key
+expires or is revoked.
+
+- A URL is valid from its `X-Amz-Date` (less the 15-minute clock allowance) for
+  `X-Amz-Expires` seconds, at most 604800 (a week), as on S3. An expired one
+  answers `403 AccessDenied`; missing, repeated or out-of-range parameters
+  answer `400 AuthorizationQueryParametersError`.
+- The signature covers the method, path, `host` (which must be signed) and the
+  rest of the query. Pointing a URL at another object, or sending it with
+  another method, fails with `SignatureDoesNotMatch`.
+- The body is `UNSIGNED-PAYLOAD`, as on S3, since the URL is signed before the
+  body exists. Checksum headers the uploader sends are still held to the body.
+  A body framed as signed `aws-chunked` is refused (`InvalidRequest`).
+- A request signed both ways (header and query) is refused (`InvalidArgument`).
+  `X-Amz-Security-Token` is refused: there is no STS to have issued one.
+- `response-content-type` and the other `response-*` overrides are ignored, so a
+  URL cannot make a download render inline.
+- A URL is a bearer credential until it expires. Presign with a key scoped to
+  what the URL is for, and keep expiries short.
 
 A signature covers the headers, so the body is held to what they claim about it,
 in the same pass that stages it: nothing is committed, and the staged bytes are
@@ -544,7 +571,7 @@ Every response carries an `X-Amz-Request-Id`. Internal errors return a generic
 message plus that ID (`<RequestId>` in XML, `request_id` in JSON); the cause is
 logged server-side under the same ID.
 
-**Deliberately unsupported:** versioning, ACLs/bucket policies, presigned URLs,
+**Deliberately unsupported:** versioning, ACLs/bucket policies,
 POST-policy uploads, virtual-host-style addressing. ETags are BLAKE3 digests,
 not MD5.
 

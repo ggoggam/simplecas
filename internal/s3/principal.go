@@ -6,7 +6,6 @@ import (
 	"net/http"
 
 	"github.com/ggoggam/simplecas/internal/apperr"
-	"github.com/ggoggam/simplecas/internal/config"
 	"github.com/ggoggam/simplecas/internal/db"
 )
 
@@ -81,9 +80,11 @@ func (g *Gateway) authenticate(r *http.Request) (principal, *chunkSigner, error)
 		return adminPrincipal(), nil, nil
 	}
 
-	parsed, ok := parseAuthHeader(r.Header.Get("Authorization"))
-	if !ok {
-		return principal{}, nil, apperr.ErrAccessDenied
+	// The signature is read from the Authorization header or, for a
+	// presigned URL, from the query; everything after is the same for both.
+	req, err := parseSignedRequest(r)
+	if err != nil {
+		return principal{}, nil, err
 	}
 
 	// The configured admin credential is matched first, so a row in
@@ -92,15 +93,17 @@ func (g *Gateway) authenticate(r *http.Request) (principal, *chunkSigner, error)
 	// mistaken for it. The empty guard matters because an unset admin key
 	// would otherwise match a request whose credential scope parsed empty.
 	adminKey := g.cfg.Auth.AccessKeyID
-	if adminKey != "" && hmac.Equal([]byte(parsed.accessKeyID), []byte(adminKey)) {
-		signer, err := verify(r, g.cfg.Auth)
+	if adminKey != "" && hmac.Equal([]byte(req.accessKeyID), []byte(adminKey)) {
+		signer, err := verifySigned(r, req, adminKey, g.cfg.Auth.SecretAccessKey)
 		if err != nil {
 			return principal{}, nil, err
 		}
 		return adminPrincipal(), signer, nil
 	}
 
-	cred, found, err := g.db.LookupS3Credential(r.Context(), parsed.accessKeyID)
+	// The lookup leaves out expired keys, and a deleted key has no row, so
+	// a presigned URL dies with the key that signed it.
+	cred, found, err := g.db.LookupS3Credential(r.Context(), req.accessKeyID)
 	if err != nil {
 		return principal{}, nil, err
 	}
@@ -115,14 +118,9 @@ func (g *Gateway) authenticate(r *http.Request) (principal, *chunkSigner, error)
 		return principal{}, nil, err
 	}
 
-	// Reuse the single-credential path rather than reimplementing the
-	// canonicalisation, so the tenanted and admin credentials cannot drift in
-	// what they accept.
-	signer, err := verify(r, config.AuthConfig{
-		Enabled:         true,
-		AccessKeyID:     cred.AccessKeyID,
-		SecretAccessKey: secret,
-	})
+	// The same check as the admin credential's, so the tenanted and admin
+	// credentials cannot drift in what they accept.
+	signer, err := verifySigned(r, req, cred.AccessKeyID, secret)
 	if err != nil {
 		return principal{}, nil, err
 	}

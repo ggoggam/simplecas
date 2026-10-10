@@ -56,6 +56,7 @@ const (
 	KindBadDigest
 	KindInvalidDigest
 	KindContentSHA256Mismatch
+	KindAuthorizationQueryParametersError
 )
 
 // Error is a classified failure. Sentinel values below cover the kinds that
@@ -156,6 +157,12 @@ func BadDigest(format string, a ...any) *Error {
 // InvalidDigest rejects a Content-MD5 header that is not a base64 MD5 digest.
 func InvalidDigest(format string, a ...any) *Error {
 	return &Error{Kind: KindInvalidDigest, msg: fmt.Sprintf(format, a...)}
+}
+
+// AuthorizationQueryParametersError rejects a presigned URL whose X-Amz-*
+// authentication parameters are missing, repeated or out of range.
+func AuthorizationQueryParametersError(format string, a ...any) *Error {
+	return &Error{Kind: KindAuthorizationQueryParametersError, msg: fmt.Sprintf(format, a...)}
 }
 
 // newInternal builds an internal error from a non-nil cause.
@@ -264,6 +271,8 @@ func (e *Error) S3Code() string {
 		return "InvalidDigest"
 	case KindContentSHA256Mismatch:
 		return "XAmzContentSHA256Mismatch"
+	case KindAuthorizationQueryParametersError:
+		return "AuthorizationQueryParametersError"
 	default:
 		return "InternalError"
 	}
@@ -281,7 +290,8 @@ func (e *Error) Status() int {
 	case KindInvalidNamespaceName, KindInvalidTenantName,
 		KindInvalidArgument, KindInvalidPart, KindMalformedXML,
 		KindEntityTooLarge, KindRequestTimeout, KindInvalidRequest,
-		KindBadDigest, KindInvalidDigest, KindContentSHA256Mismatch:
+		KindBadDigest, KindInvalidDigest, KindContentSHA256Mismatch,
+		KindAuthorizationQueryParametersError:
 		return http.StatusBadRequest
 	case KindInvalidRange:
 		return http.StatusRequestedRangeNotSatisfiable
