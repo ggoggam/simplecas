@@ -24,8 +24,15 @@ func (d *DB) Stats(ctx context.Context) (Stats, error) {
 	if err != nil {
 		return Stats{}, apperr.Internal(err)
 	}
-	err = d.pool.QueryRow(ctx,
-		"SELECT COUNT(*), COALESCE(SUM(size), 0)::BIGINT FROM blobs WHERE refcount > 0").
+	// Physical bytes are the xorbs live blobs use, each once and as
+	// stored, plus the live blobs stored whole before chunking.
+	err = d.pool.QueryRow(ctx, `
+		SELECT
+		    (SELECT COUNT(*) FROM blobs WHERE refcount > 0),
+		    ((SELECT COALESCE(SUM(size), 0) FROM blobs WHERE refcount > 0 AND NOT chunked)
+		     + (SELECT COALESCE(SUM(x.size), 0) FROM xorbs x WHERE EXISTS (
+		           SELECT 1 FROM blob_terms t JOIN blobs b ON b.hash = t.blob_hash
+		           WHERE t.xorb_hash = x.hash AND b.refcount > 0)))::BIGINT`).
 		Scan(&s.BlobCount, &s.PhysicalBytes)
 	if err != nil {
 		return Stats{}, apperr.Internal(err)
@@ -35,8 +42,8 @@ func (d *DB) Stats(ctx context.Context) (Stats, error) {
 
 // StatsForTenants restricts the accounting to namespaces owned by tenantIDs.
 //
-// Under global dedup a blob shared by two tenants counts toward each tenant's
-// physical footprint, so per-tenant PhysicalBytes summed across tenants can
+// Under global dedup a blob or xorb shared by two tenants counts toward each
+// tenant's physical footprint, so per-tenant PhysicalBytes summed across tenants can
 // exceed the global figure. It is "the footprint attributable to your data",
 // not a partition of the total.
 func (d *DB) StatsForTenants(ctx context.Context, tenantIDs []int64) (Stats, error) {
@@ -57,13 +64,19 @@ func (d *DB) StatsForTenants(ctx context.Context, tenantIDs []int64) (Stats, err
 		return Stats{}, apperr.Internal(err)
 	}
 	err = d.pool.QueryRow(ctx, `
-		SELECT COUNT(*), COALESCE(SUM(size), 0)::BIGINT FROM (
-		    SELECT DISTINCT b.hash, b.size
+		WITH team_blobs AS (
+		    SELECT DISTINCT b.hash, b.size, b.chunked
 		    FROM blobs b
 		    JOIN objects o ON o.blob_hash = b.hash
 		    JOIN namespaces n ON n.id = o.namespace_id
 		    WHERE n.tenant_id = ANY($1)
-		) distinct_blobs`, tenantIDs).
+		)
+		SELECT
+		    (SELECT COUNT(*) FROM team_blobs),
+		    ((SELECT COALESCE(SUM(size), 0) FROM team_blobs WHERE NOT chunked)
+		     + (SELECT COALESCE(SUM(x.size), 0) FROM xorbs x WHERE EXISTS (
+		           SELECT 1 FROM blob_terms bt JOIN team_blobs t ON t.hash = bt.blob_hash
+		           WHERE bt.xorb_hash = x.hash)))::BIGINT`, tenantIDs).
 		Scan(&s.BlobCount, &s.PhysicalBytes)
 	if err != nil {
 		return Stats{}, apperr.Internal(err)
@@ -72,7 +85,10 @@ func (d *DB) StatsForTenants(ctx context.Context, tenantIDs []int64) (Stats, err
 }
 
 // GCSweep deletes blobs that have sat at refcount 0 past the grace period,
-// calling deleteBytes for each one, and stops after limit blobs.
+// and stops after limit blobs. A chunked blob's row goes together with its
+// terms, which drops its references to its xorbs; the xorb sweep collects
+// any xorb that leaves at zero. A blob stored before chunking is one file,
+// and deleteBytes is called to delete it.
 //
 // The bytes are deleted while the blob's row lock is held, and ClaimBlob
 // contends on that same lock, so a blob can never be resurrected halfway
@@ -85,22 +101,59 @@ func (d *DB) StatsForTenants(ctx context.Context, tenantIDs []int64) (Stats, err
 // fails — the objects foreign key catching a reference the refcount missed —
 // then aborts before any bytes are touched. The one window left is a crash or
 // failed commit after deleteBytes, which leaves a zero-ref row with no bytes;
-// ClaimBlob treats any revival from zero as needing its bytes rewritten, and
-// ClaimExistingBlob refuses zero-ref rows, so that row is never handed out
+// ClaimBlob reports any revival of such a row as needing its bytes rewritten,
+// and ClaimExistingBlob refuses zero-ref rows, so that row is never handed out
 // without its bytes. The next pass collects it, deleteBytes being idempotent.
+// Chunked blobs have no such window, because their sweep deletes no bytes.
 //
 // Candidates must also have no object pointing at them. The refcount is a
 // cache of that fact, and if it ever drifts low the sweep must not take the
 // count's word over the objects table and destroy live data.
+func (d *DB) GCSweep(ctx context.Context, graceSecs int64, limit int64, deleteBytes func(ctx context.Context, hash string) error) (int64, error) {
+	var chunked bool
+	return d.sweepRows(ctx, "blob", limit, func(ctx context.Context, tx pgx.Tx, failed []string) (string, error) {
+		var hash string
+		err := tx.QueryRow(ctx, `
+			SELECT hash, chunked FROM blobs
+			WHERE refcount = 0
+			  AND updated_at < now() - make_interval(secs => $1)
+			  AND hash <> ALL($2)
+			  AND NOT EXISTS (SELECT 1 FROM objects o WHERE o.blob_hash = blobs.hash)
+			ORDER BY updated_at, hash
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED`, float64(graceSecs), failed).Scan(&hash, &chunked)
+		return hash, err
+	}, func(ctx context.Context, tx pgx.Tx, hash string) error {
+		if chunked {
+			if err := detachTerms(ctx, tx, hash); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM blobs WHERE hash = $1", hash); err != nil {
+			return apperr.Internal(err)
+		}
+		if chunked {
+			return nil
+		}
+		return deleteBytes(ctx, hash)
+	})
+}
+
+// sweepRows is the loop GCSweep and GCSweepXorbs share. Each candidate gets
+// its own transaction: pick locks the next one (skipping those in failed) or
+// returns pgx.ErrNoRows when none is left, and collect deletes it.
 //
-// A failure on one blob does not end the pass. That blob's transaction rolls
+// A failure on one candidate does not end the pass. Its transaction rolls
 // back, so its row survives to be retried on the next pass, and it is excluded
 // for the rest of this one; the sweep carries on with the others. Candidates
 // are taken oldest first, so the order is stable and one bad row cannot be
-// picked again and again while the rest wait. The per-blob failures come back
-// joined in err, alongside the count of blobs that were swept. Only a failure
-// to find candidates at all ends the pass early.
-func (d *DB) GCSweep(ctx context.Context, graceSecs int64, limit int64, deleteBytes func(ctx context.Context, hash string) error) (int64, error) {
+// picked again and again while the rest wait. The failures come back joined
+// in err, alongside the count of rows that were collected. Only a failure to
+// find candidates at all ends the pass early.
+func (d *DB) sweepRows(ctx context.Context, what string, limit int64,
+	pick func(ctx context.Context, tx pgx.Tx, failed []string) (string, error),
+	collect func(ctx context.Context, tx pgx.Tx, hash string) error,
+) (int64, error) {
 	var (
 		swept int64
 		errs  []error
@@ -114,35 +167,25 @@ func (d *DB) GCSweep(ctx context.Context, graceSecs int64, limit int64, deleteBy
 			done bool
 		)
 		err := d.InTx(ctx, func(tx pgx.Tx) error {
-			err := tx.QueryRow(ctx, `
-				SELECT hash FROM blobs
-				WHERE refcount = 0
-				  AND updated_at < now() - make_interval(secs => $1)
-				  AND hash <> ALL($2)
-				  AND NOT EXISTS (SELECT 1 FROM objects o WHERE o.blob_hash = blobs.hash)
-				ORDER BY updated_at, hash
-				LIMIT 1
-				FOR UPDATE SKIP LOCKED`, float64(graceSecs), failed).Scan(&hash)
+			var err error
+			hash, err = pick(ctx, tx, failed)
 			if notFound(err) {
 				done = true
 				return nil
 			}
 			if err != nil {
+				hash = ""
 				return apperr.Internal(err)
 			}
-
-			if _, err := tx.Exec(ctx, "DELETE FROM blobs WHERE hash = $1", hash); err != nil {
-				return apperr.Internal(err)
-			}
-			return deleteBytes(ctx, hash)
+			return collect(ctx, tx, hash)
 		})
 		if err != nil {
 			if hash == "" {
-				// Not tied to any one blob: the candidate query itself failed.
+				// Not tied to any one row: the candidate query itself failed.
 				return swept, errors.Join(append(errs, err)...)
 			}
 			failed = append(failed, hash)
-			errs = append(errs, fmt.Errorf("blob %s: %w", hash, err))
+			errs = append(errs, fmt.Errorf("%s %s: %w", what, hash, err))
 			continue
 		}
 		if done {
@@ -157,9 +200,20 @@ func (d *DB) GCSweep(ctx context.Context, graceSecs int64, limit int64, deleteBy
 // uses it to set aside, one round trip per page of a listing, the stored blobs
 // the table already accounts for; only the rest need ReclaimOrphanBlob.
 func (d *DB) UnknownBlobs(ctx context.Context, hashes []string) ([]string, error) {
+	return d.unknown(ctx, "blobs", hashes)
+}
+
+// UnknownXorbs is UnknownBlobs for the xorbs table.
+func (d *DB) UnknownXorbs(ctx context.Context, hashes []string) ([]string, error) {
+	return d.unknown(ctx, "xorbs", hashes)
+}
+
+// unknown returns those of hashes with no row in table, which is one of the
+// two content tables and never caller input.
+func (d *DB) unknown(ctx context.Context, table string, hashes []string) ([]string, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT h FROM unnest($1::text[]) AS h
-		WHERE NOT EXISTS (SELECT 1 FROM blobs WHERE blobs.hash = h)`, hashes)
+		WHERE NOT EXISTS (SELECT 1 FROM `+table+` t WHERE t.hash = h)`, hashes)
 	if err != nil {
 		return nil, apperr.Internal(err)
 	}
@@ -201,6 +255,19 @@ var OrphanLockTimeout = 2 * time.Second
 // A claim still in flight after OrphanLockTimeout skips the blob for this
 // pass; a later pass sees how it ended.
 func (d *DB) ReclaimOrphanBlob(ctx context.Context, hash string, deleteBytes func(ctx context.Context, hash string) error) (reclaimed bool, err error) {
+	return d.reclaimOrphan(ctx, "blobs", hash, deleteBytes)
+}
+
+// ReclaimOrphanXorb is ReclaimOrphanBlob for xorb bytes, claiming the hash
+// in the xorbs table, which AttachTerms inserts into the way ClaimBlob
+// inserts into blobs.
+func (d *DB) ReclaimOrphanXorb(ctx context.Context, hash string, deleteBytes func(ctx context.Context, hash string) error) (reclaimed bool, err error) {
+	return d.reclaimOrphan(ctx, "xorbs", hash, deleteBytes)
+}
+
+// reclaimOrphan is ReclaimOrphanBlob against table, which is one of the two
+// content tables and never caller input.
+func (d *DB) reclaimOrphan(ctx context.Context, table, hash string, deleteBytes func(ctx context.Context, hash string) error) (reclaimed bool, err error) {
 	tx, err := d.pool.Begin(ctx)
 	if err != nil {
 		return false, apperr.Internal(err)
@@ -215,7 +282,7 @@ func (d *DB) ReclaimOrphanBlob(ctx context.Context, hash string, deleteBytes fun
 
 	var claimed bool
 	err = tx.QueryRow(ctx, `
-		INSERT INTO blobs (hash, size, refcount) VALUES ($1, 0, 0)
+		INSERT INTO `+table+` (hash, size, refcount) VALUES ($1, 0, 0)
 		ON CONFLICT (hash) DO NOTHING
 		RETURNING true`, hash).Scan(&claimed)
 	if notFound(err) || lockNotAvailable(err) {

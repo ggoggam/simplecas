@@ -1,0 +1,2 @@
+internal/cas/testdata/xet/*.chunk -text
+internal/cas/testdata/xet/*.chunks -text

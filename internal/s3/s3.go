@@ -908,9 +908,9 @@ func (g *Gateway) serveResolvedObject(w http.ResponseWriter, r *http.Request, ns
 		return
 	}
 
-	reader, err := g.blob.NewRangeReader(r.Context(), storage.BlobPath(meta.BlobHash), start, length, nil)
+	reader, err := g.cas.Open(r.Context(), meta.BlobHash, start, length)
 	if err != nil {
-		g.writeError(w, r, apperr.Internalf("open blob: %w", err))
+		g.writeError(w, r, err)
 		return
 	}
 	defer func() { _ = reader.Close() }()
@@ -1029,9 +1029,9 @@ func (g *Gateway) uploadPartCopy(w http.ResponseWriter, r *http.Request, namespa
 
 	var body io.Reader = strings.NewReader("")
 	if length > 0 {
-		reader, err := g.blob.NewRangeReader(r.Context(), storage.BlobPath(src.BlobHash), start, length, nil)
+		reader, err := g.cas.Open(r.Context(), src.BlobHash, start, length)
 		if err != nil {
-			g.writeError(w, r, apperr.Internalf("open copy source: %w", err))
+			g.writeError(w, r, err)
 			return
 		}
 		defer func() { _ = reader.Close() }()

@@ -28,9 +28,10 @@ const orphanPage = 1000
 // store stored before ETags were recorded is worked through over many ticks.
 const etagBatch = 16
 
-// RunGC reclaims space until ctx is cancelled: unreferenced blobs, orphaned
-// staging files, abandoned multipart uploads, and expired sign-in sessions on
-// every tick, and stored bytes no blob row accounts for every orphan interval.
+// RunGC reclaims space until ctx is cancelled: unreferenced blobs and xorbs,
+// orphaned staging files, abandoned multipart uploads, and expired sign-in
+// sessions on every tick, and stored bytes no row accounts for every orphan
+// interval.
 // Each tick also records ETags for some objects stored before they were.
 // Every pass is best-effort — a failure is logged and retried on the next tick
 // rather than ending the loop, because a transient database or backend blip
@@ -56,20 +57,25 @@ func (s *Store) RunGC(ctx context.Context) {
 		case <-ticker.C:
 		}
 
+		// Blobs first: collecting one drops its xorbs' references, and the
+		// xorb sweep then finds those that reached zero on the same tick
+		// once their grace period is up.
 		s.sweepBlobs(ctx)
+		s.sweepXorbs(ctx)
 		s.sweepStaging(ctx)
 		s.sweepMultipart(ctx)
 		s.sweepSessions(ctx)
 		s.backfillETags(ctx)
 		if time.Since(lastOrphanSweep) >= orphanInterval {
 			s.sweepOrphanBlobs(ctx)
+			s.sweepOrphanXorbs(ctx)
 			lastOrphanSweep = time.Now()
 		}
 	}
 }
 
-// sweepBlobs deletes the bytes and rows of blobs that have stayed unreferenced
-// past the grace period.
+// sweepBlobs deletes the rows of blobs that have stayed unreferenced past the
+// grace period, with the bytes of those stored whole before chunking.
 func (s *Store) sweepBlobs(ctx context.Context) {
 	swept, err := s.db.GCSweep(ctx, s.gc.GraceSecs, gcBatch, func(ctx context.Context, hash string) error {
 		return s.deleteIfPresent(ctx, storage.BlobPath(hash))
@@ -81,6 +87,20 @@ func (s *Store) sweepBlobs(ctx context.Context) {
 	}
 	if swept > 0 {
 		s.log.Info("gc: removed unreferenced blobs", "swept", swept)
+	}
+}
+
+// sweepXorbs deletes the bytes and rows of xorbs no blob has used for the
+// grace period.
+func (s *Store) sweepXorbs(ctx context.Context) {
+	swept, err := s.db.GCSweepXorbs(ctx, s.gc.GraceSecs, gcBatch, func(ctx context.Context, hash string) error {
+		return s.deleteIfPresent(ctx, storage.XorbPath(hash))
+	})
+	if err != nil && ctx.Err() == nil {
+		s.log.Warn("xorb gc sweep failed", "swept", swept, "err", err)
+	}
+	if swept > 0 {
+		s.log.Info("gc: removed unreferenced xorbs", "swept", swept)
 	}
 }
 
@@ -101,7 +121,7 @@ func (s *Store) backfillETags(ctx context.Context) {
 	for _, p := range pending {
 		sum := p.MD5
 		if sum == "" {
-			if sum, err = s.blobMD5(ctx, p.Hash); err != nil {
+			if sum, err = s.blobMD5(ctx, p.Hash, p.Size); err != nil {
 				if ctx.Err() == nil {
 					s.log.Warn("etag backfill could not read blob", "hash", p.Hash, "err", err)
 				}
@@ -123,8 +143,8 @@ func (s *Store) backfillETags(ctx context.Context) {
 }
 
 // blobMD5 reads a stored blob and returns its hex MD5.
-func (s *Store) blobMD5(ctx context.Context, hash string) (string, error) {
-	r, err := s.blob.NewReader(ctx, storage.BlobPath(hash), nil)
+func (s *Store) blobMD5(ctx context.Context, hash string, size int64) (string, error) {
+	r, err := s.Open(ctx, hash, 0, size)
 	if err != nil {
 		return "", err
 	}
@@ -237,11 +257,46 @@ func (s *Store) sweepSessions(ctx context.Context) {
 // keeps an in-flight commit safe — that lock is — but it spares the lock for
 // the fresh bytes of commits that are bound to succeed.
 func (s *Store) sweepOrphanBlobs(ctx context.Context) {
+	s.sweepOrphans(ctx, orphanKind{
+		what:    "blob",
+		prefix:  storage.BlobPrefix,
+		parse:   storage.HashFromBlobPath,
+		path:    storage.BlobPath,
+		unknown: s.db.UnknownBlobs,
+		reclaim: s.db.ReclaimOrphanBlob,
+	})
+}
+
+// sweepOrphanXorbs is sweepOrphanBlobs for xorbs, which a failed commit
+// leaves behind the same way.
+func (s *Store) sweepOrphanXorbs(ctx context.Context) {
+	s.sweepOrphans(ctx, orphanKind{
+		what:    "xorb",
+		prefix:  storage.XorbPrefix,
+		parse:   storage.HashFromXorbPath,
+		path:    storage.XorbPath,
+		unknown: s.db.UnknownXorbs,
+		reclaim: s.db.ReclaimOrphanXorb,
+	})
+}
+
+// orphanKind is what sweepOrphans needs to know about one kind of stored
+// content: where it lives, and how its rows are checked and claimed.
+type orphanKind struct {
+	what    string
+	prefix  string
+	parse   func(key string) (string, bool)
+	path    func(hash string) string
+	unknown func(ctx context.Context, hashes []string) ([]string, error)
+	reclaim func(ctx context.Context, hash string, deleteBytes func(ctx context.Context, hash string) error) (bool, error)
+}
+
+func (s *Store) sweepOrphans(ctx context.Context, kind orphanKind) {
 	cutoff := time.Now().Add(-time.Duration(s.gc.GraceSecs) * time.Second)
 
 	var removed int
 	page := make([]string, 0, orphanPage)
-	it := s.blob.List(&blob.ListOptions{Prefix: storage.BlobPrefix})
+	it := s.blob.List(&blob.ListOptions{Prefix: kind.prefix})
 	for {
 		obj, err := it.Next(ctx)
 		if errors.Is(err, io.EOF) {
@@ -249,14 +304,14 @@ func (s *Store) sweepOrphanBlobs(ctx context.Context) {
 		}
 		if err != nil {
 			if ctx.Err() == nil {
-				s.log.Warn("orphan blob sweep failed", "err", err)
+				s.log.Warn("orphan sweep failed", "kind", kind.what, "err", err)
 			}
 			return
 		}
 		if obj.IsDir {
 			continue
 		}
-		hash, ok := storage.HashFromBlobPath(obj.Key)
+		hash, ok := kind.parse(obj.Key)
 		if !ok || !s.olderThan(ctx, obj, cutoff) {
 			continue
 		}
@@ -265,7 +320,7 @@ func (s *Store) sweepOrphanBlobs(ctx context.Context) {
 		if len(page) < orphanPage {
 			continue
 		}
-		n, ok := s.reclaimOrphans(ctx, page)
+		n, ok := s.reclaimOrphans(ctx, kind, page)
 		removed += n
 		if !ok {
 			return
@@ -273,34 +328,34 @@ func (s *Store) sweepOrphanBlobs(ctx context.Context) {
 		page = page[:0]
 	}
 	if len(page) > 0 {
-		n, _ := s.reclaimOrphans(ctx, page)
+		n, _ := s.reclaimOrphans(ctx, kind, page)
 		removed += n
 	}
 
 	if removed > 0 {
-		s.log.Info("gc: removed orphaned blobs", "removed", removed)
+		s.log.Info("gc: removed orphaned "+kind.what+"s", "removed", removed)
 	}
 }
 
-// reclaimOrphans deletes those of hashes that have no blob row. ok is false
-// when the table could not be consulted at all, which ends the pass.
-func (s *Store) reclaimOrphans(ctx context.Context, hashes []string) (removed int, ok bool) {
-	unknown, err := s.db.UnknownBlobs(ctx, hashes)
+// reclaimOrphans deletes those of hashes that have no row. ok is false when
+// the table could not be consulted at all, which ends the pass.
+func (s *Store) reclaimOrphans(ctx context.Context, kind orphanKind, hashes []string) (removed int, ok bool) {
+	unknown, err := kind.unknown(ctx, hashes)
 	if err != nil {
 		if ctx.Err() == nil {
-			s.log.Warn("orphan blob sweep could not check blob rows", "err", err)
+			s.log.Warn("orphan sweep could not check rows", "kind", kind.what, "err", err)
 		}
 		return 0, false
 	}
 	for _, hash := range unknown {
-		reclaimed, err := s.db.ReclaimOrphanBlob(ctx, hash, func(ctx context.Context, hash string) error {
-			return s.deleteIfPresent(ctx, storage.BlobPath(hash))
+		reclaimed, err := kind.reclaim(ctx, hash, func(ctx context.Context, hash string) error {
+			return s.deleteIfPresent(ctx, kind.path(hash))
 		})
 		if err != nil {
 			if ctx.Err() != nil {
 				return removed, false
 			}
-			s.log.Warn("could not delete orphaned blob", "hash", hash, "err", err)
+			s.log.Warn("could not delete orphaned bytes", "kind", kind.what, "hash", hash, "err", err)
 			continue
 		}
 		if reclaimed {

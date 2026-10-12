@@ -1,7 +1,7 @@
 # simplecas
 
 A distributed **content-addressable storage** server with an **S3-compatible
-gateway**, **global file-level deduplication**, pluggable storage backends, and
+gateway**, **global chunk-level deduplication** in the Xet format, pluggable storage backends, and
 a bundled **PWA** for managing objects.
 
 - **Go** for the server, on the standard library's `net/http` — no web framework.
@@ -19,28 +19,60 @@ a bundled **PWA** for managing objects.
 Every object's bytes are hashed with BLAKE3. The digest is the key into a global
 `blobs` table shared across **all namespaces**. Two objects
 with identical content — in the same namespace or different ones — reference one
-physical blob. A `refcount` tracks how many objects point at each blob; deleting
-the last reference marks the blob for garbage collection, which removes the bytes
-after a grace period.
+blob. A `refcount` tracks how many objects point at each blob; deleting
+the last reference marks the blob for garbage collection after a grace period.
+
+A blob's bytes are stored the way the [Xet protocol](https://huggingface.co/docs/xet)
+stores files. Content is cut into **content-defined chunks** with Xet's
+gear-hash chunker (8 KiB minimum, about 64 KiB on average, 128 KiB maximum), and
+chunks are packed into **xorbs** of up to 64 MiB, in Xet's serialization: each
+chunk behind an 8-byte header, LZ4-compressed when that makes it smaller. A blob
+is a list of **terms**, each a run of chunks in one xorb. Chunk and xorb hashes
+are Xet's (keyed BLAKE3, and a Merkle tree over a xorb's chunks), checked in the
+tests against the protocol's reference files.
+
+Chunk boundaries depend only on nearby content, so two objects that share most
+of their bytes (versions of a file, a VM image after a small change) share most
+of their chunks. A new blob reuses any run of at least 8 chunks a stored xorb
+already holds and packs the rest into new xorbs, so an edit stores only the
+chunks around it; shorter runs are stored again rather than scattering the blob
+over many xorbs, as Xet recommends.
 
 ```
-objects (namespace, key) ──blob_hash──▶ blobs (hash, size, refcount) ──▶ backend: blobs/ab/cd/<hash>
+objects (namespace, key) ──blob_hash──▶ blobs (hash, size, refcount)
+                                          └─ blob_terms (pos, chunk range) ──▶ xorbs (hash, refcount) ──▶ backend: xorbs/ab/cd/<hash>
+                                                                                 └─ xorb_chunks (chunk hash, offset, length, size)
 ```
 
-The write path streams uploads to a `staging/<uuid>` file while hashing, then in
-one transaction claims a blob reference (creating the blob row if the content is
-new) and points the key at it. Uploading duplicate content stores **zero**
-additional bytes.
+On an object store every write is a billed request (a "class A" operation on
+R2 and GCS), so one write per xorb rather than per chunk matters: each xorb is
+sent with a single `PutObject`. A 200 MiB upload is 4 writes, not 3,208.
+
+The write path streams uploads to a `staging/<uuid>` file while hashing and
+chunking, plans which chunks to reuse, writes the new xorbs, and then in one
+transaction claims a blob reference (creating the blob row and its terms if the
+content is new) and points the key at it. No row lock is held while bytes move.
+Uploading duplicate content stores **zero** additional bytes. A multipart upload
+is chunked as one stream when it completes, so where the client split its parts
+moves no boundary.
+
+Reads fetch only the chunks a range overlaps, each run of neighbouring chunks in
+one ranged request, and check each chunk against its hash before serving any of
+it, so bytes that rot or are truncated in the backend fail the read instead of
+reaching the client. Content stored before chunking stays one file under
+`blobs/`; it is read, copied and collected as before, without that check.
 
 ### What global dedup reveals
 
 Dedup is global by design, so the same bytes stored by two teams are one blob.
 Two things keep that from telling one team what another stores:
 
-- **Uniform write cost.** The bytes are written into `blobs/` for any content
-  new to the namespace, even when the blob is already stored for someone else.
+- **Uniform write cost.** Content new to the namespace is written in full even
+  when the blob, or runs of its chunks, are already stored for someone else:
+  the parts stored elsewhere are reused, so they are kept only once, but
+  written all the same to a scratch object that is deleted after the commit.
   An upload of content another team holds takes as long as one of new content;
-  only a namespace's own duplicates skip the write (a staging write + delete).
+  only content the namespace already holds skips the write.
 - **No BLAKE3 digest on the wire.** S3 ETags are MD5s as S3 computes them (the
   content's MD5, or `<md5 of part md5s>-<parts>` for a multipart upload), and
   no `x-amz-meta-blake3` header is sent. Objects stored before ETags were
@@ -712,14 +744,22 @@ the ordinary staging sweeper.
   point: `claim_blob` and the GC sweep both take `FOR UPDATE` on it, so a blob
   being swept cannot be re-referenced mid-delete, and a newly-referenced blob is
   never collected.
-- **Crash safety.** A committed object row always has backing bytes (bytes are
-  copied from staging before the transaction commits). Orphaned staging files
-  from interrupted uploads are cleaned up by the staging sweeper, and abandoned
-  multipart uploads (with their staged parts) by the multipart sweeper. Blob
-  bytes left by a commit that copied them and then failed are found by the
-  orphan sweep, which lists `blobs/` against the table every
-  `[gc] orphan_interval_secs`; it claims each hash the way an upload does, so
-  it never deletes bytes a commit still in flight is about to publish.
+- **Crash safety.** A committed object row always has backing bytes (xorbs are
+  written before the transaction, and the claim checks, under the xorb's row
+  lock, that any xorb GC might have taken is still there). Orphaned staging
+  files from interrupted uploads are cleaned up by the staging sweeper, and
+  abandoned multipart uploads (with their staged parts) by the multipart
+  sweeper. Xorb and blob bytes left by a commit that wrote them and then failed
+  are found by the orphan sweep, which lists `xorbs/` and `blobs/` against their
+  tables every `[gc] orphan_interval_secs`; it claims each hash the way an
+  upload does, so it never deletes bytes a commit still in flight is about to
+  publish.
+- **Xorb GC.** A blob's terms live exactly as long as its row, and keep its
+  xorbs referenced while the blob waits at refcount 0, so a blob revived by a
+  re-upload or a link needs no bytes rewritten. Collecting a blob drops its
+  xorbs' references; the xorb sweep deletes a xorb no term uses once it has been
+  unreferenced for the grace period. A xorb lives as long as any blob uses any
+  of its chunks; compacting xorbs that are mostly unused is not done yet.
 
 ## Source layout
 
@@ -728,10 +768,10 @@ cmd/simplecas/       entrypoint: config, pool, bucket, routes, GC task, shutdown
 internal/
   apperr/            error type carrying an S3 code + HTTP status; XML and JSON rendering
   config/            layered TOML + SIMPLECAS__ env config; backend selection
-  storage/           blob backend construction + the blobs/ and staging/ layout
-  db/                all SQL: namespaces, users, sessions, tenants + invitations, audit log, blobs/refcounts, objects, multipart, GC
+  storage/           blob backend construction + the xorbs/, blobs/ and staging/ layout
+  db/                all SQL: namespaces, users, sessions, tenants + invitations, audit log, blobs, xorbs + terms, objects, multipart, GC
   db/migrations/     embedded SQL migrations (run automatically on boot)
-  cas/               content-addressed write path (stage → claim → commit) and the GC loop
+  cas/               content-addressed write path (stage → plan → write → claim), Xet chunking, hashing and xorbs, chunked reads, and the GC loop
   s3/                S3 gateway: handlers, XML wire types, SigV4 verification
   api/               JSON admin API for the PWA
   auth/              OIDC sign-in: discovery, database-backed sessions behind signed cookies, guard middleware

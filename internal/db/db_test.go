@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -50,17 +51,48 @@ func mustNamespace(t *testing.T, d *DB, name string, tenantID *int64) int64 {
 }
 
 // putObject stages a blob reference and points a key at it, the way the CAS
-// write path does.
+// write path does. A new blob's content is one chunk in a xorb of its own,
+// which shares the blob's hash.
 func putObject(t *testing.T, d *DB, nsID int64, key, hash string, size int64) {
 	t.Helper()
 	err := d.InTx(t.Context(), func(tx pgx.Tx) error {
-		if _, _, err := ClaimBlob(t.Context(), tx, hash, size, ""); err != nil {
+		claim, err := ClaimBlob(t.Context(), tx, hash, size, "")
+		if err != nil {
 			return err
+		}
+		if claim.Fresh && size > 0 {
+			x := NewXorb{Hash: hash, Size: size, Chunks: []XorbChunk{{Hash: hash, Length: int32(size), Size: int32(size)}}}
+			terms := []Term{{Xorb: hash, Start: 0, End: 1, Size: size}}
+			if err := AttachTerms(t.Context(), tx, hash, []NewXorb{x}, terms, allPresent{}); err != nil {
+				return err
+			}
 		}
 		return UpsertObject(t.Context(), tx, nsID, key, hash, "", size, "application/octet-stream")
 	})
 	if err != nil {
 		t.Fatalf("put object %s: %v", key, err)
+	}
+}
+
+// allPresent is a backend where every xorb is in place.
+type allPresent struct{}
+
+func (allPresent) Present(context.Context, string) (bool, error) { return true, nil }
+func (allPresent) Discard(context.Context, string) error         { return nil }
+
+// wholeFile turns hash into a blob stored before chunking, whose bytes are one
+// file and which GCSweep deletes through its callback: it has no terms, so
+// the xorb putObject gave it goes too.
+func wholeFile(t *testing.T, d *DB, hash string) {
+	t.Helper()
+	for _, q := range []string{
+		"DELETE FROM blob_terms WHERE blob_hash = $1",
+		"DELETE FROM xorbs WHERE hash = $1",
+		"UPDATE blobs SET chunked = false WHERE hash = $1",
+	} {
+		if _, err := d.pool.Exec(t.Context(), q, hash); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

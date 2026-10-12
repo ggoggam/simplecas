@@ -56,8 +56,9 @@ type DatabaseConfig struct {
 //
 // The logical layout inside the backend is identical everywhere:
 //
-//	blobs/<h[0:2]>/<h[2:4]>/<hash>  – content-addressed, immutable
-//	staging/<uuid>                  – in-flight uploads and multipart parts
+//	xorbs/<h[0:2]>/<h[2:4]>/<hash> – Xet xorbs of content-defined chunks; immutable
+//	blobs/<h[0:2]>/<h[2:4]>/<hash> – whole files stored before chunking
+//	staging/<uuid>                 – in-flight uploads and multipart parts
 type StorageConfig struct {
 	// Backend is one of fs, s3, gcs, azblob.
 	Backend string `toml:"backend"`

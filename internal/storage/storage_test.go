@@ -45,6 +45,21 @@ func TestHashFromBlobPath(t *testing.T) {
 	}
 }
 
+func TestHashFromXorbPath(t *testing.T) {
+	const hash = "eea25d6ee393ccae385820daed127b96ef0ea034dfb7cf6da3a950ce334b7632"
+	if got, want := XorbPath(hash), "xorbs/ee/a2/"+hash; got != want {
+		t.Errorf("XorbPath() = %q, want %q", got, want)
+	}
+	if got, ok := HashFromXorbPath(XorbPath(hash)); !ok || got != hash {
+		t.Errorf("HashFromXorbPath(XorbPath(h)) = %q, %v; want the hash back", got, ok)
+	}
+	for _, key := range []string{"xorbs/README", BlobPath(hash), "xorbs/ee/a2/" + hash + ".tmp"} {
+		if got, ok := HashFromXorbPath(key); ok {
+			t.Errorf("HashFromXorbPath(%q) = %q, want no hash", key, got)
+		}
+	}
+}
+
 func TestStagingPath(t *testing.T) {
 	got := StagingPath("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 	if want := "staging/6ba7b810-9dad-11d1-80b4-00c04fd430c8"; got != want {

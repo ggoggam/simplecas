@@ -1,3 +1,7 @@
+# Reference vectors are byte-exact: a fixer adding a newline would change
+# their hashes.
+exclude: ^internal/cas/testdata/xet/
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0

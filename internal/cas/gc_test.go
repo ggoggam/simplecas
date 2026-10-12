@@ -26,27 +26,40 @@ func TestSweepBlobsCollectsAndKeeps(t *testing.T) {
 	if _, err := f.store.Commit(ctx, nsID, "gone", "text/plain", f.stage(t, "abc")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.store.Commit(ctx, nsID, "kept", "text/plain", f.stage(t, "")); err != nil {
+	kept := f.stage(t, "kept")
+	if _, err := f.store.Commit(ctx, nsID, "kept", "text/plain", kept); err != nil {
 		t.Fatal(err)
 	}
+	f.putWholeFile(t, nsID, "old gone", "stored whole")
 	if _, err := f.db.DeleteObject(ctx, nsID, "gone"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.DeleteObject(ctx, nsID, "old gone"); err != nil {
 		t.Fatal(err)
 	}
 
 	f.store.sweepBlobs(ctx)
+	f.store.sweepXorbs(ctx)
 
-	// The unreferenced blob loses both its row and its bytes.
+	// The unreferenced blobs lose both their rows and their bytes: the chunked
+	// one through the xorb sweep, the whole file directly.
 	if _, ok := f.refcount(t, hashABC); ok {
 		t.Error("the unreferenced blob's row should be gone")
 	}
-	if ok, _ := f.bucket.Exists(ctx, storage.BlobPath(hashABC)); ok {
-		t.Error("the unreferenced blob's bytes should be gone")
+	if ok, _ := f.bucket.Exists(ctx, storage.XorbPath(xorbABC)); ok {
+		t.Error("the unreferenced blob's xorb should be gone")
+	}
+	if _, ok := f.xorbRefcount(t, xorbABC); ok {
+		t.Error("the unreferenced blob's xorb row should be gone")
+	}
+	if ok, _ := f.bucket.Exists(ctx, storage.BlobPath(hashOf("stored whole"))); ok {
+		t.Error("the unreferenced whole-file blob's bytes should be gone")
 	}
 	// The referenced one is untouched.
-	if n, _ := f.refcount(t, hashEmpty); n != 1 {
+	if n, _ := f.refcount(t, kept.Hash); n != 1 {
 		t.Errorf("referenced blob refcount = %d, want 1", n)
 	}
-	if ok, _ := f.bucket.Exists(ctx, storage.BlobPath(hashEmpty)); !ok {
+	if ok, _ := f.bucket.Exists(ctx, storage.XorbPath(chunkHash([]byte("kept")))); !ok {
 		t.Error("a referenced blob's bytes must survive the sweep")
 	}
 }
@@ -58,21 +71,32 @@ func TestSweepBlobsToleratesMissingBytes(t *testing.T) {
 	ctx := t.Context()
 	nsID := f.namespace(t, "ns", nil)
 
+	f.putWholeFile(t, nsID, "old", "stored whole")
 	if _, err := f.store.Commit(ctx, nsID, "k", "text/plain", f.stage(t, "abc")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.db.DeleteObject(ctx, nsID, "k"); err != nil {
-		t.Fatal(err)
+	for _, key := range []string{"old", "k"} {
+		if _, err := f.db.DeleteObject(ctx, nsID, key); err != nil {
+			t.Fatal(err)
+		}
 	}
 	// Something else removed the bytes out from under us.
-	if err := f.bucket.Delete(ctx, storage.BlobPath(hashABC)); err != nil {
-		t.Fatal(err)
+	for _, path := range []string{storage.BlobPath(hashOf("stored whole")), storage.XorbPath(xorbABC)} {
+		if err := f.bucket.Delete(ctx, path); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	f.store.sweepBlobs(ctx)
+	f.store.sweepXorbs(ctx)
 
-	if _, ok := f.refcount(t, hashABC); ok {
-		t.Error("the row must be collected even when the bytes were already gone")
+	for _, hash := range []string{hashOf("stored whole"), hashABC} {
+		if _, ok := f.refcount(t, hash); ok {
+			t.Error("the row must be collected even when the bytes were already gone")
+		}
+	}
+	if _, ok := f.xorbRefcount(t, xorbABC); ok {
+		t.Error("the xorb row must be collected even when its bytes were already gone")
 	}
 }
 
@@ -191,13 +215,8 @@ func TestSweepOrphanBlobsReclaimsBytesWithNoRow(t *testing.T) {
 	f.writeBlob(t, hashABC, "abc")
 	// A live blob, and one at refcount 0 that GCSweep has not taken yet. Both
 	// have rows, so neither is the orphan sweep's business.
-	if _, err := f.store.Commit(ctx, nsID, "kept", "text/plain", f.stage(t, "")); err != nil {
-		t.Fatal(err)
-	}
-	unreferenced := f.stage(t, "unreferenced")
-	if _, err := f.store.Commit(ctx, nsID, "gone", "text/plain", unreferenced); err != nil {
-		t.Fatal(err)
-	}
+	kept := f.putWholeFile(t, nsID, "kept", "kept")
+	unreferenced := f.putWholeFile(t, nsID, "gone", "unreferenced")
 	if _, err := f.db.DeleteObject(ctx, nsID, "gone"); err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +230,7 @@ func TestSweepOrphanBlobsReclaimsBytesWithNoRow(t *testing.T) {
 	if ok, _ := f.bucket.Exists(ctx, storage.BlobPath(hashABC)); ok {
 		t.Error("bytes no row accounts for should have been reclaimed")
 	}
-	for _, key := range []string{storage.BlobPath(hashEmpty), storage.BlobPath(unreferenced.Hash), "blobs/README"} {
+	for _, key := range []string{storage.BlobPath(kept), storage.BlobPath(unreferenced), "blobs/README"} {
 		if ok, _ := f.bucket.Exists(ctx, key); !ok {
 			t.Errorf("%s must survive the orphan sweep", key)
 		}
@@ -235,6 +254,46 @@ func TestSweepOrphanBlobsHonoursTheGracePeriod(t *testing.T) {
 	}
 }
 
+// A commit that wrote its xorbs and then failed leaves them with no row, and
+// the xorb orphan sweep reclaims them as the blob one does blobs.
+func TestSweepOrphanXorbsReclaimsBytesWithNoRow(t *testing.T) {
+	f := newFixture(t, collectNow())
+	ctx := t.Context()
+	nsID := f.namespace(t, "ns", nil)
+
+	f.writeXorb(t, xorbABC, "abc")
+	if _, err := f.store.Commit(ctx, nsID, "kept", "text/plain", f.stage(t, "kept")); err != nil {
+		t.Fatal(err)
+	}
+	kept := chunkHash([]byte("kept"))
+	if err := f.bucket.WriteAll(ctx, "xorbs/README", []byte("not a xorb"), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	f.store.sweepOrphanXorbs(ctx)
+
+	if ok, _ := f.bucket.Exists(ctx, storage.XorbPath(xorbABC)); ok {
+		t.Error("xorb bytes no row accounts for should have been reclaimed")
+	}
+	for _, key := range []string{storage.XorbPath(kept), "xorbs/README"} {
+		if ok, _ := f.bucket.Exists(ctx, key); !ok {
+			t.Errorf("%s must survive the orphan sweep", key)
+		}
+	}
+	if _, ok := f.xorbRefcount(t, xorbABC); ok {
+		t.Error("the orphan sweep must not leave a xorb row behind")
+	}
+}
+
+// writeXorb puts bytes at a xorb's path directly, the way a commit that wrote
+// its xorbs and then failed to commit leaves them.
+func (f *fixture) writeXorb(t *testing.T, hash, content string) {
+	t.Helper()
+	if err := f.bucket.WriteAll(t.Context(), storage.XorbPath(hash), []byte(content), nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Once an orphan is reclaimed, the same content uploaded again must come back
 // whole: the claim sees no row and writes the bytes afresh.
 func TestReuploadAfterOrphanSweepRewritesTheBytes(t *testing.T) {
@@ -242,15 +301,14 @@ func TestReuploadAfterOrphanSweepRewritesTheBytes(t *testing.T) {
 	ctx := t.Context()
 	nsID := f.namespace(t, "ns", nil)
 
-	f.writeBlob(t, hashABC, "abc")
-	f.store.sweepOrphanBlobs(ctx)
+	f.writeXorb(t, xorbABC, "abc")
+	f.store.sweepOrphanXorbs(ctx)
 
 	if _, err := f.store.Commit(ctx, nsID, "k", "text/plain", f.stage(t, "abc")); err != nil {
 		t.Fatal(err)
 	}
-	got, err := f.bucket.ReadAll(ctx, storage.BlobPath(hashABC))
-	if err != nil || string(got) != "abc" {
-		t.Errorf("blob bytes = %q, %v; want the re-upload's bytes in place", got, err)
+	if got, err := f.readRange(t, hashABC, 0, 3); err != nil || string(got) != "abc" {
+		t.Errorf("read back %q, %v; want the re-upload's bytes in place", got, err)
 	}
 }
 
@@ -278,11 +336,7 @@ func TestBackfillETagsRecordsMD5s(t *testing.T) {
 	if _, err := f.pool.Exec(ctx, "UPDATE blobs SET md5 = NULL WHERE hash = $1", hashABC); err != nil {
 		t.Fatal(err)
 	}
-	xyz, err := f.db.GetObject(ctx, known, "k")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.bucket.Delete(ctx, storage.BlobPath(xyz.BlobHash)); err != nil {
+	if err := f.bucket.Delete(ctx, storage.XorbPath(chunkHash([]byte("xyz")))); err != nil {
 		t.Fatal(err)
 	}
 
@@ -329,10 +383,12 @@ func TestGCPassOnAnEmptyStore(t *testing.T) {
 	ctx := t.Context()
 
 	f.store.sweepBlobs(ctx)
+	f.store.sweepXorbs(ctx)
 	f.store.sweepStaging(ctx)
 	f.store.sweepMultipart(ctx)
 	f.store.sweepSessions(ctx)
 	f.store.sweepOrphanBlobs(ctx)
+	f.store.sweepOrphanXorbs(ctx)
 
 	if n := f.countUnder(t, ""); n != 0 {
 		t.Errorf("an empty store gained %d objects during a GC pass", n)

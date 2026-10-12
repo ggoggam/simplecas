@@ -235,8 +235,11 @@ func TestStatsContract(t *testing.T) {
 		"Content-Type", "application/json"), http.StatusCreated)
 
 	// Two objects share one blob, so logical bytes exceed physical bytes.
-	mustStatus(t, f.do(t, http.MethodPut, "/api/namespaces/ns-a/objects/one", "abc"), http.StatusOK)
-	mustStatus(t, f.do(t, http.MethodPut, "/api/namespaces/ns-b/objects/two", "abc"), http.StatusOK)
+	// Physical bytes are as stored: 1000 bytes that do not compress are one
+	// chunk, kept as they are behind the 8-byte chunk header.
+	body1000 := incompressible(1000)
+	mustStatus(t, f.do(t, http.MethodPut, "/api/namespaces/ns-a/objects/one", body1000), http.StatusOK)
+	mustStatus(t, f.do(t, http.MethodPut, "/api/namespaces/ns-b/objects/two", body1000), http.StatusOK)
 
 	w := f.do(t, http.MethodGet, "/api/stats", "")
 	mustStatus(t, w, http.StatusOK)
@@ -256,15 +259,28 @@ func TestStatsContract(t *testing.T) {
 	if body["blob_count"] != float64(1) {
 		t.Errorf("blob_count = %v, want 1 (deduped)", body["blob_count"])
 	}
-	if body["logical_bytes"] != float64(6) || body["physical_bytes"] != float64(3) {
+	if body["logical_bytes"] != float64(2000) || body["physical_bytes"] != float64(1008) {
 		t.Errorf("bytes = %#v", body)
 	}
-	if body["dedup_ratio"] != float64(2) {
-		t.Errorf("dedup_ratio = %v, want 2", body["dedup_ratio"])
+	if body["dedup_ratio"] != 2000.0/1008 {
+		t.Errorf("dedup_ratio = %v, want 2000/1008", body["dedup_ratio"])
 	}
-	if body["saved_bytes"] != float64(3) {
-		t.Errorf("saved_bytes = %v, want 3", body["saved_bytes"])
+	if body["saved_bytes"] != float64(992) {
+		t.Errorf("saved_bytes = %v, want 992", body["saved_bytes"])
 	}
+}
+
+// incompressible returns n bytes LZ4 cannot shrink, the same on every run.
+func incompressible(n int) string {
+	out := make([]byte, n)
+	x := uint64(0x9e3779b97f4a7c15)
+	for i := range out {
+		x ^= x << 13
+		x ^= x >> 7
+		x ^= x << 17
+		out[i] = byte(x >> 56)
+	}
+	return string(out)
 }
 
 // An empty store must report a 1.0 ratio, not a division by zero.
