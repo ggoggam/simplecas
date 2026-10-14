@@ -58,7 +58,7 @@ type DatabaseConfig struct {
 //
 //	xorbs/<h[0:2]>/<h[2:4]>/<hash> – Xet xorbs of content-defined chunks; immutable
 //	blobs/<h[0:2]>/<h[2:4]>/<hash> – whole files stored before chunking
-//	staging/<uuid>                 – in-flight uploads and multipart parts
+//	staging/<uuid>[.sealed]        – in-flight uploads and multipart parts
 type StorageConfig struct {
 	// Backend is one of fs, s3, gcs, azblob.
 	Backend string `toml:"backend"`
@@ -83,6 +83,25 @@ type StorageConfig struct {
 	Container   string `toml:"container"`
 	AccountName string `toml:"account_name"`
 	AccountKey  string `toml:"account_key"`
+
+	// EncryptionKeys encrypt stored content at rest, as "id:base64key"
+	// entries of 32 random bytes each, like auth.credential_keys but never
+	// the same keys. The first encrypts what is written from now on; the rest
+	// only decrypt what was written under them. Empty stores content in the
+	// clear. Content stored before a key was set stays in the clear.
+	EncryptionKeys []string `toml:"encryption_keys"`
+}
+
+// Keyring parses EncryptionKeys. It is nil, with no error, when none are set.
+func (s *StorageConfig) Keyring() (*seal.Keyring, error) {
+	if len(s.EncryptionKeys) == 0 {
+		return nil, nil
+	}
+	k, err := seal.Parse(s.EncryptionKeys)
+	if err != nil {
+		return nil, fmt.Errorf("storage.encryption_keys: %w", err)
+	}
+	return k, nil
 }
 
 // AuthConfig is the S3 gateway's SigV4 credential. Disabled means anonymous
@@ -427,6 +446,13 @@ func (c *Config) Validate() error {
 	if _, err := c.Auth.Keyring(); err != nil {
 		return err
 	}
+	if _, err := c.Storage.Keyring(); err != nil {
+		return err
+	}
+	if shared := sharedKey(c.Auth.CredentialKeys, c.Storage.EncryptionKeys); shared != "" {
+		return fmt.Errorf("storage.encryption_keys and auth.credential_keys both hold the key material of %q: "+
+			"give each its own keys, so that rotating one does not mean rotating the other", shared)
+	}
 
 	// Without OIDC nothing authenticates /api, which creates and deletes every
 	// namespace and object and mints gateway credentials. That is a sensible
@@ -463,6 +489,23 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// sharedKey returns the id, in b, of a key whose material a also holds, or
+// "" if the two lists share none. Both have already parsed.
+func sharedKey(a, b []string) string {
+	material := make(map[string]bool, len(a))
+	for _, entry := range a {
+		_, m, _ := strings.Cut(strings.TrimSpace(entry), ":")
+		material[seal.Normalize(m)] = true
+	}
+	for _, entry := range b {
+		id, m, _ := strings.Cut(strings.TrimSpace(entry), ":")
+		if material[seal.Normalize(m)] {
+			return id
+		}
+	}
+	return ""
 }
 
 // IsLoopbackBind reports whether a listen address accepts connections from

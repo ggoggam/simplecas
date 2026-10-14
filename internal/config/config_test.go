@@ -215,6 +215,10 @@ func TestLoadMissingConfigFile(t *testing.T) {
 // testCredentialKey is a well-formed auth.credential_keys entry.
 const testCredentialKey = "k1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
+// testEncryptionKey is a well-formed storage.encryption_keys entry, another
+// key than testCredentialKey.
+const testEncryptionKey = "e1:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+
 func TestValidate(t *testing.T) {
 	base := func() Config {
 		c := Default()
@@ -310,6 +314,22 @@ func TestValidate(t *testing.T) {
 		}
 	})
 
+	t.Run("encryption keys parse into a keyring, and are optional", func(t *testing.T) {
+		c := base()
+		if k, err := c.Storage.Keyring(); k != nil || err != nil {
+			t.Errorf("Keyring() = %v, %v; want nil, nil with no keys", k, err)
+		}
+		c.Auth.CredentialKeys = []string{testCredentialKey}
+		c.Storage.EncryptionKeys = []string{testEncryptionKey}
+		if err := c.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		k, err := c.Storage.Keyring()
+		if err != nil || k == nil || k.Current() != "e1" {
+			t.Errorf("Keyring() = %v, %v; want one keyed e1", k, err)
+		}
+	})
+
 	t.Run("non-fs backends get no root default", func(t *testing.T) {
 		c := base()
 		c.Storage.Backend = "s3"
@@ -363,6 +383,15 @@ func TestValidate(t *testing.T) {
 		// Checked with or without oidc: a key list that is set is meant.
 		{"malformed credential key", func(c *Config) {
 			c.Auth.CredentialKeys = []string{"k1:not-a-32-byte-key"}
+		}},
+		{"malformed encryption key", func(c *Config) {
+			c.Storage.EncryptionKeys = []string{"e1:not-a-32-byte-key"}
+		}},
+		// The same material, even spelled in another base64 alphabet and
+		// under another name, is still one key used for two things.
+		{"an encryption key that is also a credential key", func(c *Config) {
+			c.Auth.CredentialKeys = []string{testCredentialKey}
+			c.Storage.EncryptionKeys = []string{testEncryptionKey, "e0:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
 		}},
 	}
 	for _, tc := range tests {

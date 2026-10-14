@@ -2,6 +2,7 @@ package cas
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -279,11 +280,19 @@ func (s *Store) fetchRun(ctx context.Context, xorb string, run []span) fetched {
 			end := at + int64(sp.Length)
 			if end > int64(len(stored)) {
 				damage = fmt.Sprintf("short read: %d bytes at %d, want %d", len(stored), start, length)
-			} else if raw, why := verifyChunk(stored[at:end], sp.XorbChunk); why != "" {
-				damage = fmt.Sprintf("chunk at %d: %s", sp.Offset, why)
 			} else {
-				raws[i] = raw
-				continue
+				raw, why, cerr := s.verifyChunk(ctx, stored[at:end], sp.XorbChunk)
+				if cerr != nil {
+					if damage != "" {
+						s.damaged(ctx, xorb, damage)
+					}
+					return fetched{err: cerr}
+				}
+				if why == "" {
+					raws[i] = raw
+					continue
+				}
+				damage = fmt.Sprintf("chunk at %d: %s", sp.Offset, why)
 			}
 		}
 		missing = append(missing, i)
@@ -338,7 +347,10 @@ func (s *Store) soundCopy(ctx context.Context, c db.XorbChunk, locs []db.ChunkLo
 		if err != nil {
 			continue
 		}
-		raw, why := verifyChunk(b, stored[0])
+		raw, why, err := s.verifyChunk(ctx, b, stored[0])
+		if err != nil {
+			continue
+		}
 		if why != "" {
 			s.damaged(ctx, loc.Xorb, fmt.Sprintf("chunk at %d: %s", stored[0].Offset, why))
 			continue
@@ -359,19 +371,39 @@ func (s *Store) readStored(ctx context.Context, key string, start, length int64)
 }
 
 // verifyChunk decodes one stored chunk and checks it against c, returning
-// it decoded, or why it is not sound.
-func verifyChunk(b []byte, c db.XorbChunk) (raw []byte, why string) {
+// it decoded, or why it is not sound. err is a check that could not be made:
+// the chunk is sealed under a key this instance does not hold, which says
+// nothing about whether its bytes are sound, so it must not be taken for
+// damage.
+//
+// The key a chunk names is read from its bytes before anything authenticates
+// them, and a bit flipped there would name a key nobody holds. So a missing
+// key counts as one only if it is a key some instance has been configured
+// with (storage_keys); any other name is damage, which lets reads fall back
+// to a sound copy and compaction repair it.
+func (s *Store) verifyChunk(ctx context.Context, b []byte, c db.XorbChunk) (raw []byte, why string, err error) {
 	if len(b) != int(c.Length) {
-		return nil, fmt.Sprintf("%d bytes stored, want %d", len(b), c.Length)
+		return nil, fmt.Sprintf("%d bytes stored, want %d", len(b), c.Length), nil
 	}
-	raw, err := decodeChunk(b, int(c.Size))
+	raw, err = decodeChunk(b, int(c.Size), c.Hash, s.keys)
+	var missing *missingKeyError
+	if errors.As(err, &missing) {
+		recorded, rerr := s.keyRecorded(ctx, missing.id)
+		if rerr != nil {
+			return nil, "", rerr
+		}
+		if recorded {
+			return nil, "", apperr.Internalf("chunk %s: %w", c.Hash, err)
+		}
+		return nil, fmt.Sprintf("sealed under %q, a key no instance has been configured with", missing.id), nil
+	}
 	if err != nil {
-		return nil, err.Error()
+		return nil, err.Error(), nil
 	}
 	if chunkHash(raw) != c.Hash {
-		return nil, "chunk does not match its hash"
+		return nil, "chunk does not match its hash", nil
 	}
-	return raw, ""
+	return raw, "", nil
 }
 
 // damaged logs a xorb whose stored bytes failed a check, and records it.

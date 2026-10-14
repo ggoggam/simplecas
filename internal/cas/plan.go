@@ -82,7 +82,7 @@ func (s *Store) plan(ctx context.Context, staged StagedBlob, namespaceID int64) 
 	}
 	if exists {
 		// Stored for someone else: written in full, then thrown away.
-		p.decoys = groupForXorbs(staged.Chunks, allIndexes(len(staged.Chunks)))
+		p.decoys = groupForXorbs(staged.Chunks, allIndexes(len(staged.Chunks)), chunkOverhead(s.keys))
 		return p, nil
 	}
 
@@ -126,7 +126,7 @@ func (s *Store) plan(ctx context.Context, staged StagedBlob, namespaceID int64) 
 		}
 	}
 
-	for x, chunks := range groupForXorbs(staged.Chunks, newChunks) {
+	for x, chunks := range groupForXorbs(staged.Chunks, newChunks, chunkOverhead(s.keys)) {
 		px := plannedXorb{chunks: chunks}
 		nodes := make([]hashedSize, len(chunks))
 		for i, c := range chunks {
@@ -147,7 +147,7 @@ func (s *Store) plan(ctx context.Context, staged StagedBlob, namespaceID int64) 
 		}
 		p.xorbs = append(p.xorbs, px)
 	}
-	p.decoys = groupForXorbs(staged.Chunks, decoyChunks)
+	p.decoys = groupForXorbs(staged.Chunks, decoyChunks, chunkOverhead(s.keys))
 
 	// Terms: consecutive chunks at consecutive places in one xorb.
 	for c, ref := range staged.Chunks {
@@ -245,8 +245,8 @@ func allIndexes(n int) []int {
 }
 
 // groupForXorbs splits the chunks at indexes, in order, into groups that each
-// fit one xorb.
-func groupForXorbs(chunks []db.ChunkRef, indexes []int) [][]int {
+// fit one xorb, with overhead bytes stored around each chunk.
+func groupForXorbs(chunks []db.ChunkRef, indexes []int, overhead int64) [][]int {
 	var (
 		groups [][]int
 		cur    []int
@@ -254,7 +254,7 @@ func groupForXorbs(chunks []db.ChunkRef, indexes []int) [][]int {
 	)
 	for _, c := range indexes {
 		size := int64(chunks[c].Size)
-		if len(cur) > 0 && (len(cur) == maxXorbChunks || worstCaseStored(raw+size, len(cur)+1) > maxXorbBytes) {
+		if len(cur) > 0 && (len(cur) == maxXorbChunks || worstCaseStored(raw+size, len(cur)+1, overhead) > maxXorbBytes) {
 			groups = append(groups, cur)
 			cur, raw = nil, 0
 		}
@@ -274,6 +274,9 @@ const xorbUploads = 1
 
 // written is what carrying out a plan stored: the new xorbs, as the database
 // records them, and the scratch objects to delete afterwards.
+//
+// Decoys are written as xorbs are, sealed if xorbs are, so that writing one
+// costs what writing new content would.
 type written struct {
 	xorbs  []db.NewXorb
 	decoys []string
@@ -288,7 +291,7 @@ type written struct {
 func (s *Store) carryOut(ctx context.Context, staged StagedBlob, p *commitPlan) (w written, err error) {
 	w.xorbs = make([]db.NewXorb, len(p.xorbs))
 	for i, x := range p.xorbs {
-		w.xorbs[i] = db.NewXorb{Hash: x.hash, Chunks: make([]db.XorbChunk, 0, len(x.chunks))}
+		w.xorbs[i] = db.NewXorb{Hash: x.hash, KeyID: currentKeyID(s.keys), Chunks: make([]db.XorbChunk, 0, len(x.chunks))}
 	}
 	if !p.writes() {
 		return w, nil
@@ -299,7 +302,7 @@ func (s *Store) carryOut(ctx context.Context, staged StagedBlob, p *commitPlan) 
 		}
 	}()
 
-	r, err := s.blob.NewReader(ctx, staged.StagingKey, nil)
+	r, err := s.openStaging(ctx, staged.StagingKey)
 	if err != nil {
 		return w, apperr.Internalf("open staged upload: %w", err)
 	}
@@ -354,7 +357,9 @@ func (s *Store) carryOut(ctx context.Context, staged StagedBlob, p *commitPlan) 
 		if chunkHash(raw) != ref.Hash {
 			return w, errors.Join(apperr.Internalf("staged chunk at %d no longer matches its hash", ref.Pos), g.Wait())
 		}
-		scratch = appendChunk(scratch[:0], raw)
+		if scratch, err = appendChunk(scratch[:0], raw, ref.Hash, s.keys); err != nil {
+			return w, errors.Join(apperr.Internalf("seal chunk at %d: %w", ref.Pos, err), g.Wait())
+		}
 
 		var out *objectWriter
 		switch rt {
@@ -364,7 +369,7 @@ func (s *Store) carryOut(ctx context.Context, staged StagedBlob, p *commitPlan) 
 					finish(xorbOut, &w.xorbs[xorbAt])
 				}
 				px := p.xorbs[x]
-				xorbOut, err = s.openObject(gctx, storage.XorbPath(px.hash), worstCaseStored(px.raw, len(px.chunks)), true)
+				xorbOut, err = s.openObject(gctx, storage.XorbPath(px.hash), worstCaseStored(px.raw, len(px.chunks), chunkOverhead(s.keys)), true)
 				if err != nil {
 					return w, errors.Join(err, g.Wait())
 				}
@@ -386,7 +391,7 @@ func (s *Store) carryOut(ctx context.Context, staged StagedBlob, p *commitPlan) 
 				}
 				key := storage.StagingPath(uuid.NewString())
 				w.decoys = append(w.decoys, key)
-				decoyOut, err = s.openObject(gctx, key, worstCaseStored(raw, len(p.decoys[d])), false)
+				decoyOut, err = s.openObject(gctx, key, worstCaseStored(raw, len(p.decoys[d]), chunkOverhead(s.keys)), false)
 				if err != nil {
 					return w, errors.Join(err, g.Wait())
 				}

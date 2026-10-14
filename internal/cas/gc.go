@@ -31,7 +31,8 @@ const etagBatch = 16
 // RunGC reclaims space until ctx is cancelled: unreferenced blobs and xorbs,
 // the dead chunks of sparse xorbs (by compacting them), orphaned staging
 // files, abandoned multipart uploads, and expired sign-in sessions on every
-// tick, and stored bytes no row accounts for every orphan interval.
+// tick, and stored bytes no row accounts for every orphan interval. Each tick
+// also folds the usage deltas written since the last into their counters.
 // Each tick also records ETags for some objects stored before they were.
 // Every pass is best-effort — a failure is logged and retried on the next tick
 // rather than ending the loop, because a transient database or backend blip
@@ -66,6 +67,7 @@ func (s *Store) RunGC(ctx context.Context) {
 		s.sweepStaging(ctx)
 		s.sweepMultipart(ctx)
 		s.sweepSessions(ctx)
+		s.foldUsage(ctx)
 		s.backfillETags(ctx)
 		if time.Since(lastOrphanSweep) >= orphanInterval {
 			s.sweepOrphanBlobs(ctx)
@@ -102,6 +104,14 @@ func (s *Store) sweepXorbs(ctx context.Context) {
 	}
 	if swept > 0 {
 		s.log.Info("gc: removed unreferenced xorbs", "swept", swept)
+	}
+}
+
+// foldUsage folds the usage deltas objects' writes left into the namespace
+// counters, which keeps the deltas a quota check reads few.
+func (s *Store) foldUsage(ctx context.Context) {
+	if _, err := s.db.FoldUsage(ctx); err != nil && ctx.Err() == nil {
+		s.log.Warn("could not fold usage deltas", "err", err)
 	}
 }
 

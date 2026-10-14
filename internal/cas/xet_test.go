@@ -122,7 +122,7 @@ func TestXetReferenceFile(t *testing.T) {
 	off := 0
 	for i, c := range got {
 		stored := int(xorb[off+1]) | int(xorb[off+2])<<8 | int(xorb[off+3])<<16
-		raw, err := decodeChunk(xorb[off:off+chunkHeaderLen+stored], int(c.Size))
+		raw, err := decodeChunk(xorb[off:off+chunkHeaderLen+stored], int(c.Size), c.Hash, nil)
 		if err != nil {
 			t.Fatalf("chunk %d: %v", i, err)
 		}
@@ -145,7 +145,10 @@ func TestChunkSerializationRoundTrips(t *testing.T) {
 		{"empty", nil, schemeNone},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			b := appendChunk([]byte("prefix"), tc.data)
+			b, err := appendChunk([]byte("prefix"), tc.data, chunkHash(tc.data), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
 			chunk := b[len("prefix"):]
 			if chunk[4] != tc.scheme {
 				t.Errorf("scheme = %d, want %d", chunk[4], tc.scheme)
@@ -153,17 +156,17 @@ func TestChunkSerializationRoundTrips(t *testing.T) {
 			if tc.scheme == schemeNone && len(chunk) != chunkHeaderLen+len(tc.data) {
 				t.Errorf("stored %d bytes, want the data as it is behind its header", len(chunk))
 			}
-			got, err := decodeChunk(chunk, len(tc.data))
+			got, err := decodeChunk(chunk, len(tc.data), "", nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if !bytes.Equal(got, tc.data) {
 				t.Error("decoded bytes differ")
 			}
-			if _, err := decodeChunk(chunk, len(tc.data)+1); err == nil {
+			if _, err := decodeChunk(chunk, len(tc.data)+1, "", nil); err == nil {
 				t.Error("a chunk of the wrong size decoded")
 			}
-			if _, err := decodeChunk(chunk[:len(chunk)-1], len(tc.data)); err == nil && len(chunk) > chunkHeaderLen {
+			if _, err := decodeChunk(chunk[:len(chunk)-1], len(tc.data), "", nil); err == nil && len(chunk) > chunkHeaderLen {
 				t.Error("a truncated chunk decoded")
 			}
 		})
@@ -180,13 +183,16 @@ func TestDecodeChunkReadsByteGrouping(t *testing.T) {
 		}
 	}
 	data := bytes.Repeat([]byte{1, 2, 3, 4, 5}, 1000)
-	lz4ed := appendChunk(nil, bg4Split(data))
+	lz4ed, err := appendChunk(nil, bg4Split(data), "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if lz4ed[4] != schemeLZ4 {
 		t.Fatal("setup: grouped data should compress")
 	}
 	lz4ed[4] = schemeBG4LZ4
 	lz4ed[5], lz4ed[6], lz4ed[7] = byte(len(data)), byte(len(data)>>8), byte(len(data)>>16)
-	got, err := decodeChunk(lz4ed, len(data))
+	got, err := decodeChunk(lz4ed, len(data), "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

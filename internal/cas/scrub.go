@@ -166,7 +166,11 @@ func (s *Store) checkXorb(ctx context.Context, p *pacer, t db.ScrubTarget) (why 
 		if c.Offset != at || c.Offset+int64(c.Length) > int64(len(b)) {
 			return fmt.Sprintf("chunk %d is recorded at %d+%d, want it at %d", i, c.Offset, c.Length, at), nil
 		}
-		if _, why := verifyChunk(b[c.Offset:c.Offset+int64(c.Length)], c); why != "" {
+		_, why, err := s.verifyChunk(ctx, b[c.Offset:c.Offset+int64(c.Length)], c)
+		if err != nil {
+			return "", err
+		}
+		if why != "" {
 			if bad == 0 {
 				first = fmt.Sprintf("chunk %d at %d: %s", i, c.Offset, why)
 			}

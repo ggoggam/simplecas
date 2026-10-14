@@ -18,9 +18,7 @@ func (d *DB) Stats(ctx context.Context) (Stats, error) {
 	if err != nil {
 		return Stats{}, apperr.Internal(err)
 	}
-	err = d.pool.QueryRow(ctx,
-		"SELECT COUNT(*), COALESCE(SUM(size), 0)::BIGINT FROM objects").
-		Scan(&s.ObjectCount, &s.LogicalBytes)
+	err = d.pool.QueryRow(ctx, usageQuery("true")).Scan(&s.ObjectCount, &s.LogicalBytes)
 	if err != nil {
 		return Stats{}, apperr.Internal(err)
 	}
@@ -40,6 +38,20 @@ func (d *DB) Stats(ctx context.Context) (Stats, error) {
 	return s, nil
 }
 
+// usageQuery counts the objects, and sums their sizes, of the namespaces
+// matching where (over namespaces n), from the usage counters and the deltas
+// not yet folded into them (see quota.go).
+func usageQuery(where string) string {
+	return `
+		SELECT COALESCE(SUM(objects), 0)::BIGINT, COALESCE(SUM(bytes), 0)::BIGINT FROM (
+		    SELECT u.objects, u.bytes FROM namespace_usage u
+		    JOIN namespaces n ON n.id = u.namespace_id WHERE ` + where + `
+		    UNION ALL
+		    SELECT d.objects, d.bytes FROM usage_deltas d
+		    JOIN namespaces n ON n.id = d.namespace_id WHERE ` + where + `
+		) usage`
+}
+
 // StatsForTenants restricts the accounting to namespaces owned by tenantIDs.
 //
 // Under global dedup a blob or xorb shared by two tenants counts toward each
@@ -54,11 +66,7 @@ func (d *DB) StatsForTenants(ctx context.Context, tenantIDs []int64) (Stats, err
 	if err != nil {
 		return Stats{}, apperr.Internal(err)
 	}
-	err = d.pool.QueryRow(ctx, `
-		SELECT COUNT(*), COALESCE(SUM(o.size), 0)::BIGINT
-		FROM objects o
-		JOIN namespaces n ON n.id = o.namespace_id
-		WHERE n.tenant_id = ANY($1)`, tenantIDs).
+	err = d.pool.QueryRow(ctx, usageQuery("n.tenant_id = ANY($1)"), tenantIDs).
 		Scan(&s.ObjectCount, &s.LogicalBytes)
 	if err != nil {
 		return Stats{}, apperr.Internal(err)

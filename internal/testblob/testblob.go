@@ -16,8 +16,10 @@
 package testblob
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -35,6 +37,7 @@ import (
 	"gocloud.dev/blob"
 
 	"github.com/ggoggam/simplecas/internal/config"
+	"github.com/ggoggam/simplecas/internal/seal"
 	"github.com/ggoggam/simplecas/internal/storage"
 )
 
@@ -206,4 +209,33 @@ func randomSuffix(t *testing.T) string {
 		t.Fatalf("read random: %v", err)
 	}
 	return hex.EncodeToString(buf[:])
+}
+
+// EncryptEnvVar, when set to anything, has the suites store content
+// encrypted at rest: Keys returns a keyring rather than nil. CI sets it on the
+// s3 leg, so every suite runs once in the clear and once sealed.
+const EncryptEnvVar = "SIMPLECAS_TEST_ENCRYPT"
+
+// Keys returns the keyring a test's store should encrypt content under: nil
+// unless EncryptEnvVar is set.
+func Keys(t *testing.T) *seal.Keyring {
+	t.Helper()
+	if os.Getenv(EncryptEnvVar) == "" {
+		return nil
+	}
+	return TestKeys(t)
+}
+
+// TestKeys returns a keyring for a test that always encrypts, whose current
+// key is "t2" and which can also open what "t1" sealed.
+func TestKeys(t *testing.T) *seal.Keyring {
+	t.Helper()
+	k, err := seal.Parse([]string{
+		"t2:" + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{2}, seal.KeyBytes)),
+		"t1:" + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, seal.KeyBytes)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
 }

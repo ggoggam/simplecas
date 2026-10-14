@@ -82,6 +82,8 @@ Two background jobs keep stored content sound and compact:
   it if its live chunks take up less than `[gc] compact_below_percent` of it
   (default 50): the live chunks are copied as stored into a new xorb, every
   term moves onto it, and the old xorb is collected after the grace period.
+  With [encryption at rest](#encryption-at-rest) on, chunks not sealed under
+  the current key are sealed under it on the way.
   Reads that looked their terms up before the move still find the chunks. `0`
   turns compaction off.
 
@@ -121,8 +123,81 @@ What remains: the global `blobs` table is shared, so an operator, or anyone
 with read access to the database or the blob store, can see which teams store
 identical content. Per-team storage and quota statistics count only the team's
 own objects, and the PWA's zero-byte link only links content the caller's own
-team already holds (see [Teams](#teams-multi-tenancy)). Encryption at rest with
-per-team keys would need per-team dedup and is not offered.
+team already holds (see [Teams](#teams-multi-tenancy)). Content can be
+[encrypted at rest](#encryption-at-rest) under server keys; per-team keys
+would need per-team dedup and are not offered.
+
+### Encryption at rest
+
+With `storage.encryption_keys` set, what the server writes to the blob backend
+is encrypted with AES-256-GCM: the chunks in xorbs, and the staging files that
+hold uploads and multipart parts until they are committed. The exception is a
+blob stored whole before chunking, which stays in the clear (see below). Someone
+who can read the bucket, but not the server's configuration, learns how much
+is stored and nothing else. Keys work as `auth.credential_keys` do, and must
+be different keys:
+
+```toml
+[storage]
+# "id:base64key", 32 random bytes each: openssl rand -base64 32
+encryption_keys = ["e1:…"]
+```
+
+or `SIMPLECAS__STORAGE__ENCRYPTION_KEYS=e1:…`. Every instance needs the same
+list. Without it, content is stored in the clear, as before.
+
+- **Keys per chunk.** Dedup is global, so a chunk can belong to many teams and
+  cannot be sealed under any one team's key. Each chunk is sealed under a key
+  derived (HKDF-SHA256) from the server key and the chunk's hash, with a
+  random nonce: convergent encryption, keyed with a server secret. Deriving a
+  key per chunk keeps each GCM key's use to the copies of one chunk, so random
+  nonces never approach their collision limit, which one key for everything
+  would reach at about 256 TiB of chunks. Dedup works as before.
+- **Self-describing.** Each chunk names its key, and each sealed staging file
+  (`staging/<uuid>.sealed`) does too, so content stored in the clear and
+  content under older keys is read beside new content. A sealed staging file
+  is a stream of 64 KiB segments under a key bound to its name, so one cut
+  short, reordered, or copied over another upload's staging file does not
+  open. Completing a multipart upload also checks each staged part's size and
+  MD5 against the part that was uploaded.
+- **Not damage.** A chunk under a key the instance does not hold, but that
+  some instance has been configured with, fails the read with an error but is
+  not marked damaged, and the scrub leaves it for an instance that can check
+  it. A chunk naming a key no instance was ever given (its key name rotted), or
+  that does not authenticate under its key, is damage like any other: reads
+  fall back to a sound copy, and compaction can repair it.
+
+The server **refuses to start** when its keys cannot read what is stored: if
+some xorb is under a key the list no longer holds, or the list is empty while
+sealed xorbs exist. It also records a fingerprint of each key under its id the
+first time any instance starts with it, and refuses a different key under a
+recorded id. Two instances given different keys under one name would otherwise
+each write content the other cannot open. **A key id names one key for good;
+a new key needs a new id.**
+
+To **turn it on**, deploy this version everywhere first, then set the keys on
+every instance: an older instance cannot read sealed chunks. To **rotate**:
+
+1. Add the new key **at the end** and roll it out, so every instance can read
+   what it will write.
+2. Move it **to the front** and roll that out. New content is sealed under it.
+3. Drop the old key only once no xorb is under it, and a
+   `[gc] multipart_expiry_secs` has passed since step 2, so no staged part is
+   either. The server refuses to start without a key some xorb still uses.
+
+What is already stored is not rewritten when keys change. Compaction seals
+what it copies under the current key, so sparse xorbs move forward on their
+own; a dense xorb stays as it was written. Blobs stored whole before chunking
+stay in the clear, and when an upload of such content rewrites the file (to
+revive or repair it), it is written in the clear as before. To see what is stored under which key (`NULL` is in the
+clear):
+
+```sql
+SELECT key_id, count(*) AS xorbs, sum(size) AS bytes FROM xorbs WHERE refcount > 0 GROUP BY key_id;
+```
+
+Database rows are not encrypted: object keys, sizes and content hashes stay
+readable to anyone who can read the database.
 
 ### Client-side dedup (PWA)
 
@@ -251,9 +326,16 @@ object in its namespaces plus the parts of its unfinished multipart uploads.
 Dedup stays global, but content another team also stores is charged in full, so
 a team's usage never reveals what other teams hold. Overwriting a key charges the
 difference; copies and dedup links are charged like uploads. Namespaces without a
-team are never charged. Usage is summed from the rows on each write rather than
-kept as a counter, which costs a scan of the team's objects per write while a
-quota is set.
+team are never charged.
+
+Usage is counted as it changes, so a quota check reads a few counters per
+namespace of the team, however many objects it stores. Triggers on the
+`objects` table append each statement's net change per namespace to
+`usage_deltas`, so no write path can leave the count out, and no write waits
+on a shared counter row. Each GC tick folds those deltas into
+`namespace_usage`; a check counts both. Team and global stats read the same
+counters. Staged parts are summed from their rows, since only unfinished
+uploads have any.
 
 The stall timeout is on silence, not duration: a multi-gigabyte transfer may
 take as long as it needs while bytes keep moving, but one that stops for
@@ -819,7 +901,8 @@ internal/
   storage/           blob backend construction + the xorbs/, blobs/ and staging/ layout
   db/                all SQL: namespaces, users, sessions, tenants + invitations, audit log, blobs, xorbs + terms, objects, multipart, GC, compaction, scrubbing
   db/migrations/     embedded SQL migrations (run automatically on boot)
-  cas/               content-addressed write path (stage → plan → write → claim), Xet chunking, hashing and xorbs, chunked reads, the GC loop with compaction, and scrubbing
+  cas/               content-addressed write path (stage → plan → write → claim), Xet chunking, hashing and xorbs, chunked reads, encryption at rest, the GC loop with compaction, and scrubbing
+  seal/              versioned server keys: sealing small secrets, and deriving subkeys
   s3/                S3 gateway: handlers, XML wire types, SigV4 verification
   api/               JSON admin API for the PWA
   auth/              OIDC sign-in: discovery, database-backed sessions behind signed cookies, guard middleware
@@ -863,8 +946,10 @@ Blobs go to a temporary directory on the fs backend unless
 `SIMPLECAS_TEST_S3_URL` (`http://KEY:SECRET@host:port/bucket`) names an
 S3-compatible store; then every test stores its blobs under its own prefix of
 that bucket instead (`internal/testblob`), so the same suites cover the s3
-backend. `mise run test:s3` runs everything that way against the dev RustFS,
-and CI runs the suite once on each backend.
+backend. With `SIMPLECAS_TEST_ENCRYPT` set, every suite also stores content
+[encrypted at rest](#encryption-at-rest). `mise run test:s3` runs everything
+both ways against the dev RustFS, and CI runs the suite once on each backend,
+the s3 leg encrypted.
 
 `e2e/conformance_test.go` states S3 behaviour through the AWS SDK for Go —
 errors, ranges, listing order and pagination, awkward keys, copy, multipart,

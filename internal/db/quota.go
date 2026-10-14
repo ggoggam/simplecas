@@ -18,10 +18,12 @@ import (
 // this team its full size. Splitting the cost by refcount would let a team
 // learn what other teams store by watching its own usage move.
 //
-// Usage is summed from the rows rather than kept in a counter. The namespace
-// and upload deletes cascade to objects and parts, and a counter maintained
-// beside them would drift the first time a path forgot it. The sum costs a
-// scan of the team's objects per write, and only when a quota is configured.
+// What objects store is counted per namespace by triggers on the objects
+// table (migration 0013), so no write path can leave it out: usage is the
+// namespace_usage counters plus the usage_deltas not yet folded into them.
+// Reading it costs a few rows per namespace of the team, however many
+// objects the team stores. Staged parts are still summed from their rows:
+// only unfinished uploads have any, and they go when the upload does.
 // ---------------------------------------------------------------------------
 
 // QuotaCheck describes the write being charged, so usage can leave out what
@@ -111,15 +113,26 @@ func namespaceTenant(ctx context.Context, tx pgx.Tx, namespaceID int64) (*int64,
 
 // tenantUsage sums a team's objects and staged parts, leaving out the object
 // and parts c says are being replaced.
+//
+// It is one statement, so it sees the counters and the deltas at one moment:
+// a fold that commits meanwhile moves deltas into the counters all at once,
+// and is seen whole or not at all.
 func tenantUsage(ctx context.Context, tx pgx.Tx, tenantID int64, c QuotaCheck) (int64, error) {
 	var used int64
 	err := tx.QueryRow(ctx, `
 		SELECT
 		    COALESCE((
-		        SELECT SUM(o.size) FROM objects o
-		        JOIN namespaces n ON n.id = o.namespace_id
+		        SELECT SUM(u.bytes) FROM namespace_usage u
+		        JOIN namespaces n ON n.id = u.namespace_id
 		        WHERE n.tenant_id = $1
-		          AND NOT (o.namespace_id = $2 AND o.key = $3)
+		    ), 0)
+		  + COALESCE((
+		        SELECT SUM(d.bytes) FROM usage_deltas d
+		        JOIN namespaces n ON n.id = d.namespace_id
+		        WHERE n.tenant_id = $1
+		    ), 0)
+		  - COALESCE((
+		        SELECT o.size FROM objects o WHERE o.namespace_id = $2 AND o.key = $3
 		    ), 0)
 		  + COALESCE((
 		        SELECT SUM(p.size) FROM multipart_parts p
@@ -140,4 +153,47 @@ func overQuota(used, quota int64) error {
 		return apperr.QuotaExceeded("this would use %d bytes of the team's %d-byte quota", used, quota)
 	}
 	return nil
+}
+
+// usageFoldBatch caps how many deltas one fold takes, so that one statement
+// never holds a lock on a great many of them.
+const usageFoldBatch = 10000
+
+// FoldUsage folds the usage deltas written so far into the namespace
+// counters, and reports how many it folded. Instances can fold at the same
+// time: each takes deltas none of the others has (SKIP LOCKED), and a delta
+// is deleted in the statement that adds it to its counter, so each is
+// counted once. Deltas of a namespace that no longer exists are dropped.
+func (d *DB) FoldUsage(ctx context.Context) (int64, error) {
+	var total int64
+	for {
+		var n int64
+		err := d.pool.QueryRow(ctx, `
+			WITH folded AS (
+			    DELETE FROM usage_deltas WHERE id IN (
+			        SELECT id FROM usage_deltas ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED)
+			    RETURNING namespace_id, objects, bytes
+			), summed AS (
+			    SELECT f.namespace_id, sum(f.objects) AS objects, sum(f.bytes) AS bytes
+			    FROM folded f JOIN namespaces n ON n.id = f.namespace_id
+			    GROUP BY f.namespace_id
+			), upserted AS (
+			    -- In namespace order, so that two folds lock counters
+			    -- one way round.
+			    INSERT INTO namespace_usage (namespace_id, objects, bytes)
+			    SELECT namespace_id, objects, bytes FROM summed ORDER BY namespace_id
+			    ON CONFLICT (namespace_id) DO UPDATE
+			        SET objects = namespace_usage.objects + EXCLUDED.objects,
+			            bytes = namespace_usage.bytes + EXCLUDED.bytes
+			    RETURNING 1
+			)
+			SELECT count(*) FROM folded`, usageFoldBatch).Scan(&n)
+		if err != nil {
+			return total, apperr.Internal(err)
+		}
+		total += n
+		if n < usageFoldBatch {
+			return total, nil
+		}
+	}
 }
