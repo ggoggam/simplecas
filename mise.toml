@@ -198,8 +198,8 @@ run = "go test -race -count=1 ./e2e/..."
 [tasks."test:e2e".env]
 SIMPLECAS_TEST_DATABASE_URL = "postgres://postgres:postgres@localhost:55432/simplecas"
 
-# Everything again with blobs on the dev RustFS instead of a temp directory, as
-# CI's s3 leg runs it; RustFS is also the reference the S3 conformance suite
+# Everything again with blobs on the dev RustFS instead of a temp directory, and
+# encrypted at rest, as CI's s3 leg runs it; RustFS is also the reference the S3 conformance suite
 # (e2e/conformance_test.go) checks the gateway against. Tests keep to their own
 # prefix of a 'simplecas-test' bucket, apart from the dev server's 'simplecas'.
 [tasks."test:s3"]
@@ -215,6 +215,8 @@ go test -race -count=1 ./...
 [tasks."test:s3".env]
 SIMPLECAS_TEST_DATABASE_URL = "postgres://postgres:postgres@localhost:55432/simplecas"
 SIMPLECAS_TEST_S3_URL = "http://rustfsadmin:rustfsadmin@localhost:9200/simplecas-test"
+# As on CI's s3 leg, content is also encrypted at rest.
+SIMPLECAS_TEST_ENCRYPT = "1"
 
 [tasks."test:coverage"]
 description = "Run the test suite with coverage"

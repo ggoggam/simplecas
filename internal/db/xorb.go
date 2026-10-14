@@ -47,6 +47,9 @@ type XorbChunk struct {
 type NewXorb struct {
 	Hash string
 	Size int64
+	// KeyID is the encryption key its chunks are sealed under, or "" for a
+	// xorb written in the clear.
+	KeyID string
 	// Existed means the object was already in the backend and the write left
 	// it alone, so Chunks' offsets describe this commit's serialization, not
 	// necessarily the stored one.
@@ -230,9 +233,9 @@ func claimXorb(ctx context.Context, tx pgx.Tx, hash string, x *NewXorb, store Xo
 	)
 	if x != nil {
 		err := tx.QueryRow(ctx, `
-			INSERT INTO xorbs (hash, size) VALUES ($1, $2)
+			INSERT INTO xorbs (hash, size, key_id) VALUES ($1, $2, NULLIF($3, ''))
 			ON CONFLICT (hash) DO UPDATE SET updated_at = now()
-			RETURNING xmax = 0, refcount`, hash, x.Size).Scan(&fresh, &refcount)
+			RETURNING xmax = 0, refcount`, hash, x.Size, x.KeyID).Scan(&fresh, &refcount)
 		if err != nil {
 			return false, apperr.Internal(err)
 		}
@@ -421,4 +424,66 @@ func (d *DB) GCSweepXorbs(ctx context.Context, graceSecs int64, limit int64, del
 		}
 		return deleteBytes(ctx, hash)
 	})
+}
+
+// StoredKeys lists every encryption key some xorb is sealed under. It runs
+// at startup, so it reads the key index once per distinct key rather than
+// scanning every xorb.
+func (d *DB) StoredKeys(ctx context.Context) ([]string, error) {
+	rows, err := d.pool.Query(ctx, `
+		WITH RECURSIVE k AS (
+		    (SELECT key_id FROM xorbs WHERE key_id IS NOT NULL ORDER BY key_id LIMIT 1)
+		    UNION ALL
+		    SELECT (SELECT x.key_id FROM xorbs x
+		            WHERE x.key_id IS NOT NULL AND x.key_id > k.key_id
+		            ORDER BY x.key_id LIMIT 1)
+		    FROM k WHERE k.key_id IS NOT NULL
+		)
+		SELECT key_id FROM k WHERE key_id IS NOT NULL`)
+	if err != nil {
+		return nil, apperr.Internal(err)
+	}
+	keys, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	return keys, apperr.Internal(err)
+}
+
+// RecordStorageKeys records the fingerprint of each key in fingerprints
+// (id → fingerprint) whose id is not yet on record, and returns the
+// fingerprint on record for each of them, which differs from the one given
+// when that id was first recorded with another key.
+func (d *DB) RecordStorageKeys(ctx context.Context, fingerprints map[string]string) (map[string]string, error) {
+	ids := make([]string, 0, len(fingerprints))
+	fps := make([]string, 0, len(fingerprints))
+	for id, fp := range fingerprints {
+		ids = append(ids, id)
+		fps = append(fps, fp)
+	}
+	if _, err := d.pool.Exec(ctx, `
+		INSERT INTO storage_keys (id, fingerprint)
+		SELECT * FROM unnest($1::text[], $2::text[])
+		ON CONFLICT (id) DO NOTHING`, ids, fps); err != nil {
+		return nil, apperr.Internal(err)
+	}
+	rows, err := d.pool.Query(ctx, "SELECT id, fingerprint FROM storage_keys WHERE id = ANY($1)", ids)
+	if err != nil {
+		return nil, apperr.Internal(err)
+	}
+	recorded := make(map[string]string, len(ids))
+	for rows.Next() {
+		var id, fp string
+		if err := rows.Scan(&id, &fp); err != nil {
+			rows.Close()
+			return nil, apperr.Internal(err)
+		}
+		recorded[id] = fp
+	}
+	rows.Close()
+	return recorded, apperr.Internal(rows.Err())
+}
+
+// StorageKeyRecorded reports whether storage_keys holds the key id.
+func (d *DB) StorageKeyRecorded(ctx context.Context, id string) (bool, error) {
+	var ok bool
+	err := d.pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM storage_keys WHERE id = $1)", id).Scan(&ok)
+	return ok, apperr.Internal(err)
 }

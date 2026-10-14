@@ -6,13 +6,15 @@
 //
 //	xorbs/<h[0:2]>/<h[2:4]>/<hash> – Xet xorbs of content-defined chunks; immutable
 //	blobs/<h[0:2]>/<h[2:4]>/<hash> – whole files stored before chunking
-//	staging/<uuid>                 – in-flight uploads and multipart parts
+//	staging/<uuid>[.sealed]        – in-flight uploads and multipart parts
 //
 // A commit reads the staging file back and writes its new chunks into xorbs,
 // each written in one request. Content stored before chunking was promoted
 // whole through Bucket.Copy, which every driver implements with the backend's
-// own copy operation, and still is when such a blob is revived from zero; that
-// path inherits S3's 5GiB single-copy ceiling.
+// own copy operation, and still is when such a blob is revived from zero
+// from staging written in the clear; that path inherits S3's 5GiB
+// single-copy ceiling. Staging sealed at rest (.sealed) is read back and
+// written instead.
 package storage
 
 import (

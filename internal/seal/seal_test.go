@@ -120,7 +120,7 @@ func TestParseRejects(t *testing.T) {
 		"no separator":   {key(1)},
 		"empty id":       {":" + key(1)},
 		"bad id":         {"v 1:" + key(1)},
-		"long id":        {strings.Repeat("a", maxKeyIDLen+1) + ":" + key(1)},
+		"long id":        {strings.Repeat("a", MaxKeyIDLen+1) + ":" + key(1)},
 		"duplicate id":   {"v1:" + key(1), "v1:" + key(2)},
 		"short key":      {"v1:" + base64.StdEncoding.EncodeToString([]byte("too short"))},
 		"not base64":     {"v1:!!!!"},
@@ -142,5 +142,55 @@ func TestParseErrorOmitsKeyMaterial(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), material) {
 		t.Errorf("error %q repeats the key material", err)
+	}
+}
+
+func TestDeriveIsStableAndSeparated(t *testing.T) {
+	k := mustParse(t, "v1:"+key(1), "v2:"+key(2))
+	same := mustParse(t, "v1:"+key(1))
+	seal := func(k *Keyring, id, info string) []byte {
+		t.Helper()
+		aead, err := k.Derive(id, info)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return aead.Seal(nil, make([]byte, aead.NonceSize()), []byte("x"), nil)
+	}
+	if !bytes.Equal(seal(k, "v1", "a"), seal(same, "v1", "a")) {
+		t.Error("the same key and info derived different subkeys")
+	}
+	if bytes.Equal(seal(k, "v1", "a"), seal(k, "v1", "b")) {
+		t.Error("different info derived the same subkey")
+	}
+	if bytes.Equal(seal(k, "v1", "a"), seal(k, "v2", "a")) {
+		t.Error("different keys derived the same subkey")
+	}
+	if _, err := k.Derive("v3", "a"); err == nil {
+		t.Error("derived from a key the keyring does not hold")
+	}
+}
+
+func TestFingerprint(t *testing.T) {
+	a := mustParse(t, "v1:"+key(1), "v2:"+key(2))
+	b := mustParse(t, "v2:"+key(2), "v1:"+key(9))
+	fp := func(k *Keyring, id string) string {
+		t.Helper()
+		f, err := k.Fingerprint(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	if fp(a, "v2") != fp(b, "v2") {
+		t.Error("the same key under the same name has different fingerprints")
+	}
+	if fp(a, "v1") == fp(b, "v1") {
+		t.Error("different keys under one name have the same fingerprint")
+	}
+	if strings.Contains(fp(a, "v1"), key(1)) {
+		t.Error("the fingerprint reveals the key")
+	}
+	if got := b.IDs(); len(got) != 2 || got[0] != "v2" || got[1] != "v1" {
+		t.Errorf("IDs = %v, want the current key first", got)
 	}
 }

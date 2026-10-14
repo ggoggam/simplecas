@@ -82,7 +82,7 @@ func newGateway(t *testing.T, options ...func(*config.Config)) *Gateway {
 	log := slog.New(slog.DiscardHandler)
 	gc := config.GcConfig{IntervalSecs: 60, GraceSecs: 300, MultipartExpirySecs: 86400}
 
-	return New(database, bucket, cas.New(database, bucket, gc, cfg.Limits, log), &cfg, log)
+	return New(database, bucket, cas.New(database, bucket, testblob.Keys(t), gc, cfg.Limits, log), &cfg, log)
 }
 
 // do issues a request against the gateway and returns the recorded response.

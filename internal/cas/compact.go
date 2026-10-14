@@ -92,7 +92,10 @@ func (s *Store) compactXorbs(ctx context.Context) {
 // back to other copies of its chunks where there are any.
 //
 // Stored bytes are copied as they are, header and all, so nothing is
-// recompressed. The new xorb is written before the terms move, as a commit
+// recompressed, except that with encryption keys set a chunk stored in the
+// clear, or sealed under a key that is no longer the current one, is sealed
+// under the current key on the way: every xorb compaction writes is under
+// one key, the current one. The new xorb is written before the terms move, as a commit
 // writes its xorbs before claiming them, and a failure after the write
 // leaves it for the orphan sweep.
 func (s *Store) compactXorb(ctx context.Context, hash string) (freed int64, err error) {
@@ -132,6 +135,7 @@ func (s *Store) compactXorb(ctx context.Context, hash string) (freed int64, err 
 		chunks    []db.XorbChunk
 		nodes     []hashedSize
 		repaired  int
+		resealed  int
 		index     = make([]int32, len(use.Chunks))
 		elsewhere map[string][]db.ChunkLocation
 	)
@@ -145,8 +149,24 @@ func (s *Store) compactXorb(ctx context.Context, hash string) (freed int64, err 
 		var why string
 		if end > int64(len(stored)) {
 			why = "past the end of the stored bytes"
-		} else if _, why = verifyChunk(stored[c.Offset:end], c); why == "" {
-			buf = append(buf, stored[c.Offset:end]...)
+		} else {
+			b := stored[c.Offset:end]
+			var raw []byte
+			if raw, why, err = s.verifyChunk(ctx, b, c); err != nil {
+				return -1, err
+			}
+			if why == "" {
+				if id, _ := chunkKeyID(b); id == currentKeyID(s.keys) {
+					buf = append(buf, b...)
+				} else {
+					// Stored in the clear, or under a key no longer
+					// first: sealed under the current one on the way.
+					if buf, err = appendChunk(buf, raw, c.Hash, s.keys); err != nil {
+						return -1, err
+					}
+					resealed++
+				}
+			}
 		}
 		if why != "" {
 			if elsewhere == nil {
@@ -158,7 +178,9 @@ func (s *Store) compactXorb(ctx context.Context, hash string) (freed int64, err 
 			if !ok {
 				return -1, fmt.Errorf("%w: chunk %d, %s", errNoSoundCopy, i, why)
 			}
-			buf = appendChunk(buf, raw)
+			if buf, err = appendChunk(buf, raw, c.Hash, s.keys); err != nil {
+				return -1, err
+			}
 			repaired++
 		}
 		sum, err := parseXetHex(c.Hash)
@@ -170,7 +192,7 @@ func (s *Store) compactXorb(ctx context.Context, hash string) (freed int64, err 
 		chunks = append(chunks, db.XorbChunk{Hash: c.Hash, Offset: start, Length: int32(int64(len(buf)) - start), Size: c.Size})
 	}
 
-	to := db.NewXorb{Hash: xetHex(xorbHash(nodes)), Size: int64(len(buf)), Chunks: chunks}
+	to := db.NewXorb{Hash: xetHex(xorbHash(nodes)), Size: int64(len(buf)), KeyID: currentKeyID(s.keys), Chunks: chunks}
 	if err := s.blob.PutOnce(ctx, storage.XorbPath(to.Hash), buf, true); err != nil {
 		if !errors.Is(err, storage.ErrExists) {
 			return -1, fmt.Errorf("write compacted xorb: %w", err)
@@ -186,7 +208,7 @@ func (s *Store) compactXorb(ctx context.Context, hash string) (freed int64, err 
 			"xorb", hash, "into", to.Hash, "chunks", repaired)
 	}
 	s.log.Debug("compacted xorb", "xorb", hash, "into", to.Hash, "blobs", moved,
-		"chunks", len(chunks), "of", len(use.Chunks))
+		"chunks", len(chunks), "of", len(use.Chunks), "resealed", resealed)
 	return use.Size - to.Size, nil
 }
 

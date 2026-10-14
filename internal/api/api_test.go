@@ -61,7 +61,7 @@ func newFixture(t *testing.T) *fixture {
 	cfg.Database.URL = dsn
 	cfg.Auth.CredentialKeys = []string{"test:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}
 	log := slog.New(slog.DiscardHandler)
-	store := cas.New(database, bucket, config.GcConfig{
+	store := cas.New(database, bucket, testblob.Keys(t), config.GcConfig{
 		IntervalSecs: 60, GraceSecs: 300, MultipartExpirySecs: 86400,
 	}, cfg.Limits, log)
 	gateway := s3.New(database, bucket, store, &cfg, log)
@@ -236,8 +236,13 @@ func TestStatsContract(t *testing.T) {
 
 	// Two objects share one blob, so logical bytes exceed physical bytes.
 	// Physical bytes are as stored: 1000 bytes that do not compress are one
-	// chunk, kept as they are behind the 8-byte chunk header.
+	// chunk, kept as they are behind the 8-byte chunk header, and when
+	// encrypted, sealed behind the key ID "t2", a nonce and a tag too.
 	body1000 := incompressible(1000)
+	stored := 1008
+	if testblob.Keys(t) != nil {
+		stored += 1 + len("t2") + 12 + 16
+	}
 	mustStatus(t, f.do(t, http.MethodPut, "/api/namespaces/ns-a/objects/one", body1000), http.StatusOK)
 	mustStatus(t, f.do(t, http.MethodPut, "/api/namespaces/ns-b/objects/two", body1000), http.StatusOK)
 
@@ -259,14 +264,14 @@ func TestStatsContract(t *testing.T) {
 	if body["blob_count"] != float64(1) {
 		t.Errorf("blob_count = %v, want 1 (deduped)", body["blob_count"])
 	}
-	if body["logical_bytes"] != float64(2000) || body["physical_bytes"] != float64(1008) {
-		t.Errorf("bytes = %#v", body)
+	if body["logical_bytes"] != float64(2000) || body["physical_bytes"] != float64(stored) {
+		t.Errorf("bytes = %#v, want %d physical", body, stored)
 	}
-	if body["dedup_ratio"] != 2000.0/1008 {
-		t.Errorf("dedup_ratio = %v, want 2000/1008", body["dedup_ratio"])
+	if body["dedup_ratio"] != 2000.0/float64(stored) {
+		t.Errorf("dedup_ratio = %v, want 2000/%d", body["dedup_ratio"], stored)
 	}
-	if body["saved_bytes"] != float64(992) {
-		t.Errorf("saved_bytes = %v, want 992", body["saved_bytes"])
+	if body["saved_bytes"] != float64(2000-stored) {
+		t.Errorf("saved_bytes = %v, want %d", body["saved_bytes"], 2000-stored)
 	}
 }
 

@@ -74,7 +74,7 @@ func newTenantFixture(t *testing.T) *tenantFixture {
 	log := slog.New(slog.DiscardHandler)
 
 	f := &tenantFixture{
-		g:          New(database, bucket, cas.New(database, bucket, gc, cfg.Limits, log), &cfg, log),
+		g:          New(database, bucket, cas.New(database, bucket, testblob.Keys(t), gc, cfg.Limits, log), &cfg, log),
 		pool:       pool,
 		namespaceA: "ns-a",
 		namespcB:   "ns-b",

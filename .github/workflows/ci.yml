@@ -123,6 +123,9 @@ jobs:
           SIMPLECAS_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/simplecas
           # Empty on the fs leg, which leaves the tests on the fs backend.
           SIMPLECAS_TEST_S3_URL: ${{ matrix.blobs == 's3' && 'http://rustfsadmin:rustfsadmin@localhost:9000/simplecas-test' || '' }}
+          # The s3 leg also stores content encrypted at rest, so every suite
+          # runs once in the clear (fs) and once sealed (s3).
+          SIMPLECAS_TEST_ENCRYPT: ${{ matrix.blobs == 's3' && '1' || '' }}
 
   # The main ruleset requires a check named "test"; this reports the matrix
   # above as that one check.

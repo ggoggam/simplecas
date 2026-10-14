@@ -35,6 +35,9 @@
 //
 // Clients see MD5 ETags, as S3 serves them, never the BLAKE3 digest: that
 // digest is the dedup key for every tenant's copy of some content.
+//
+// With encryption keys configured, staging files and the chunks in xorbs are
+// sealed at rest (see crypt.go).
 package cas
 
 import (
@@ -48,6 +51,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -57,22 +61,29 @@ import (
 	"github.com/ggoggam/simplecas/internal/apperr"
 	"github.com/ggoggam/simplecas/internal/config"
 	"github.com/ggoggam/simplecas/internal/db"
+	"github.com/ggoggam/simplecas/internal/seal"
 	"github.com/ggoggam/simplecas/internal/storage"
 )
 
 // Store performs content-addressed writes against the metadata store and the
 // blob backend together.
 type Store struct {
-	db     *db.DB
-	blob   *storage.Bucket
+	db   *db.DB
+	blob *storage.Bucket
+	// keys seal what is written to the backend; nil stores it in the clear.
+	keys   *seal.Keyring
 	gc     config.GcConfig
 	limits config.LimitsConfig
 	log    *slog.Logger
+	// recordedKeys caches the key ids keyRecorded found on record.
+	recordedKeys sync.Map
 }
 
-// New returns a Store over the given database and blob backend.
-func New(database *db.DB, bucket *storage.Bucket, gc config.GcConfig, limits config.LimitsConfig, log *slog.Logger) *Store {
-	return &Store{db: database, blob: bucket, gc: gc, limits: limits, log: log}
+// New returns a Store over the given database and blob backend. keys, from
+// storage.encryption_keys, encrypt content at rest; nil stores it in the
+// clear.
+func New(database *db.DB, bucket *storage.Bucket, keys *seal.Keyring, gc config.GcConfig, limits config.LimitsConfig, log *slog.Logger) *Store {
+	return &Store{db: database, blob: bucket, keys: keys, gc: gc, limits: limits, log: log}
 }
 
 // StagedBlob is an upload buffered in staging, with the hashes and size
@@ -188,11 +199,9 @@ func (s *Store) Stage(ctx context.Context, r io.Reader) (StagedBlob, error) {
 }
 
 func (s *Store) stage(ctx context.Context, r io.Reader, limit int64, what string, chunk bool) (StagedBlob, error) {
-	key := storage.StagingPath(uuid.NewString())
-
-	w, err := s.blob.NewWriter(ctx, key, nil)
+	key, w, err := s.createStaging(ctx)
 	if err != nil {
-		return StagedBlob{}, apperr.Internal(err)
+		return StagedBlob{}, err
 	}
 
 	// One byte past the limit is enough to know the body is too long, and
@@ -334,8 +343,8 @@ func (s *Store) commit(ctx context.Context, namespaceID int64, key, contentType 
 					return err
 				}
 				if claim.NeedsBytes() || !held || claim.Damaged {
-					if err := s.blob.Copy(ctx, storage.BlobPath(staged.Hash), staged.StagingKey, nil); err != nil {
-						return apperr.Internalf("promote staged blob: %w", err)
+					if err := s.promoteWhole(ctx, staged); err != nil {
+						return err
 					}
 				}
 				if claim.Damaged {
@@ -367,6 +376,43 @@ func (s *Store) commit(ctx context.Context, namespaceID int64, key, contentType 
 
 	s.DiscardStaging(ctx, staged.StagingKey)
 	return staged.ETag, nil
+}
+
+// promoteWhole writes the staged content as the file of a blob stored whole
+// before chunking. Such a blob is stored in the clear, as it was before
+// encryption, so content staged sealed is opened on the way: the file holds
+// the same bytes it held before, and a backend copy suffices when staging was
+// in the clear too.
+func (s *Store) promoteWhole(ctx context.Context, staged StagedBlob) error {
+	dst := storage.BlobPath(staged.Hash)
+	if !strings.HasSuffix(staged.StagingKey, sealedStagingSuffix) {
+		if err := s.blob.Copy(ctx, dst, staged.StagingKey, nil); err != nil {
+			return apperr.Internalf("promote staged blob: %w", err)
+		}
+		return nil
+	}
+	r, err := s.openStaging(ctx, staged.StagingKey)
+	if err != nil {
+		return apperr.Internalf("promote staged blob: %w", err)
+	}
+	defer func() { _ = r.Close() }()
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	w, err := s.blob.NewWriter(wctx, dst, nil)
+	if err != nil {
+		return apperr.Internalf("promote staged blob: %w", err)
+	}
+	if _, err := io.Copy(w, r); err != nil {
+		// Closing a writer whose context is cancelled abandons the write,
+		// rather than publish a truncated file under the blob's name.
+		cancel()
+		_ = w.Close()
+		return apperr.Internalf("promote staged blob: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return apperr.Internalf("promote staged blob: %w", err)
+	}
+	return nil
 }
 
 // commitAttempts is how many times a commit plans and writes before giving
@@ -511,11 +557,9 @@ func (s *Store) CompleteMultipart(ctx context.Context, upload db.MultipartUpload
 // client split its parts. Each part's MD5 is measured on the way through too, rather
 // than trusted from the part's row, to give the multipart ETag.
 func (s *Store) stageParts(ctx context.Context, parts []db.PartMeta) (StagedBlob, error) {
-	key := storage.StagingPath(uuid.NewString())
-
-	w, err := s.blob.NewWriter(ctx, key, nil)
+	key, w, err := s.createStaging(ctx)
 	if err != nil {
-		return StagedBlob{}, apperr.Internal(err)
+		return StagedBlob{}, err
 	}
 
 	hasher, md5er, partMD5s, chunks := blake3.New(), md5.New(), md5.New(), newChunker()
@@ -524,7 +568,7 @@ func (s *Store) stageParts(ctx context.Context, parts []db.PartMeta) (StagedBlob
 	for _, part := range parts {
 		partMD5 := md5.New()
 		sink := io.MultiWriter(w, hasher, md5er, chunks, partMD5)
-		r, err := s.blob.NewReader(ctx, part.StagingKey, nil)
+		r, err := s.openStaging(ctx, part.StagingKey)
 		if err != nil {
 			_ = w.Close()
 			s.DiscardStaging(ctx, key)
@@ -533,6 +577,11 @@ func (s *Store) stageParts(ctx context.Context, parts []db.PartMeta) (StagedBlob
 		n, copyErr := io.Copy(sink, r)
 		closeErr := r.Close()
 		size += n
+		if copyErr == nil && closeErr == nil && (n != part.Size || hexSum(partMD5) != part.ETag) {
+			// The staged bytes are not the part that was uploaded.
+			copyErr = fmt.Errorf("staged part holds %d bytes with MD5 %s, want %d with %s",
+				n, hexSum(partMD5), part.Size, part.ETag)
+		}
 		if copyErr != nil || closeErr != nil {
 			_ = w.Close()
 			s.DiscardStaging(ctx, key)

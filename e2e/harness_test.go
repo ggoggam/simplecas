@@ -125,9 +125,10 @@ func newStack(t *testing.T, options ...stackOption) *stack {
 		SecretAccessKey: adminSecret,
 		CredentialKeys:  []string{"e2e:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
 	}
+	keys := testblob.Keys(t)
 	log := slog.New(slog.DiscardHandler)
 
-	store := cas.New(database, bucket, cfg.GC, cfg.Limits, log)
+	store := cas.New(database, bucket, keys, cfg.GC, cfg.Limits, log)
 	gateway := s3.New(database, bucket, store, &cfg, log)
 	routes := server.Routes{
 		Gateway:      gateway,

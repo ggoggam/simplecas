@@ -84,7 +84,7 @@ func newFixtureWithLimits(t *testing.T, gc config.GcConfig, limits config.Limits
 	bucket := testblob.Open(t)
 
 	return &fixture{
-		store:  New(database, bucket, gc, limits, slog.New(slog.DiscardHandler)),
+		store:  New(database, bucket, testblob.Keys(t), gc, limits, slog.New(slog.DiscardHandler)),
 		db:     database,
 		bucket: bucket,
 		pool:   pool,
@@ -283,7 +283,12 @@ func TestStageHashesWhileStreaming(t *testing.T) {
 				t.Errorf("staging key %q is outside the staging prefix", staged.StagingKey)
 			}
 			// The bytes really landed.
-			got, err := f.bucket.ReadAll(t.Context(), staged.StagingKey)
+			r, err := f.store.openStaging(t.Context(), staged.StagingKey)
+			if err != nil {
+				t.Fatalf("open staged bytes: %v", err)
+			}
+			got, err := io.ReadAll(r)
+			_ = r.Close()
 			if err != nil {
 				t.Fatalf("read staged bytes: %v", err)
 			}

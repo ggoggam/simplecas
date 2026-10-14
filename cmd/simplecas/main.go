@@ -113,7 +113,16 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
-	store := cas.New(database, bucket, cfg.GC, cfg.Limits, logger)
+	keys, err := cfg.Storage.Keyring()
+	if err != nil {
+		return err
+	}
+	store := cas.New(database, bucket, keys, cfg.GC, cfg.Limits, logger)
+	// Refuse keys that cannot read what is already stored, before anything
+	// is read.
+	if err := store.CheckKeys(startupCtx); err != nil {
+		return err
+	}
 	gateway := s3.New(database, bucket, store, cfg, logger)
 
 	// Seal any team S3 secret still in plaintext, or under a rotated-out
