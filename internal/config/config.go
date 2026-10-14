@@ -168,6 +168,16 @@ type GcConfig struct {
 	// The listing touches every blob, so it runs far less often than the
 	// other sweeps; such bytes are rare and harmless until then.
 	OrphanIntervalSecs int64 `toml:"orphan_interval_secs"`
+	// ScrubIntervalSecs is how long stored content goes before it is read
+	// back and checked against its hashes again. 0 turns scrubbing off.
+	ScrubIntervalSecs int64 `toml:"scrub_interval_secs"`
+	// ScrubBytesPerSec caps how fast each instance reads stored content to
+	// check it, so scrubbing never competes with requests for the backend.
+	ScrubBytesPerSec int64 `toml:"scrub_bytes_per_sec"`
+	// CompactBelowPercent is when a xorb is compacted: once the chunks some
+	// blob still uses take up less than this percentage of its stored bytes,
+	// it is rewritten with only those. 0 turns compaction off.
+	CompactBelowPercent int64 `toml:"compact_below_percent"`
 }
 
 // LimitsConfig bounds what one request, and one team, can consume.
@@ -203,6 +213,9 @@ func Default() Config {
 			GraceSecs:           300,
 			MultipartExpirySecs: 86400,
 			OrphanIntervalSecs:  86400,
+			ScrubIntervalSecs:   30 * 86400,
+			ScrubBytesPerSec:    4 << 20,
+			CompactBelowPercent: 50,
 		},
 		Limits: LimitsConfig{
 			MaxObjectBytes:   5 << 40,
@@ -381,6 +394,12 @@ func (c *Config) Validate() error {
 
 	if c.GC.IntervalSecs < 1 || c.GC.GraceSecs < 0 || c.GC.MultipartExpirySecs < 1 || c.GC.OrphanIntervalSecs < 1 {
 		return fmt.Errorf("gc intervals must be positive")
+	}
+	if c.GC.ScrubIntervalSecs < 0 || c.GC.ScrubBytesPerSec < 1 {
+		return fmt.Errorf("gc.scrub_interval_secs must not be negative (0 turns scrubbing off), and gc.scrub_bytes_per_sec must be positive")
+	}
+	if c.GC.CompactBelowPercent < 0 || c.GC.CompactBelowPercent > 100 {
+		return fmt.Errorf("gc.compact_below_percent must be between 0 (off) and 100")
 	}
 
 	if c.Limits.MaxObjectBytes < 1 || c.Limits.MaxPartBytes < 1 {

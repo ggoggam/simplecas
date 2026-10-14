@@ -326,15 +326,23 @@ func (s *Store) commit(ctx context.Context, namespaceID int64, key, contentType 
 				// Stored whole before chunking. A blob revived from zero,
 				// whose bytes GC may already have deleted, is rewritten
 				// from staging, which is idempotent; and as above, so is
-				// one new to the namespace.
+				// one new to the namespace. So is one a scrub found
+				// damaged, which repairs it: the staged copy was hashed on
+				// the way in.
 				held, err := db.BlobReferencedInNamespace(ctx, tx, staged.Hash, namespaceID)
 				if err != nil {
 					return err
 				}
-				if claim.NeedsBytes() || !held {
+				if claim.NeedsBytes() || !held || claim.Damaged {
 					if err := s.blob.Copy(ctx, storage.BlobPath(staged.Hash), staged.StagingKey, nil); err != nil {
 						return apperr.Internalf("promote staged blob: %w", err)
 					}
+				}
+				if claim.Damaged {
+					if err := db.RepairedBlob(ctx, tx, staged.Hash); err != nil {
+						return err
+					}
+					s.log.Info("rewrote a damaged blob from an upload of its content", "blob", staged.Hash)
 				}
 			}
 			if err := db.UpsertObject(ctx, tx, namespaceID, key, staged.Hash, staged.ETag, staged.Size, contentType); err != nil {

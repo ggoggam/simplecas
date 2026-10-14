@@ -19,8 +19,12 @@ func TestDefaultsAreServiceable(t *testing.T) {
 	if c.Storage.Backend != "fs" {
 		t.Errorf("storage backend = %q, want fs", c.Storage.Backend)
 	}
-	if c.GC.IntervalSecs != 60 || c.GC.GraceSecs != 300 || c.GC.MultipartExpirySecs != 86400 || c.GC.OrphanIntervalSecs != 86400 {
-		t.Errorf("gc defaults = %+v", c.GC)
+	wantGC := GcConfig{
+		IntervalSecs: 60, GraceSecs: 300, MultipartExpirySecs: 86400, OrphanIntervalSecs: 86400,
+		ScrubIntervalSecs: 30 * 86400, ScrubBytesPerSec: 4 << 20, CompactBelowPercent: 50,
+	}
+	if c.GC != wantGC {
+		t.Errorf("gc defaults = %+v, want %+v", c.GC, wantGC)
 	}
 	if c.OIDC.SessionTTLSecs != 86400 {
 		t.Errorf("session_ttl_secs = %d, want 86400", c.OIDC.SessionTTLSecs)
@@ -330,6 +334,9 @@ func TestValidate(t *testing.T) {
 		{"gcs without a bucket", func(c *Config) { c.Storage.Backend = "gcs" }},
 		{"azblob without a container", func(c *Config) { c.Storage.Backend = "azblob" }},
 		{"zero gc interval", func(c *Config) { c.GC.IntervalSecs = 0 }},
+		{"negative scrub interval", func(c *Config) { c.GC.ScrubIntervalSecs = -1 }},
+		{"zero scrub rate", func(c *Config) { c.GC.ScrubBytesPerSec = 0 }},
+		{"compaction threshold over 100", func(c *Config) { c.GC.CompactBelowPercent = 101 }},
 		{"zero object size limit", func(c *Config) { c.Limits.MaxObjectBytes = 0 }},
 		{"zero part size limit", func(c *Config) { c.Limits.MaxPartBytes = 0 }},
 		{"negative quota", func(c *Config) { c.Limits.TenantQuotaBytes = -1 }},

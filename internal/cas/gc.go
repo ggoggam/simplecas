@@ -29,9 +29,9 @@ const orphanPage = 1000
 const etagBatch = 16
 
 // RunGC reclaims space until ctx is cancelled: unreferenced blobs and xorbs,
-// orphaned staging files, abandoned multipart uploads, and expired sign-in
-// sessions on every tick, and stored bytes no row accounts for every orphan
-// interval.
+// the dead chunks of sparse xorbs (by compacting them), orphaned staging
+// files, abandoned multipart uploads, and expired sign-in sessions on every
+// tick, and stored bytes no row accounts for every orphan interval.
 // Each tick also records ETags for some objects stored before they were.
 // Every pass is best-effort — a failure is logged and retried on the next tick
 // rather than ending the loop, because a transient database or backend blip
@@ -62,6 +62,7 @@ func (s *Store) RunGC(ctx context.Context) {
 		// once their grace period is up.
 		s.sweepBlobs(ctx)
 		s.sweepXorbs(ctx)
+		s.compactXorbs(ctx)
 		s.sweepStaging(ctx)
 		s.sweepMultipart(ctx)
 		s.sweepSessions(ctx)

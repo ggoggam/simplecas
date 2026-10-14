@@ -36,6 +36,10 @@ type BlobClaim struct {
 	// MD5 is the content's recorded hex MD5, or "" for a blob stored before
 	// MD5s were recorded that the backfill has not reached.
 	MD5 string
+	// Damaged means a scrub found the bytes of a whole-file blob missing or
+	// not matching its hash. A commit that has the content staged rewrites
+	// them (see RepairedBlob).
+	Damaged bool
 }
 
 // NeedsBytes reports whether the claim leaves the blob without bytes it can
@@ -73,13 +77,21 @@ func ClaimBlob(ctx context.Context, tx pgx.Tx, hash string, size int64, md5 stri
 		ON CONFLICT (hash) DO UPDATE
 		    SET refcount = blobs.refcount + 1, updated_at = now(),
 		        md5 = COALESCE(blobs.md5, EXCLUDED.md5)
-		RETURNING xmax = 0, refcount, chunked, COALESCE(md5, '')`, hash, size, md5).
-		Scan(&c.Fresh, &refcount, &c.Chunked, &c.MD5)
+		RETURNING xmax = 0, refcount, chunked, COALESCE(md5, ''), damaged_at IS NOT NULL`, hash, size, md5).
+		Scan(&c.Fresh, &refcount, &c.Chunked, &c.MD5, &c.Damaged)
 	if err != nil {
 		return BlobClaim{}, apperr.Internal(err)
 	}
 	c.Revived = !c.Fresh && refcount == 1
 	return c, nil
+}
+
+// RepairedBlob records that the bytes of a whole-file blob were rewritten,
+// inside the transaction holding its claim: whatever damage a scrub found is
+// gone, and the bytes are as sound as the staged copy they came from.
+func RepairedBlob(ctx context.Context, tx pgx.Tx, hash string) error {
+	_, err := tx.Exec(ctx, "UPDATE blobs SET damaged_at = NULL, verified_at = now() WHERE hash = $1", hash)
+	return apperr.Internal(err)
 }
 
 // ClaimStoredBlob takes a reference to hash only if its row exists, live or
