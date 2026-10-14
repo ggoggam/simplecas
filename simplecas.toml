@@ -76,6 +76,16 @@ multipart_expiry_secs = 86400
 # for (left by an upload that failed to commit). The listing touches every
 # blob, so keep it infrequent. Default: 86400 (24h).
 orphan_interval_secs = 86400
+# How long stored content goes before it is read back and checked against its
+# hashes again (scrubbing); content never checked goes first. 0 turns scrubbing
+# off. Default: 2592000 (30 days).
+scrub_interval_secs = 2592000
+# The most bytes per second each instance reads to scrub. Default: 4194304
+# (4 MiB/s, about 345 GB a day).
+scrub_bytes_per_sec = 4194304
+# Rewrite a xorb with only its live chunks once those take up less than this
+# percentage of it (compaction). 0 turns compaction off. Default: 50.
+compact_below_percent = 50
 
 # Request and storage limits. Over-limit uploads get 400 EntityTooLarge, and
 # writes past a team's quota get 403 QuotaExceeded.

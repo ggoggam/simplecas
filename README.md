@@ -58,9 +58,47 @@ moves no boundary.
 
 Reads fetch only the chunks a range overlaps, each run of neighbouring chunks in
 one ranged request, and check each chunk against its hash before serving any of
-it, so bytes that rot or are truncated in the backend fail the read instead of
-reaching the client. Content stored before chunking stays one file under
-`blobs/`; it is read, copied and collected as before, without that check.
+it, so bytes that rot or are truncated in the backend never reach the client. A
+chunk that fails its check is read from another xorb that holds a sound copy of
+it, if there is one, and fails the read otherwise. Content stored before
+chunking stays one file under `blobs/`; it is read, copied and collected as
+before, without that check (the scrub below covers it).
+
+### Scrubbing and compaction
+
+Two background jobs keep stored content sound and compact:
+
+- **Scrubbing.** Every live xorb is read back once per
+  `[gc] scrub_interval_secs` (default 30 days) and checked whole: its size,
+  where each chunk sits, each chunk against its hash, and the chunk hashes
+  against the xorb's name. Blobs stored before chunking are checked against
+  their BLAKE3 digest. Content never checked goes first. Each instance reads at
+  most `[gc] scrub_bytes_per_sec` (default 4 MiB/s, about 345 GB a day), so the
+  scrub never competes with requests for the backend. `scrub_interval_secs = 0`
+  turns it off.
+- **Compaction.** A xorb lives as long as any blob uses any of its chunks, so
+  deleting objects can leave xorbs that are mostly dead chunks. Once a xorb
+  that lost a blob has been settled for the grace period, the GC loop rewrites
+  it if its live chunks take up less than `[gc] compact_below_percent` of it
+  (default 50): the live chunks are copied as stored into a new xorb, every
+  term moves onto it, and the old xorb is collected after the grace period.
+  Reads that looked their terms up before the move still find the chunks. `0`
+  turns compaction off.
+
+Content that fails a check, by the scrub or by a read, is marked damaged
+(`damaged_at`) and logged as an error, with a count of the objects that may be
+affected. Dedup never reuses chunks of a damaged xorb, so new uploads do not
+take on its damage. Reads of a damaged chunk fall back to a sound copy where
+another xorb holds one. Compaction repairs a damaged xorb that has dead chunks:
+it rewrites the xorb, taking any damaged live chunk from a sound copy. A
+whole-file blob is repaired by uploading its content again. To list what is
+damaged:
+
+```sql
+SELECT 'xorb', hash, damaged_at FROM xorbs WHERE damaged_at IS NOT NULL AND refcount > 0
+UNION ALL
+SELECT 'blob', hash, damaged_at FROM blobs WHERE damaged_at IS NOT NULL AND refcount > 0;
+```
 
 ### What global dedup reveals
 
@@ -758,20 +796,30 @@ the ordinary staging sweeper.
   xorbs referenced while the blob waits at refcount 0, so a blob revived by a
   re-upload or a link needs no bytes rewritten. Collecting a blob drops its
   xorbs' references; the xorb sweep deletes a xorb no term uses once it has been
-  unreferenced for the grace period. A xorb lives as long as any blob uses any
-  of its chunks; compacting xorbs that are mostly unused is not done yet.
+  unreferenced for the grace period. A xorb that loses a blob but is still used
+  by others is marked for compaction, which looks at nothing else.
+- **Compaction safety.** Compaction writes the new xorb before its transaction,
+  as a commit does. The transaction locks the affected blobs, then both xorbs,
+  checks that every term on the old xorb is covered by the new one, and moves
+  them. It locks in a different order from a commit that overwrites an object,
+  so it waits at most 200 ms for any lock and gives up, to try again later: an
+  upload waits on compaction no longer than that, and with Postgres's default
+  `deadlock_timeout` of 1 s, compaction has always backed off before the
+  deadlock detector would pick a victim. A commit
+  that planned to reuse the old xorb before the move still can, which brings
+  that xorb back from zero and marks it for compaction again.
 
 ## Source layout
 
 ```
-cmd/simplecas/       entrypoint: config, pool, bucket, routes, GC task, shutdown
+cmd/simplecas/       entrypoint: config, pool, bucket, routes, GC and scrub tasks, shutdown
 internal/
   apperr/            error type carrying an S3 code + HTTP status; XML and JSON rendering
   config/            layered TOML + SIMPLECAS__ env config; backend selection
   storage/           blob backend construction + the xorbs/, blobs/ and staging/ layout
-  db/                all SQL: namespaces, users, sessions, tenants + invitations, audit log, blobs, xorbs + terms, objects, multipart, GC
+  db/                all SQL: namespaces, users, sessions, tenants + invitations, audit log, blobs, xorbs + terms, objects, multipart, GC, compaction, scrubbing
   db/migrations/     embedded SQL migrations (run automatically on boot)
-  cas/               content-addressed write path (stage → plan → write → claim), Xet chunking, hashing and xorbs, chunked reads, and the GC loop
+  cas/               content-addressed write path (stage → plan → write → claim), Xet chunking, hashing and xorbs, chunked reads, the GC loop with compaction, and scrubbing
   s3/                S3 gateway: handlers, XML wire types, SigV4 verification
   api/               JSON admin API for the PWA
   auth/              OIDC sign-in: discovery, database-backed sessions behind signed cookies, guard middleware

@@ -79,14 +79,15 @@ const locatePage = 4096
 
 // LocateChunks returns, for each of hashes that some live xorb holds, every
 // place it is held. Only xorbs with a reference are considered: one at zero
-// may be collected, its bytes first, at any moment.
+// may be collected, its bytes first, at any moment. Nor are damaged ones: a
+// chunk found there may be one of those that failed its check.
 func (d *DB) LocateChunks(ctx context.Context, hashes []string) (map[string][]ChunkLocation, error) {
 	found := make(map[string][]ChunkLocation)
 	for page := range slices.Chunk(hashes, locatePage) {
 		rows, err := d.pool.Query(ctx, `
 			SELECT xc.chunk_hash, xc.xorb_hash, xc.idx
 			FROM xorb_chunks xc JOIN xorbs x ON x.hash = xc.xorb_hash
-			WHERE xc.chunk_hash = ANY($1) AND x.refcount > 0
+			WHERE xc.chunk_hash = ANY($1) AND x.refcount > 0 AND x.damaged_at IS NULL
 			ORDER BY xc.xorb_hash, xc.idx`, page)
 		if err != nil {
 			return nil, apperr.Internal(err)
@@ -158,7 +159,8 @@ type XorbBytes interface {
 // those this commit wrote (written). Every xorb whose row this claim creates
 // or finds at zero is checked, under its row lock, to be in the backend: GC
 // may have taken such a xorb's bytes. A xorb that is gone, or that the commit
-// meant to reuse and is no longer live, fails the claim with ErrStaleXorbs.
+// meant to reuse and is no longer live or has since been found damaged, fails
+// the claim with ErrStaleXorbs.
 //
 // The xorb rows are locked in hash order, one at a time. The blob sweep
 // locks the rows it releases in the same order, so two transactions can
@@ -179,60 +181,32 @@ func AttachTerms(ctx context.Context, tx pgx.Tx, blobHash string, written []NewX
 	}
 	slices.Sort(used)
 
+	var revived []string
 	for _, hash := range used {
-		var (
-			fresh    bool
-			refcount int64
-		)
-		x, ours := mine[hash]
-		if ours {
-			err := tx.QueryRow(ctx, `
-				INSERT INTO xorbs (hash, size) VALUES ($1, $2)
-				ON CONFLICT (hash) DO UPDATE SET updated_at = now()
-				RETURNING xmax = 0, refcount`, hash, x.Size).Scan(&fresh, &refcount)
-			if err != nil {
-				return apperr.Internal(err)
-			}
-		} else {
-			err := tx.QueryRow(ctx, "SELECT refcount FROM xorbs WHERE hash = $1 FOR UPDATE", hash).Scan(&refcount)
-			if notFound(err) {
-				return ErrStaleXorbs
-			}
-			if err != nil {
-				return apperr.Internal(err)
-			}
+		var x *NewXorb
+		if nx, ok := mine[hash]; ok {
+			x = &nx
 		}
-		if fresh && x.Existed {
-			// Bytes this commit did not write, with no row to describe
-			// them: left by a commit that failed after writing them, and
-			// perhaps serialized differently, so this commit's offsets
-			// cannot be trusted to match them. Nothing reads a xorb with
-			// no row, so they are deleted under the new row's lock, and
-			// the commit's retry writes its own.
-			if err := store.Discard(ctx, hash); err != nil {
-				return err
-			}
-			return ErrStaleXorbs
+		wasZero, err := claimXorb(ctx, tx, hash, x, store)
+		if err != nil {
+			return err
 		}
-		if fresh || refcount == 0 {
-			ok, err := store.Present(ctx, hash)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				return ErrStaleXorbs
-			}
-		}
-		if fresh {
-			if err := insertXorbChunks(ctx, tx, x); err != nil {
-				return err
-			}
+		if wasZero && x == nil {
+			revived = append(revived, hash)
 		}
 	}
 
 	if _, err := tx.Exec(ctx, `
 		UPDATE xorbs SET refcount = refcount + 1, updated_at = now() WHERE hash = ANY($1)`, used); err != nil {
 		return apperr.Internal(err)
+	}
+	if len(revived) > 0 {
+		// A xorb reused from zero was given up by every blob before this
+		// one, which may use only a few of its chunks: compaction looks.
+		if _, err := tx.Exec(ctx, `
+			UPDATE xorbs SET released_at = COALESCE(released_at, now()) WHERE hash = ANY($1)`, revived); err != nil {
+			return apperr.Internal(err)
+		}
 	}
 	_, err := tx.CopyFrom(ctx, pgx.Identifier{"blob_terms"},
 		[]string{"blob_hash", "pos", "xorb_hash", "chunk_start", "chunk_end", "size"},
@@ -241,6 +215,69 @@ func AttachTerms(ctx context.Context, tx pgx.Tx, blobHash string, written []NewX
 			return []any{blobHash, t.Pos, t.Xorb, t.Start, t.End, t.Size}, nil
 		}))
 	return apperr.Internal(err)
+}
+
+// claimXorb locks a xorb's row for a claim that is about to reference it,
+// creating the row if x is the xorb as this caller wrote it (nil means the
+// caller found it stored). It checks what AttachTerms describes: a xorb whose
+// row this creates, or finds at zero, has its bytes in the backend, and one
+// the caller only found stored is still live and undamaged. wasZero reports
+// a row that existed at refcount 0.
+func claimXorb(ctx context.Context, tx pgx.Tx, hash string, x *NewXorb, store XorbBytes) (wasZero bool, err error) {
+	var (
+		fresh, damaged bool
+		refcount       int64
+	)
+	if x != nil {
+		err := tx.QueryRow(ctx, `
+			INSERT INTO xorbs (hash, size) VALUES ($1, $2)
+			ON CONFLICT (hash) DO UPDATE SET updated_at = now()
+			RETURNING xmax = 0, refcount`, hash, x.Size).Scan(&fresh, &refcount)
+		if err != nil {
+			return false, apperr.Internal(err)
+		}
+	} else {
+		err := tx.QueryRow(ctx, `
+			SELECT refcount, damaged_at IS NOT NULL FROM xorbs WHERE hash = $1 FOR UPDATE`, hash).
+			Scan(&refcount, &damaged)
+		if notFound(err) {
+			return false, ErrStaleXorbs
+		}
+		if err != nil {
+			return false, apperr.Internal(err)
+		}
+		if damaged {
+			// Found damaged since the plan was made: its chunks are not
+			// to be trusted to a new blob.
+			return false, ErrStaleXorbs
+		}
+	}
+	if fresh && x.Existed {
+		// Bytes this caller did not write, with no row to describe them:
+		// left by a commit that failed after writing them, and perhaps
+		// serialized differently, so this caller's offsets cannot be
+		// trusted to match them. Nothing reads a xorb with no row, so they
+		// are deleted under the new row's lock, and a retry writes its own.
+		if err := store.Discard(ctx, hash); err != nil {
+			return false, err
+		}
+		return false, ErrStaleXorbs
+	}
+	if fresh || refcount == 0 {
+		ok, err := store.Present(ctx, hash)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, ErrStaleXorbs
+		}
+	}
+	if fresh {
+		if err := insertXorbChunks(ctx, tx, *x); err != nil {
+			return false, err
+		}
+	}
+	return !fresh && refcount == 0, nil
 }
 
 func insertXorbChunks(ctx context.Context, tx pgx.Tx, x NewXorb) error {
@@ -280,8 +317,11 @@ func detachTerms(ctx context.Context, tx pgx.Tx, blobHash string) error {
 	if _, err := tx.Exec(ctx, "DELETE FROM blob_terms WHERE blob_hash = $1", blobHash); err != nil {
 		return apperr.Internal(err)
 	}
+	// A xorb other blobs still use may now hold chunks none of them do,
+	// and is marked for compaction to look at.
 	tag, err := tx.Exec(ctx, `
-		UPDATE xorbs SET refcount = refcount - 1, updated_at = now()
+		UPDATE xorbs SET refcount = refcount - 1, updated_at = now(),
+		    released_at = CASE WHEN refcount > 1 THEN COALESCE(released_at, now()) ELSE released_at END
 		WHERE hash = ANY($1) AND refcount > 0`, hashes)
 	if err != nil {
 		return apperr.Internal(err)

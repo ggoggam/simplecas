@@ -158,6 +158,11 @@ func run(logger *slog.Logger) error {
 		defer wg.Done()
 		store.RunGC(ctx)
 	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		store.RunScrub(ctx)
+	}()
 	if registry != nil {
 		wg.Add(1)
 		go func() {

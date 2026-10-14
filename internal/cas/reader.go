@@ -2,6 +2,7 @@ package cas
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"strings"
 
@@ -28,8 +29,9 @@ const termPage = 256
 // A chunked blob is read term by term, fetching only the chunks the range
 // overlaps, each run of neighbouring chunks in one ranged request. Each chunk
 // is decoded and checked against its hash before any of it is served, so a
-// chunk that rotted or was truncated in the backend fails the read instead of
-// reaching the client; a failure after the first fetch surfaces as an error
+// chunk that rotted or was truncated in the backend is not served: it is read
+// from a sound copy in another xorb if there is one (see fetchRun), and fails
+// the read otherwise. A failure after the first fetch surfaces as an error
 // from Read. A blob stored before chunking is read straight from its file,
 // unchecked.
 //
@@ -165,7 +167,8 @@ func (r *chunkReader) produce(ctx context.Context, s *Store, hash string, from, 
 		return true
 	}
 
-	pos := from
+	pos, rereads := from, 0
+pages:
 	for pos < to {
 		before := pos
 		terms, err := s.db.BlobTerms(ctx, hash, pos, to, termPage)
@@ -183,6 +186,14 @@ func (r *chunkReader) produce(ctx context.Context, s *Store, hash string, from, 
 			}
 			chunks, err := s.db.XorbChunks(ctx, t.Xorb, t.Start, t.End)
 			if err == nil && len(chunks) != int(t.End-t.Start) {
+				// The xorb was collected after these terms were read:
+				// compaction moved them to another, and the sweep took
+				// it once its grace was up. The terms are read again
+				// from here on, a few times at most.
+				if rereads < maxRereads {
+					rereads++
+					continue pages
+				}
 				err = apperr.Internalf("xorb %s is missing chunks of a term of blob %s", t.Xorb, hash)
 			}
 			if err != nil {
@@ -231,47 +242,142 @@ func (r *chunkReader) produce(ctx context.Context, s *Store, hash string, from, 
 	flush()
 }
 
+// maxRereads is how many times a read looks a blob's terms up again after
+// finding that a xorb they named was collected under it.
+const maxRereads = 3
+
 // fetchRun reads a run of neighbouring chunks of a xorb in one ranged
 // request, decodes each and checks it against its hash, and returns the
 // bytes of them the range wants.
+//
+// A chunk is content-addressed, so any sound copy of it will do. A chunk that
+// fails its check, or every chunk when the xorb cannot be read at all, is
+// read instead from another live xorb that holds the same chunk: the xorb may
+// be damaged where another is not, or compaction may have moved the blob's
+// terms since they were read and the xorb since been collected. Bytes that
+// fail their check also mark the xorb damaged.
 func (s *Store) fetchRun(ctx context.Context, xorb string, run []span) fetched {
 	first, last := run[0], run[len(run)-1]
 	start := first.Offset
 	length := last.Offset + int64(last.Length) - start
-	rr, err := s.blob.NewRangeReader(ctx, storage.XorbPath(xorb), start, length, nil)
+	stored, err := s.readStored(ctx, storage.XorbPath(xorb), start, length)
 	if err != nil {
-		return fetched{err: apperr.Internalf("read xorb %s: %w", xorb, err)}
-	}
-	stored, err := io.ReadAll(rr)
-	_ = rr.Close()
-	if err != nil {
-		return fetched{err: apperr.Internalf("read xorb %s: %w", xorb, err)}
-	}
-	if int64(len(stored)) != length {
-		return fetched{err: s.corrupt(xorb, "short read", len(stored), length)}
+		if ctx.Err() != nil {
+			return fetched{err: ctx.Err()}
+		}
+		err = apperr.Internalf("read xorb %s: %w", xorb, err)
 	}
 
+	raws := make([][]byte, len(run))
+	var (
+		missing []int
+		damage  string
+	)
+	for i, sp := range run {
+		if err == nil {
+			at := sp.Offset - start
+			end := at + int64(sp.Length)
+			if end > int64(len(stored)) {
+				damage = fmt.Sprintf("short read: %d bytes at %d, want %d", len(stored), start, length)
+			} else if raw, why := verifyChunk(stored[at:end], sp.XorbChunk); why != "" {
+				damage = fmt.Sprintf("chunk at %d: %s", sp.Offset, why)
+			} else {
+				raws[i] = raw
+				continue
+			}
+		}
+		missing = append(missing, i)
+	}
+	if damage != "" {
+		s.damaged(ctx, xorb, damage)
+		err = apperr.Internalf("xorb %s failed verification", xorb)
+	}
+
+	if len(missing) > 0 {
+		hashes := make([]string, len(missing))
+		for i, m := range missing {
+			hashes[i] = run[m].Hash
+		}
+		found, lerr := s.db.LocateChunks(ctx, hashes)
+		if lerr != nil {
+			return fetched{err: err}
+		}
+		for _, m := range missing {
+			raw, ok := s.soundCopy(ctx, run[m].XorbChunk, found[run[m].Hash], xorb)
+			if !ok {
+				return fetched{err: err}
+			}
+			raws[m] = raw
+		}
+		s.log.Warn("served chunks from other xorbs", "xorb", xorb, "chunks", len(missing), "err", err)
+	}
+
+	if len(run) == 1 {
+		return fetched{data: raws[0][run[0].lo:run[0].hi]}
+	}
 	var out []byte
-	for _, sp := range run {
-		b := stored[sp.Offset-start : sp.Offset-start+int64(sp.Length)]
-		raw, err := decodeChunk(b, int(sp.Size))
-		if err != nil {
-			return fetched{err: s.corrupt(xorb, err.Error(), sp.Offset, sp.Hash)}
-		}
-		if chunkHash(raw) != sp.Hash {
-			return fetched{err: s.corrupt(xorb, "chunk does not match its hash", sp.Offset, sp.Hash)}
-		}
-		if len(run) == 1 {
-			return fetched{data: raw[sp.lo:sp.hi]}
-		}
-		out = append(out, raw[sp.lo:sp.hi]...)
+	for i, sp := range run {
+		out = append(out, raws[i][sp.lo:sp.hi]...)
 	}
 	return fetched{data: out}
 }
 
-// corrupt logs stored bytes that failed verification and returns the error
-// the read fails with.
-func (s *Store) corrupt(xorb, why string, at, want any) error {
-	s.log.Error("stored xorb failed verification", "xorb", xorb, "why", why, "at", at, "want", want)
-	return apperr.Internalf("xorb %s failed verification", xorb)
+// soundCopy reads the chunk c from the first of locs, other than in the xorb
+// skip, whose copy passes its check, and returns it decoded. Copies that
+// fail their check mark their xorb damaged.
+func (s *Store) soundCopy(ctx context.Context, c db.XorbChunk, locs []db.ChunkLocation, skip string) ([]byte, bool) {
+	for _, loc := range locs {
+		if loc.Xorb == skip {
+			continue
+		}
+		stored, err := s.db.XorbChunks(ctx, loc.Xorb, loc.Index, loc.Index+1)
+		if err != nil || len(stored) != 1 || stored[0].Hash != c.Hash {
+			continue
+		}
+		b, err := s.readStored(ctx, storage.XorbPath(loc.Xorb), stored[0].Offset, int64(stored[0].Length))
+		if err != nil {
+			continue
+		}
+		raw, why := verifyChunk(b, stored[0])
+		if why != "" {
+			s.damaged(ctx, loc.Xorb, fmt.Sprintf("chunk at %d: %s", stored[0].Offset, why))
+			continue
+		}
+		return raw, true
+	}
+	return nil, false
+}
+
+// readStored reads the bytes [start, start+length) of key.
+func (s *Store) readStored(ctx context.Context, key string, start, length int64) ([]byte, error) {
+	r, err := s.blob.NewRangeReader(ctx, key, start, length, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = r.Close() }()
+	return io.ReadAll(r)
+}
+
+// verifyChunk decodes one stored chunk and checks it against c, returning
+// it decoded, or why it is not sound.
+func verifyChunk(b []byte, c db.XorbChunk) (raw []byte, why string) {
+	if len(b) != int(c.Length) {
+		return nil, fmt.Sprintf("%d bytes stored, want %d", len(b), c.Length)
+	}
+	raw, err := decodeChunk(b, int(c.Size))
+	if err != nil {
+		return nil, err.Error()
+	}
+	if chunkHash(raw) != c.Hash {
+		return nil, "chunk does not match its hash"
+	}
+	return raw, ""
+}
+
+// damaged logs a xorb whose stored bytes failed a check, and records it.
+func (s *Store) damaged(ctx context.Context, xorb, why string) {
+	s.log.Error("stored xorb failed verification", "xorb", xorb, "why", why)
+	if err := s.db.MarkXorbDamaged(context.WithoutCancel(ctx), xorb); err != nil {
+		s.log.Warn("could not record a damaged xorb", "xorb", xorb, "err", err)
+	}
 }
